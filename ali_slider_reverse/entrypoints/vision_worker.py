@@ -1,4 +1,15 @@
-"""OpenCV 缺口求解的独立 Python 进程入口。"""
+"""OpenCV 缺口求解的独立进程入口。
+
+两种运行方式：
+
+```text
+--worker                 常驻模式：先预载 OpenCV，再按行读取 JSON 请求
+--background/--shadow    一次性模式：算完即退
+```
+
+worker 模式的意义在于把 OpenCV/NumPy 约 200ms 的冷导入提前到收到图片之前完成，
+让调用方能把这段固定成本与 DeviceToken 生成、Init 请求和资源下载重叠掉。
+"""
 
 from __future__ import annotations
 
@@ -6,11 +17,13 @@ import argparse
 import json
 import sys
 
-from .image_solver import estimate_puzzle_canvas_left_cv
+from ..vision.gap_solver import solve_gap
 
 
 def _solve_payload(background: str, shadow: str) -> dict[str, object]:
-    estimate = estimate_puzzle_canvas_left_cv(background, shadow)
+    """求解一次并转成可 JSON 序列化的结果。"""
+
+    estimate = solve_gap(background, shadow)
     return {
         "xPos": estimate.x_pos,
         "confidence": estimate.confidence,
@@ -31,12 +44,18 @@ def _solve_payload(background: str, shadow: str) -> dict[str, object]:
     }
 
 
-def _worker_main() -> int:
-    # 在收到图片路径前完成 OpenCV/NumPy 的冷导入。调用方可把这 200ms 左右的
-    # 固定成本与 DeviceToken、Init 和资源下载重叠，真正识别阶段只保留算法耗时。
+def _emit(payload: dict[str, object]) -> None:
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), flush=True)
+
+
+def _run_worker() -> int:
+    """常驻模式：预载依赖后按行处理请求。"""
+
+    # 在收到图片路径前完成冷导入，并用 ready 信号告知调用方可以开始计时。
     __import__("cv2")
     __import__("numpy")
     print('{"ready":true}', flush=True)
+
     for line in sys.stdin:
         request = json.loads(line)
         if not isinstance(request, dict):
@@ -45,36 +64,29 @@ def _worker_main() -> int:
         shadow = request.get("shadow")
         if not isinstance(background, str) or not isinstance(shadow, str):
             raise ValueError("worker 请求缺少 background/shadow 路径")
-        print(
-            json.dumps(
-                _solve_payload(background, shadow),
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ),
-            flush=True,
-        )
+        _emit(_solve_payload(background, shadow))
     return 0
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="从 back.png / shadow.png 计算阿里滑块 xPos"
+        prog="python -m ali_slider_reverse.entrypoints.vision_worker",
+        description="从 back.png / shadow.png 计算阿里滑块 xPos",
     )
-    parser.add_argument("--background")
-    parser.add_argument("--shadow")
+    parser.add_argument("--background", help="背景图路径")
+    parser.add_argument("--shadow", help="拼图图路径")
     parser.add_argument(
         "--worker",
         action="store_true",
         help="预载 OpenCV 后通过 stdin/stdout 处理 JSON 行请求",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.worker:
-        return _worker_main()
+        return _run_worker()
     if args.background is None or args.shadow is None:
         parser.error("非 worker 模式必须提供 --background 和 --shadow")
-    payload = _solve_payload(args.background, args.shadow)
-    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+    _emit(_solve_payload(args.background, args.shadow))
     return 0
 
 

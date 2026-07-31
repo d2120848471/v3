@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ali-slider-reverse"
+version = "2.0.0"
+description = "阿里 V3 滑块验证码的纯协议复现（授权研究用途）"
+readme = "README.md"
+requires-python = ">=3.10"
+
+# 主协议解释器只需要这两个：HTTP 编排与 AES/HMAC。
+# 图像识别的 OpenCV/NumPy 是可选依赖，见 [project.optional-dependencies]。
+dependencies = [
+    "requests>=2.31",
+    "cryptography>=42",
+]
+
+[project.optional-dependencies]
+# 图像识别可以跑在另一个解释器里（--vision-python）。只有当你想让同一个环境
+# 同时承担协议与识别时，才需要装这一组。
+vision = [
+    "opencv-python>=4.8",
+    "numpy>=1.26",
+]
+
+[project.scripts]
+ali-slider = "ali_slider_reverse.entrypoints.cli:main"
+ali-slider-api = "ali_slider_reverse.entrypoints.api:main"
+
+[tool.setuptools.packages.find]
+include = ["ali_slider_reverse*"]
+exclude = ["ali_slider_reverse.tests*"]
+
+[tool.setuptools.package-data]
+# Node 桥脚本与默认触摸轨迹是运行必需的资产，必须随包分发。
+"ali_slider_reverse.runtime" = ["bridges/*.mjs"]
+"ali_slider_reverse.challenge" = ["*.json"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RUF"]
+ignore = [
+    # 复刻前端语义时需要保留看起来"多余"的显式写法。
+    "SIM108",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 桥的返回值校验天然是长条件表达式，拆开反而更难核对。
+"ali_slider_reverse/runtime/*.py" = ["B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["ali_slider_reverse/tests"]

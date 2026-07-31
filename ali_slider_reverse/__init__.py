@@ -1,257 +1,104 @@
-"""阿里 V3 滑块前端算法复现工具包。"""
+"""阿里 V3 滑块纯协议复现工具包。
 
-from .device import (
-    DEFAULT_DEVICE_CONFIG_IV,
-    DEVICE_CONFIG_FIELDS,
-    DeviceConfig,
-    DeviceToken,
-    aes_cbc_decrypt_base64,
-    aes_cbc_encrypt_base64,
-    build_device_token,
-    build_device_token_from_features,
-    build_device_data,
-    decrypt_device_config,
-    encrypt_fingerprint,
-    generate_device_token,
-    parse_device_config_plaintext,
-    parse_device_token,
-    serialize_fingerprint,
-    unpack_device_token,
-    verify_device_token,
+> 仅用于获得明确授权的本地 CTF、兼容性研究与协议验证环境。禁止用于批量解题、
+> 并发挑战、同一挑战重试、规避第三方访问控制或任何未授权目标。
+
+## 分层
+
+```text
+config / errors      集中式常量与统一异常层级
+protocol/            纯算法：签名、参数封装、token 容器、data 解包、密文恢复
+vision/              坐标运动式与 OpenCV 缺口定位
+runtime/             Node 与 OpenCV 子进程桥，重环境依赖都隔离在这一层
+challenge/           编排：Init → 资源 → 识别 → PE → Verify，持有全部网络出口
+entrypoints/         CLI、HTTP 接口与视觉 worker
+```
+
+依赖方向严格单向：``entrypoints → challenge → runtime → {protocol, vision}``。
+
+## 快速开始
+
+```python
+from ali_slider_reverse import AliSliderClient
+from ali_slider_reverse.entrypoints.options import RuntimeSettings
+
+settings = RuntimeSettings(vision_python="/path/to/vision-python")
+client = settings.build_client()
+try:
+    client.prewarm_vision()
+    outcome = client.run_captcha(settings.build_device_runtime())
+    print(outcome.verify.verify_code, outcome.verify.succeeded)
+finally:
+    client.close()
+```
+
+命令行等价物见 ``python -m ali_slider_reverse --help``。
+"""
+
+from __future__ import annotations
+
+from . import config
+from .challenge.assets import ChallengeAssets
+from .challenge.business import (
+    BusinessRequestTemplate,
+    BusinessResponse,
+    load_business_template_from_capture,
 )
-from .data_codec import (
-    CHECKSUM_VM_SEED,
-    PREFIX_VM_SEED,
-    DATA_PAYLOAD_FIELDS,
-    INITIAL_64_STATE,
-    PE091_ARG_KEY,
-    PE091_DATA_KEY,
-    TRACK_EVENT_FIELDS,
-    TRACK_LIST_FIELDS,
+from .challenge.session import (
+    AliSliderClient,
+    CaptchaChallenge,
+    CaptchaVerifyResult,
+    ChallengeOutcome,
+    VerifyBuild,
+    normalize_proxies,
+)
+from .errors import (
+    AliSliderError,
+    ApiRequestError,
     DataCodecError,
-    DecodedData,
-    build_arg,
-    build_plain_payload,
-    checksum_with_node_bridge,
-    decode64_text,
-    encode64_text,
-    keyed_state64,
-    pack_data_json,
-    pack_data_payload,
-    prefix_with_node_bridge,
-    transform64,
-    unpack_data,
-    validate_checksum_prefix,
-    validate_payload_schema,
-)
-from .image_solver import (
-    BoundingBox,
-    ConnectedComponent,
-    GapCandidate,
-    GapEstimate,
-    SliderSolution,
-    alpha_bbox,
-    bright_low_saturation_components,
-    calibrate_mapping_ratio,
-    estimate_puzzle_bbox,
-    estimate_puzzle_canvas_left,
-    estimate_puzzle_canvas_left_cv,
-    estimate_puzzle_left,
-    map_drag_x,
-    pe_puzzle_x_from_slide_pos,
-    pe_slide_pos_from_puzzle_x,
-    puzzle_left_to_slider_distance,
-    solve_slider,
-)
-from .frontend_profile import (
-    DEVICE_CONFIG_KEY_CIPHERTEXT,
-    DEVICE_TOKEN_SALT_CIPHERTEXT,
-    FEILIN_RPC_KEY_ID_CIPHERTEXT,
-    FEILIN_RPC_KEY_SECRET_CIPHERTEXT,
-    FRONTEND_ACCESS_KEY,
-    FRONTEND_IV,
-    FRONTEND_IV_HEX,
-    FrontendSecrets,
-    MAIN_RPC_KEY_ID_CIPHERTEXT,
-    MAIN_RPC_KEY_SECRET_CIPHERTEXT,
-    decrypt_frontend_constant,
-    resolve_frontend_secrets,
-)
-from .protocol import (
-    aliyun_rpc_v1_signature,
-    build_business_captcha_verify_param,
-    build_business_signed_query,
-    build_verify_captcha_param,
-    business_sha512_signature,
-    compact_json,
-    form_urlencode,
-    js_encode_uri_component,
-    js_form_urlencode,
-    ordered_form_urlencode,
-    parse_business_captcha_verify_param,
-    parse_form_urlencoded,
-    parse_verify_captcha_param,
-    rpc_percent_encode,
-    rpc_v1_canonical_query,
-    rpc_v1_signature,
-    rpc_v1_string_to_sign,
-    utc_timestamp,
-    uuid4_nonce,
-    uuid4_hex_nonce,
-)
-from .track import (
-    SDK_TRACK_FIELDS,
-    SDK_TRACK_OUTPUT_ORDER,
-    TrackConfig,
-    TrackEvent,
-    build_sdk_touch_tracker,
-    generate_human_track,
-    normalize_touch_events,
-    rescale_recorded_touch_track,
-    serialize_sdk_track_list,
-    track_from_touch_events,
-)
-from .device_runtime import (
-    DEFAULT_SDK_URL,
-    DeviceRuntimeClient,
     DeviceRuntimeError,
+    PeRuntimeError,
+    ProtocolError,
+    RuntimeBridgeError,
+    VisionError,
+)
+from .runtime.node_device import (
+    DeviceRuntimeClient,
     DeviceRuntimeResult,
     DeviceRuntimeSession,
 )
-from .client import (
-    DEFAULT_PREFIX,
-    DEFAULT_SCENE_ID,
-    AliSliderClient,
-    AliSliderError,
-    BusinessRequestTemplate,
-    BusinessResponse,
-    CaptchaChallenge,
-    CaptchaVerifyResult,
-    ChallengeAssets,
-    VerifyBuild,
-    VisionResult,
-    extract_business_sign_salt,
-    load_business_template_from_capture,
-    normalize_proxies,
-)
+from .runtime.vision import VisionResult
+
+__version__ = "2.0.0"
 
 __all__ = [
-    "BoundingBox",
-    "ConnectedComponent",
-    "CHECKSUM_VM_SEED",
-    "PREFIX_VM_SEED",
-    "DATA_PAYLOAD_FIELDS",
-    "DEFAULT_DEVICE_CONFIG_IV",
-    "DEVICE_CONFIG_FIELDS",
-    "DataCodecError",
-    "DecodedData",
-    "DeviceConfig",
-    "DeviceToken",
-    "FrontendSecrets",
-    "GapCandidate",
-    "GapEstimate",
-    "FRONTEND_ACCESS_KEY",
-    "FRONTEND_IV",
-    "FRONTEND_IV_HEX",
-    "INITIAL_64_STATE",
-    "MAIN_RPC_KEY_ID_CIPHERTEXT",
-    "MAIN_RPC_KEY_SECRET_CIPHERTEXT",
-    "PE091_ARG_KEY",
-    "PE091_DATA_KEY",
-    "DEVICE_CONFIG_KEY_CIPHERTEXT",
-    "DEVICE_TOKEN_SALT_CIPHERTEXT",
-    "FEILIN_RPC_KEY_ID_CIPHERTEXT",
-    "FEILIN_RPC_KEY_SECRET_CIPHERTEXT",
-    "SliderSolution",
-    "SDK_TRACK_FIELDS",
-    "SDK_TRACK_OUTPUT_ORDER",
-    "TRACK_EVENT_FIELDS",
-    "TRACK_LIST_FIELDS",
-    "TrackConfig",
-    "TrackEvent",
+    # 编排入口
     "AliSliderClient",
-    "AliSliderError",
-    "BusinessRequestTemplate",
-    "BusinessResponse",
+    "ChallengeOutcome",
+    "DeviceRuntimeClient",
+    # 结果模型
     "CaptchaChallenge",
     "CaptchaVerifyResult",
     "ChallengeAssets",
-    "DEFAULT_PREFIX",
-    "DEFAULT_SCENE_ID",
-    "DEFAULT_SDK_URL",
-    "DeviceRuntimeClient",
-    "DeviceRuntimeError",
     "DeviceRuntimeResult",
     "DeviceRuntimeSession",
     "VerifyBuild",
     "VisionResult",
-    "aes_cbc_decrypt_base64",
-    "aes_cbc_encrypt_base64",
-    "alpha_bbox",
-    "aliyun_rpc_v1_signature",
-    "bright_low_saturation_components",
-    "build_business_captcha_verify_param",
-    "build_business_signed_query",
-    "business_sha512_signature",
-    "build_arg",
-    "build_plain_payload",
-    "build_device_token",
-    "build_device_token_from_features",
-    "build_device_data",
-    "build_verify_captcha_param",
-    "calibrate_mapping_ratio",
-    "checksum_with_node_bridge",
-    "compact_json",
-    "decrypt_device_config",
-    "decrypt_frontend_constant",
-    "decode64_text",
-    "estimate_puzzle_bbox",
-    "estimate_puzzle_canvas_left",
-    "estimate_puzzle_canvas_left_cv",
-    "estimate_puzzle_left",
-    "encrypt_fingerprint",
-    "encode64_text",
-    "form_urlencode",
-    "js_encode_uri_component",
-    "js_form_urlencode",
-    "generate_device_token",
-    "generate_human_track",
-    "keyed_state64",
-    "map_drag_x",
-    "normalize_touch_events",
-    "build_sdk_touch_tracker",
-    "rescale_recorded_touch_track",
-    "normalize_proxies",
-    "ordered_form_urlencode",
-    "parse_business_captcha_verify_param",
-    "parse_device_config_plaintext",
-    "parse_device_token",
-    "parse_form_urlencoded",
-    "parse_verify_captcha_param",
-    "pack_data_json",
-    "pack_data_payload",
-    "prefix_with_node_bridge",
-    "pe_puzzle_x_from_slide_pos",
-    "pe_slide_pos_from_puzzle_x",
-    "puzzle_left_to_slider_distance",
-    "rpc_percent_encode",
-    "rpc_v1_canonical_query",
-    "rpc_v1_signature",
-    "rpc_v1_string_to_sign",
-    "resolve_frontend_secrets",
-    "serialize_fingerprint",
-    "serialize_sdk_track_list",
-    "solve_slider",
-    "track_from_touch_events",
-    "transform64",
-    "unpack_data",
-    "unpack_device_token",
-    "utc_timestamp",
-    "uuid4_nonce",
-    "uuid4_hex_nonce",
-    "verify_device_token",
-    "validate_checksum_prefix",
-    "validate_payload_schema",
-    "extract_business_sign_salt",
+    # 可选业务提交
+    "BusinessRequestTemplate",
+    "BusinessResponse",
     "load_business_template_from_capture",
+    # 异常
+    "AliSliderError",
+    "ApiRequestError",
+    "DataCodecError",
+    "DeviceRuntimeError",
+    "PeRuntimeError",
+    "ProtocolError",
+    "RuntimeBridgeError",
+    "VisionError",
+    # 工具
+    "config",
+    "normalize_proxies",
+    "__version__",
 ]

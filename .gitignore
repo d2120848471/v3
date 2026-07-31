@@ -24,10 +24,15 @@ pe.js
 # ── 敏感材料（绝不入库）────────────────────────────────────────────────
 # 原始抓包、app bundle、Cookie、业务 token 与 securityToken 都属于会话材料，
 # 由使用者从受控路径提供，不进源码、日志或提交历史。
+#
+# 注意：这里只写仓库根目录下的配置文件名（前导 /）。不要用 `secrets.*` 这类
+# 无锚点的通配 —— 它会连 protocol/secrets.py 这样的源码一起忽略掉。
 *capture*.json
 *bundle*.js
 AliyunCaptcha.js
-secrets.*
+/secrets.json
+/secrets.yaml
+/secrets.toml
 .env
 
 # ── 编辑器 / 系统 ─────────────────────────────────────────────────────
