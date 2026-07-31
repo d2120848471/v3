@@ -1,0 +1,37 @@
+# ── Python ────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# ── 虚拟环境 ──────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── 运行产物 ──────────────────────────────────────────────────────────
+# --artifacts-dir 保留的本轮图片与动态 PE；默认走临时目录，显式保留时勿入库。
+artifacts/
+*.log
+back.png
+shadow.png
+main.css
+pe.js
+
+# ── 敏感材料（绝不入库）────────────────────────────────────────────────
+# 原始抓包、app bundle、Cookie、业务 token 与 securityToken 都属于会话材料，
+# 由使用者从受控路径提供，不进源码、日志或提交历史。
+*capture*.json
+*bundle*.js
+AliyunCaptcha.js
+secrets.*
+.env
+
+# ── 编辑器 / 系统 ─────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp
