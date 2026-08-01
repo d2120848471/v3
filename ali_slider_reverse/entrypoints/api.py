@@ -44,6 +44,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from .. import config
+from ..challenge.device_pool import DeviceSessionPool
 from ..challenge.session import normalize_proxies
 from ..errors import AliSliderError, ApiRequestError
 from .options import (
@@ -129,11 +130,15 @@ def parse_solve_request(payload: dict[str, Any]) -> SolveRequest:
 def solve_once(
     request: SolveRequest,
     settings: RuntimeSettings,
+    pool: DeviceSessionPool | None = None,
 ) -> dict[str, Any]:
     """执行一轮完整挑战并返回响应体。
 
     每次调用都新建客户端与设备运行时：``proxy``、``SceneId`` 与 ``AaduaneId``
     逐轮不同，而 FeiLin worker 本身就绑定单轮 session，不适合跨请求复用。
+
+    ``pool`` 只改变 FeiLin 会话是"现建"还是"上一轮之后就备好的"，不改变本轮
+    只用一个会话、一个 ``CertifyId`` 的语义；未开启时行为与之前完全一致。
     """
 
     client = settings.build_client(
@@ -142,18 +147,24 @@ def solve_once(
         proxies=request.proxies,
         rpc_key_id=request.rpc_key_id,
     )
+    device_runtime = settings.build_device_runtime(
+        prefix=request.prefix, proxies=request.proxies
+    )
     with closing(client):
         # 视觉解释器的冷导入与 DeviceToken、Init、资源下载重叠；五个出网主机的
         # TLS 握手与设备链重叠。
         client.prewarm_vision()
         client.prewarm_connections()
         started = time.monotonic()
-        outcome = client.run_captcha(
-            settings.build_device_runtime(
-                prefix=request.prefix, proxies=request.proxies
-            ),
-            minimum_confidence=settings.minimum_confidence,
-        )
+        if pool is None:
+            outcome = client.run_captcha(
+                device_runtime, minimum_confidence=settings.minimum_confidence
+            )
+        else:
+            with pool.lease(device_runtime) as leased:
+                outcome = client.run_captcha(
+                    leased, minimum_confidence=settings.minimum_confidence
+                )
         elapsed_ms = int((time.monotonic() - started) * 1000)
 
     verify = outcome.verify
@@ -188,6 +199,7 @@ class SliderApiHandler(BaseHTTPRequestHandler):
 
     settings: RuntimeSettings = RuntimeSettings()
     slots: Any = _Unlimited()
+    device_pool: DeviceSessionPool | None = None
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 约定。
         if urlsplit(self.path).path != config.API_SOLVE_PATH:
@@ -239,7 +251,7 @@ class SliderApiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            body = solve_once(request, self.settings)
+            body = solve_once(request, self.settings, self.device_pool)
         except (AliSliderError, ValueError) as exc:
             self._send_error(500, exc)
             return
@@ -333,6 +345,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="同时进行的挑战数上限（默认 0 表示不限制）",
     )
+    parser.add_argument(
+        "--prewarm-device-session",
+        action="store_true",
+        help=(
+            "在上一轮响应之后预备下一轮的 FeiLin 会话，省掉约 460ms 设备链；"
+            "预备的会话无人领取时那次 Log1/Log2 就是白发的请求，因此默认关闭，"
+            "且仅对固定出口（不换代理）的部署有意义"
+        ),
+    )
     add_runtime_arguments(parser)
     add_confidence_argument(parser)
     return parser
@@ -351,6 +372,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.max_concurrency > 0
         else _Unlimited()
     )
+    device_pool = DeviceSessionPool(enabled=args.prewarm_device_session)
+    SliderApiHandler.device_pool = device_pool
 
     server = ThreadingHTTPServer((args.host, args.port), SliderApiHandler)
     server.daemon_threads = True
@@ -360,9 +383,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.max_concurrency > 0
         else "不限并发"
     )
+    prewarm_label = (
+        "预热设备会话" if args.prewarm_device_session else "不预热设备会话"
+    )
     print(
         f"滑块接口已启动：http://{host}:{port}{config.API_SOLVE_PATH}"
-        f"（{limit_label}）",
+        f"（{limit_label}，{prewarm_label}）",
         file=sys.stderr,
     )
     try:
@@ -371,6 +397,7 @@ def main(argv: list[str] | None = None) -> int:
         print("正在停止……", file=sys.stderr)
     finally:
         server.server_close()
+        device_pool.close()
     return 0
 
 
