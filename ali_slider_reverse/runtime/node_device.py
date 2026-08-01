@@ -31,10 +31,11 @@ import hashlib
 import json
 import math
 import os
+import queue
 import secrets
-import select
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
@@ -701,6 +702,8 @@ class DeviceRuntimeSession:
         self.client = client
         self.sdk_path = sdk_path
         self.process: subprocess.Popen[str] | None = None
+        self._stdout_lines: queue.Queue[str | None] | None = None
+        self._stdout_reader: threading.Thread | None = None
         self._init_result: DeviceRuntimeResult | None = None
         self._completed = False
         self._target_first_touch_age_ms: int | None = None
@@ -738,6 +741,7 @@ class DeviceRuntimeSession:
             ) from exc
 
         try:
+            self._start_stdout_reader()
             # 首阶段就完整校验容器、Log1 session 与 DeviceConfig，
             # 不合格时不必浪费一次真实的 Init 请求。
             self._init_result = _build_result(
@@ -752,24 +756,58 @@ class DeviceRuntimeSession:
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         self.close()
 
-    def _read_stage(self, expected: str) -> dict[str, Any]:
-        """阻塞读取指定阶段的 JSON 输出，超时或进程退出即失败。"""
+    def _start_stdout_reader(self) -> None:
+        """在独立线程中读取 Node stdout，兼容 Windows 子进程管道。"""
 
         process = self.process
         if process is None or process.stdout is None:
             raise DeviceRuntimeError("challenge-worker 尚未启动")
 
+        lines: queue.Queue[str | None] = queue.Queue()
+        self._stdout_lines = lines
+        reader = threading.Thread(
+            target=self._drain_stdout,
+            args=(process, lines),
+            name="ali-device-stdout",
+            daemon=True,
+        )
+        self._stdout_reader = reader
+        reader.start()
+
+    @staticmethod
+    def _drain_stdout(
+        process: subprocess.Popen[str], lines: queue.Queue[str | None]
+    ) -> None:
+        """持续把子进程 stdout 行转交给主线程。"""
+
+        stream = process.stdout
+        if stream is None:
+            lines.put(None)
+            return
+        try:
+            for line in stream:
+                lines.put(line)
+        finally:
+            # EOF 也要入队，让等待方从阻塞中醒来并返回结构化错误。
+            lines.put(None)
+
+    def _read_stage(self, expected: str) -> dict[str, Any]:
+        """阻塞读取指定阶段的 JSON 输出，超时或进程退出即失败。"""
+
+        process = self.process
+        lines = self._stdout_lines
+        if process is None or process.stdout is None or lines is None:
+            raise DeviceRuntimeError("challenge-worker 尚未启动")
+
         deadline = time.monotonic() + self.client.timeout + 5
         while time.monotonic() < deadline:
             remaining = max(0.0, deadline - time.monotonic())
-            readable, _, _ = select.select([process.stdout], [], [], remaining)
-            if not readable:
+            try:
+                line = lines.get(timeout=remaining)
+            except queue.Empty:
                 break
-            line = process.stdout.readline()
-            if not line:
-                if process.poll() is not None:
-                    break
-                continue
+            if line is None:
+                break
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError:
@@ -914,6 +952,7 @@ class DeviceRuntimeSession:
         process = self.process
         if process is None:
             return
+        reader = self._stdout_reader
         if process.stdin is not None and not process.stdin.closed:
             process.stdin.close()
         if process.poll() is None:
@@ -923,6 +962,10 @@ class DeviceRuntimeSession:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=2)
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(timeout=0.5)
+        self._stdout_reader = None
+        self._stdout_lines = None
         self.process = None
 
 
