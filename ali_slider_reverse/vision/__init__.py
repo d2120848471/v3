@@ -2,7 +2,7 @@
 
 ```text
 geometry.py    xPos ↔ slidePos 的二次运动式与 JS 取整语义（纯标准库）
-gap_solver.py  基于 OpenCV 的多路缺口检测与 Chamfer 仲裁
+gap_solver.py  基于缺口渲染模型的多路候选定位与物理判据复核
 ```
 
 ``geometry`` 只依赖标准库，主协议进程直接使用；``gap_solver`` 需要

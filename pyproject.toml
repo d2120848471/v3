@@ -30,7 +30,6 @@ ali-slider-api = "ali_slider_reverse.entrypoints.api:main"
 
 [tool.setuptools.packages.find]
 include = ["ali_slider_reverse*"]
-exclude = ["ali_slider_reverse.tests*"]
 
 [tool.setuptools.package-data]
 # Node 桥脚本与默认触摸轨迹是运行必需的资产，必须随包分发。
@@ -51,6 +50,3 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # 桥的返回值校验天然是长条件表达式，拆开反而更难核对。
 "ali_slider_reverse/runtime/*.py" = ["B008"]
-
-[tool.pytest.ini_options]
-testpaths = ["ali_slider_reverse/tests"]
