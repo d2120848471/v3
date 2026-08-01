@@ -17,41 +17,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import tempfile
-from pathlib import Path
 
-from ..vision.gap_solver import solve_gap
-
-
-def _warm_algorithm() -> None:
-    """用一张合成图空跑一次完整求解，把算子首次初始化的开销提前付掉。
-
-    合成图只需要能走完"候选 → 复核"全流程，不需要像真实挑战图：平滑噪声背景配
-    一块矩形 alpha 就够。
-
-    任何失败都静默忽略——预热失败最多退回原来的耗时，绝不能让 worker 起不来。
-    """
-
-    try:
-        import cv2
-        import numpy
-
-        with tempfile.TemporaryDirectory(prefix="ali-vision-warm-") as directory:
-            root = Path(directory)
-            background_path = root / "back.png"
-            shadow_path = root / "shadow.png"
-
-            rng = numpy.random.default_rng(0)
-            background = (rng.random((200, 296, 3)) * 80 + 100).astype(numpy.uint8)
-            cv2.imwrite(str(background_path), cv2.GaussianBlur(background, (15, 15), 0))
-
-            shadow = numpy.zeros((200, 52, 4), dtype=numpy.uint8)
-            shadow[40:150, 5:47] = 255
-            cv2.imwrite(str(shadow_path), shadow)
-
-            solve_gap(background_path, shadow_path)
-    except Exception:
-        return
+from ..vision.gap_solver import solve_gap, warm_up
 
 
 def _solve_payload(background: str, shadow: str) -> dict[str, object]:
@@ -86,9 +53,7 @@ def _run_worker() -> int:
     """常驻模式：预载依赖并热身后按行处理请求。"""
 
     # 在收到图片路径前完成冷导入与算子初始化，再用 ready 信号告知调用方。
-    __import__("cv2")
-    __import__("numpy")
-    _warm_algorithm()
+    warm_up()
     print('{"ready":true}', flush=True)
 
     for line in sys.stdin:

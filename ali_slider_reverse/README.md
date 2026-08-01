@@ -82,8 +82,9 @@ ali_slider_reverse/
 ├── entrypoints/
 │   ├── cli.py             solve / run 命令
 │   ├── api.py             标准库 http.server 实现的 HTTP 接口
+│   ├── desktop.py         桌面窗口模式 + 免安装分发包的总入口
 │   ├── vision_worker.py   OpenCV 求解子进程入口
-│   └── options.py         两个入口共享的参数定义与对象装配
+│   └── options.py         三个入口共享的参数定义与对象装配
 ```
 
 依赖方向严格单向：`entrypoints → challenge → runtime → {protocol, vision}`。三个桥
@@ -330,6 +331,24 @@ python3 -m pip install -e '.[vision]'
 
 安装后可用 `ali-slider` 与 `ali-slider-api` 两个命令；不安装则用 `python -m` 形式，
 下文命令都从本 README 的上一级工作区根目录执行。
+
+### 5.1 Windows 免安装分发包
+
+需要交付给没有开发环境的机器时，把 Python、Node 与 OpenCV 一起打进一个解压即用的
+文件夹，双击 `AliSlider.exe` 就能跑。构建脚本与完整说明在上一级的 `packaging/`：
+
+```powershell
+# 在 Windows 上执行；PyInstaller 不能交叉编译，macOS/Linux 上产不出 exe
+powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
+```
+
+手边没有 Windows 机器时，用 `.github/workflows/build-windows.yml` 在 GitHub 的
+Windows runner 上构建，跑完从 Artifacts 下载。
+
+冻结分发下有两处行为自动切换，都不需要配置：Node 取随包携带的那一份而不是 PATH；
+图像识别在进程内跑而不是拉起第二个解释器（`--vision-python` 默认值变为哨兵
+`<in-process>`，预热改在后台线程完成）。跑不起来时先执行 `AliSlider.exe doctor`，
+它会逐项报告资源解析与运行时状态。
 
 ## 6. 运行
 

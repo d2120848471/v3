@@ -13,7 +13,49 @@ runtime 模块里（超时、GatherCost 区间、首触年龄、vision 解释器
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+
+
+# ==========================================================================
+# 冻结分发（PyInstaller）
+#
+# 打包后的可执行文件里没有 pip、没有 PATH 上的 node，也没有第二个装了 OpenCV 的
+# 解释器。所以运行时要能自己回答两个问题：Node 在哪、图像识别怎么跑。
+# ==========================================================================
+
+FROZEN = bool(getattr(sys, "frozen", False))
+"""是否运行在 PyInstaller 冻结分发里。"""
+
+BUNDLE_ROOT = Path(getattr(sys, "_MEIPASS", "")) if FROZEN else None
+"""冻结分发的资源根目录；非冻结运行时为 ``None``。"""
+
+VISION_IN_PROCESS = "<in-process>"
+"""``vision_python`` 的哨兵值：不拉起子解释器，直接在本进程内求解。
+
+冻结分发已经把 OpenCV/NumPy 打进同一个可执行文件，再 spawn 一个"带 OpenCV 的
+Python"既找不到、也没必要。
+"""
+
+
+def _bundled_node_binary() -> str | None:
+    """定位随包携带的 Node 可执行文件。
+
+    先看可执行文件旁边（允许分发后自行替换版本），再看打包资源目录。两处都没有
+    时返回 ``None``，由调用方回落到 PATH 上的 ``node``。
+    """
+
+    if not FROZEN:
+        return None
+    name = "node.exe" if sys.platform == "win32" else "node"
+    roots = [Path(sys.executable).resolve().parent]
+    if BUNDLE_ROOT is not None:
+        roots.append(BUNDLE_ROOT)
+    for root in roots:
+        candidate = root / "node" / name
+        if candidate.is_file():
+            return str(candidate)
+    return None
 
 
 # ==========================================================================
@@ -21,7 +63,10 @@ from pathlib import Path
 # ==========================================================================
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
-"""包根目录；Node 桥脚本与默认轨迹资产都相对它定位。"""
+"""包根目录；Node 桥脚本与默认轨迹资产都相对它定位。
+
+冻结分发下 ``__file__`` 指向解包目录内的同名路径，因此这里无需特判。
+"""
 
 BRIDGES_DIR = PACKAGE_ROOT / "runtime" / "bridges"
 """Node 侧桥脚本目录。"""
@@ -169,14 +214,24 @@ SLIDER_HANDLE_WIDTH = 40
 # 运行默认值：入口层可通过命令行覆盖
 # ==========================================================================
 
-DEFAULT_NODE_BINARY = "node"
+DEFAULT_NODE_BINARY = _bundled_node_binary() or "node"
+"""Node 可执行文件。
 
-DEFAULT_VISION_PYTHON = "/opt/homebrew/bin/python3"
+冻结分发优先用随包携带的那一份，保证目标机器没装 Node 也能跑；否则取 PATH。
+"""
+
+DEFAULT_VISION_PYTHON = (
+    VISION_IN_PROCESS
+    if FROZEN
+    else ("/opt/homebrew/bin/python3" if sys.platform == "darwin" else sys.executable)
+)
 """默认的 OpenCV/NumPy 解释器。
 
 主协议解释器只需 requests + cryptography，图像识别则需要 opencv-python +
-numpy。两者常常不是同一个环境，因此拆成独立进程；这里的默认值对应已验证的
-macOS/Homebrew 环境，其他平台请用 ``--vision-python`` 指定。
+numpy。两者常常不是同一个环境，因此拆成独立进程；macOS 的默认值对应已验证的
+Homebrew 环境，其他平台默认取当前解释器，都可用 ``--vision-python`` 覆盖。
+
+冻结分发没有"第二个解释器"可言，取 :data:`VISION_IN_PROCESS` 走进程内求解。
 """
 
 DEFAULT_TIMEOUT = 25.0
@@ -242,6 +297,7 @@ __all__ = [
     "API_PORT",
     "API_SOLVE_PATH",
     "BRIDGES_DIR",
+    "BUNDLE_ROOT",
     "BUSINESS_SALT_SHA256",
     "CAPTCHA_API_VERSION",
     "DEFAULT_FIRST_TOUCH_AGE_RANGE",
@@ -254,6 +310,7 @@ __all__ = [
     "DEFAULT_TIMEOUT",
     "DEFAULT_TOUCH_TRACK",
     "DEFAULT_VISION_PYTHON",
+    "FROZEN",
     "IMAGE_BASE",
     "ORIGIN",
     "PACKAGE_ROOT",
@@ -269,6 +326,7 @@ __all__ = [
     "UPLOAD_URL",
     "USER_AGENT",
     "VERIFY_FUTURE_SKEW_LIMIT_MS",
+    "VISION_IN_PROCESS",
     "browser_headers",
     "init_url",
     "verify_url",

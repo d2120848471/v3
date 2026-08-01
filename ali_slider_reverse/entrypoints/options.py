@@ -96,6 +96,33 @@ def add_confidence_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_server_arguments(parser: argparse.ArgumentParser) -> None:
+    """添加 HTTP 服务端参数；纯接口入口与桌面窗口入口共用。"""
+
+    parser.add_argument("--host", default=config.API_HOST, help="监听地址")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=config.API_PORT,
+        help=f"监听端口（默认 {config.API_PORT}）",
+    )
+    parser.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=0,
+        help="同时进行的挑战数上限（默认 0 表示不限制）",
+    )
+    parser.add_argument(
+        "--prewarm-device-session",
+        action="store_true",
+        help=(
+            "在上一轮响应之后预备下一轮的 FeiLin 会话，省掉约 460ms 设备链；"
+            "预备的会话无人领取时那次 Log1/Log2 就是白发的请求，因此默认关闭，"
+            "且仅对固定出口（不换代理）的部署有意义"
+        ),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeSettings:
     """启动时固定的运行环境，与单次挑战无关。"""
@@ -174,4 +201,5 @@ __all__ = [
     "RuntimeSettings",
     "add_confidence_argument",
     "add_runtime_arguments",
+    "add_server_arguments",
 ]

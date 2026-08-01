@@ -37,6 +37,7 @@ import json
 import sys
 import threading
 import time
+from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -51,6 +52,7 @@ from .options import (
     RuntimeSettings,
     add_confidence_argument,
     add_runtime_arguments,
+    add_server_arguments,
 )
 
 
@@ -201,6 +203,16 @@ class SliderApiHandler(BaseHTTPRequestHandler):
     slots: Any = _Unlimited()
     device_pool: DeviceSessionPool | None = None
 
+    result_hook: Callable[[str, str, int, dict[str, Any]], None] | None = None
+    """可选的宿主回调，每次响应发出后以 ``(method, path, status, body)`` 调用。
+
+    给桌面启动器一类的宿主一个观察本轮结果的口子。回调内的异常一律吞掉：展示
+    逻辑绝不能影响已经发出的协议响应。
+
+    赋值请用**可调用对象**或 ``staticmethod``：这是类属性，直接挂一个普通函数会
+    被描述符协议当成方法绑定，第一个实参会变成 handler 自己。
+    """
+
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 约定。
         if urlsplit(self.path).path != config.API_SOLVE_PATH:
             self._send_json(404, {"ok": False, "error": "未知路径"})
@@ -302,6 +314,13 @@ class SliderApiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+        hook = self.result_hook
+        if hook is not None:
+            try:
+                hook(self.command, urlsplit(self.path).path, status, body)
+            except Exception:  # pragma: no cover - 展示失败不影响协议响应。
+                pass
+
     def _send_error(self, status: int, exc: Exception) -> None:
         self._send_json(
             status,
@@ -332,28 +351,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python -m ali_slider_reverse.entrypoints.api",
         description="阿里 V3 滑块纯协议 HTTP 接口",
     )
-    parser.add_argument("--host", default=config.API_HOST, help="监听地址")
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=config.API_PORT,
-        help=f"监听端口（默认 {config.API_PORT}）",
-    )
-    parser.add_argument(
-        "--max-concurrency",
-        type=int,
-        default=0,
-        help="同时进行的挑战数上限（默认 0 表示不限制）",
-    )
-    parser.add_argument(
-        "--prewarm-device-session",
-        action="store_true",
-        help=(
-            "在上一轮响应之后预备下一轮的 FeiLin 会话，省掉约 460ms 设备链；"
-            "预备的会话无人领取时那次 Log1/Log2 就是白发的请求，因此默认关闭，"
-            "且仅对固定出口（不换代理）的部署有意义"
-        ),
-    )
+    add_server_arguments(parser)
     add_runtime_arguments(parser)
     add_confidence_argument(parser)
     return parser
