@@ -688,6 +688,13 @@ function wait(delayMs) {
 }
 
 
+// 跨过一个完整的宿主事件循环轮次（timers → poll → check）：已到期的 timer 与
+// 排队的 microtask 照常执行，但不付 Node 把 setTimeout(0) 抬到 1ms 的固定代价。
+function nextHostTurn() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+
 function alignLogicalReplayInput(input, hostNowMs) {
   if (!Number.isInteger(hostNowMs) || hostNowMs < 1) {
     throw new Error("hostNowMs 必须是有效 epoch 毫秒");
@@ -763,7 +770,13 @@ async function waitForSlider(dom, timeoutMs) {
 }
 
 
-async function replayTrack(context, dom, input, logicalClock) {
+async function replayTrack(
+  context,
+  dom,
+  input,
+  logicalClock,
+  hasPendingAnimationFrame = () => true,
+) {
   const slider = await waitForSlider(dom, 3_000);
   logicalClock.advanceTo(input.firstTouchAgeMs);
   const actualFirstTouchAgeMs = context.performance.now();
@@ -800,9 +813,23 @@ async function replayTrack(context, dom, input, logicalClock) {
     } else {
       context.document.dispatchEvent(event);
     }
-    // 零延迟宿主 timer 仍跨过一个真实 macrotask，使 dispatch 期间同步排入的
-    // 当前 1ms RAF/host callback 在下一事件前执行；不按逻辑 dt 真实睡眠。
-    await wait(RUNTIME_CALLBACK_TURN_MS);
+    // 每条事件后跨一个真实 macrotask，让 dispatch 期间同步排入的 host callback
+    // 在下一事件前执行；不按逻辑 dt 真实睡眠。
+    //
+    // 这个 turn 有多长是有讲究的。PE 的 requestAnimationFrame 由真实
+    // setTimeout(cb, 1) 驱动，一条回调自我续注册的链需要真实时间才能推进；实测
+    // 这条链约 11 环，在旧的 1ms turn 下正好在拖拽前段跑完。若整段回放压到
+    // setImmediate 的量级，链就跑不完，TrackList 会少掉子流并被 Python 侧的字段
+    // 校验拦下——这是实测过的失败模式，不是假想。
+    //
+    // 因此按"链是否还活着"分流：还有待触发帧就付真实 1ms 让它按自己的节奏走完，
+    // 之后的事件只跨一个宿主 turn。回放期间 PE 不注册任何非 RAF 宿主定时器
+    // （全在 construct/init 阶段），所以快路径上没有会被饿死的回调。
+    await (
+      hasPendingAnimationFrame()
+        ? wait(RUNTIME_CALLBACK_TURN_MS)
+        : nextHostTurn()
+    );
   }
   return {
     targetFirstTouchAgeMs: input.firstTouchAgeMs,
@@ -1039,9 +1066,14 @@ async function main() {
   });
   context.performance = shiftedPerformance;
   let animationTimestamp = null;
+  // 待触发的 RAF 帧数。回放循环据此决定这一条事件后要不要付真实 1ms——
+  // 见 replayTrack 里的说明。
+  let pendingAnimationFrames = 0;
   context.requestAnimationFrame = (callback) => {
+    pendingAnimationFrames += 1;
     return context.setTimeout(
       () => {
+        pendingAnimationFrames -= 1;
         animationTimestamp = animationTimestamp === null
           ? context.performance.now()
           : animationTimestamp + (1000 / 120);
@@ -1056,6 +1088,7 @@ async function main() {
     );
   };
   context.cancelAnimationFrame = (identifier) => {
+    if (pendingAnimationFrames > 0) pendingAnimationFrames -= 1;
     context.clearTimeout(identifier);
   };
   context.NodeList = class NodeList extends Array {};
@@ -1260,6 +1293,7 @@ async function main() {
     dom,
     input,
     logicalClock,
+    () => pendingAnimationFrames > 0,
   );
   const verifyParam = await Promise.race([
     verifyPromise,
