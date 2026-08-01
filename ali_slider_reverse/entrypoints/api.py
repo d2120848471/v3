@@ -143,8 +143,10 @@ def solve_once(
         rpc_key_id=request.rpc_key_id,
     )
     with closing(client):
-        # 视觉解释器的冷导入与 DeviceToken、Init、资源下载重叠。
+        # 视觉解释器的冷导入与 DeviceToken、Init、资源下载重叠；五个出网主机的
+        # TLS 握手与设备链重叠。
         client.prewarm_vision()
+        client.prewarm_connections()
         started = time.monotonic()
         outcome = client.run_captcha(
             settings.build_device_runtime(

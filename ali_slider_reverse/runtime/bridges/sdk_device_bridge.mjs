@@ -1685,6 +1685,14 @@ function wait(delayMs) {
 }
 
 
+// 跨过一个完整的宿主事件循环轮次（timers → poll → check），语义与 wait(0)
+// 相同——已到期的 timer 与排队的 microtask 照常执行——但不付 Node 把
+// setTimeout(0) 抬到 1ms 的固定代价。回放 86 条事件时这是 106ms 对 1.7ms 的差距。
+function nextHostTurn() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+
 function selectFeiLinGetterOwner(context) {
   const getterOwner = context?.z_um || context?.um;
   return getterOwner
@@ -1887,7 +1895,7 @@ async function replayFeiLinInteractionEvents(context, events) {
     // 保留 PE 提供的完整逻辑 timeStamp，但不把相邻时间差转换成真实
     // sleep；每条事件后仍跨一个 host turn，让 FeiLin 的 timer/microtask
     // listener 不会被压成单个同步 burst。
-    await wait(0);
+    await nextHostTurn();
   }
 }
 
@@ -2053,7 +2061,7 @@ async function main() {
       if (completion.postInteractionDelayMs > 0) {
         // post delay 已保留在 PE data/getter 相对时间中；这里只维持 getter
         // 前的异步 turn，不再按该逻辑毫秒值真实等待。
-        await wait(0);
+        await nextHostTurn();
       }
       const verifyDeviceToken = callPeFeiLinGetter(
         getterOwner,

@@ -19,17 +19,27 @@
 
 Init 之前拿不到本轮图片与 ``StaticPath``，无法安全预取。Init 之后能并行的只有
 两类互相独立的工作：四项公开资源的下载，以及"只尝试一次的 UploadLog"与本地
-OpenCV 识别。所有 worker 都在 PE/Verify 开始前回收，不留后台悬挂任务。
+OpenCV 识别。
 
-单轮之内不并发多个挑战。多轮可以同时进行，但每轮持有自己的客户端、FeiLin
-worker、临时目录与 ``CertifyId``，轮与轮之间没有共享可变状态。
+UploadLog 是 best-effort 遥测，**不参与任何控制流**，公开 SDK 也不 await 它，
+因此它只需要在本轮结束前被回收，不必挡住 PE。真正会挡住 PE 的只有图像置信度
+这道闸。
+
+还有一段容易被忽略的空窗：设备链（SDK 准备 → Node 启动 → Log1 → Log2）期间
+Python 侧完全阻塞在读子进程输出上。本轮五个出网主机的 TLS 握手就在这里提前做掉
+（见 :mod:`.transport`），其中 Verify 主机原本要等到整条链路的最后一步才第一次
+握手。
+
+所有 worker 都在本轮返回前回收，不留后台悬挂任务。单轮之内不并发多个挑战。多轮
+可以同时进行，但每轮持有自己的客户端、FeiLin worker、临时目录与 ``CertifyId``，
+轮与轮之间没有共享可变状态。
 """
 
 from __future__ import annotations
 
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -62,6 +72,7 @@ from .business import (
     submit_business,
 )
 from .track import load_scaled_touch_track
+from .transport import build_pool_adapter, pooled_session, warm_connections
 
 
 _SUPPORTED_PROXY_SCHEMES = frozenset(
@@ -109,7 +120,6 @@ class VerifyBuild:
     last_touch_to_verify_ms: float = field(repr=False)
     post_interaction_delay_ms: float = field(repr=False)
 
-    upload_log_succeeded: bool
     device_getter_arguments: tuple[str, ...] = field(repr=False)
     feilin_interaction_events: tuple[dict[str, float | bool | str], ...] = field(
         repr=False
@@ -143,6 +153,13 @@ class ChallengeOutcome:
     vision: VisionResult
     build: VerifyBuild
     verify: CaptchaVerifyResult
+
+    upload_log_succeeded: bool
+    """best-effort 遥测是否送达。
+
+    放在这一层而不是 :class:`VerifyBuild` 里：它与 PE 原生生成的 Verify 载荷毫无
+    关系，只是本轮的一项记录，因此也不需要在 PE 开始前就有结果。
+    """
 
 
 # ==========================================================================
@@ -187,6 +204,18 @@ def _requests_module() -> Any:
     except ImportError as exc:  # pragma: no cover - 由调用环境决定。
         raise AliSliderError("协议客户端需要 requests") from exc
     return requests
+
+
+def _settled_flag(future: Future[bool], *, timeout: float) -> bool:
+    """读取 best-effort 任务的结果，超时或异常一律记为失败。
+
+    调用点必须选在"这个 worker 反正要被回收"之后——那时取结果不增加任何等待。
+    """
+
+    try:
+        return bool(future.result(timeout=timeout))
+    except Exception:  # pragma: no cover - 含超时；任务内部已吞掉全部异常。
+        return False
 
 
 # ==========================================================================
@@ -243,7 +272,12 @@ class AliSliderClient:
         self.proxies = dict(proxies) if proxies else None
 
         self._requests = _requests_module()
+        # 本轮共享的连接池：Session 仍按线程隔离，但热连接集中在这个 adapter 上，
+        # 预热出来的 TLS 连接才能被 Init/Verify/UploadLog 和四项资源下载共同复用。
+        self._adapter = build_pool_adapter(self._requests)
+        self._connections_warmed = False
         self.session = self._requests.Session()
+        self.session.mount("https://", self._adapter)
         if self.proxies is not None:
             self.session.proxies.update(self.proxies)
 
@@ -257,6 +291,7 @@ class AliSliderClient:
             timeout=self.timeout,
             proxies=self.proxies,
             referer=referer,
+            adapter=self._adapter,
         )
         self.pe_runtime = PeRuntimeClient(
             node_binary=node_binary,
@@ -280,13 +315,43 @@ class AliSliderClient:
 
         self.vision.prewarm()
 
+    def prewarm_connections(self) -> None:
+        """提前建立本轮五个出网主机的 TLS 连接。
+
+        建议在设备链开始前调用：那段时间 Python 只是阻塞在读 Node 输出上，正好
+        用来把握手做掉。只建连接、不发 HTTP 字节，因此没有任何协议侧副作用。
+
+        重复调用是安全的，每个客户端只预热一次；走代理时整体跳过（原因见
+        :mod:`.transport`）。
+        """
+
+        if self._connections_warmed:
+            return
+        self._connections_warmed = True
+        warm_connections(
+            self._adapter,
+            (
+                self.init_url,
+                self.verify_url,
+                self.upload_url,
+                config.IMAGE_BASE,
+                config.PE_BASE,
+            ),
+            proxies=self.proxies,
+            timeout=self.timeout,
+        )
+
     def close(self) -> None:
-        """回收视觉子进程与 HTTP 会话。"""
+        """回收视觉子进程、HTTP 会话与共享连接池。"""
 
         self.vision.close()
         try:
             self.session.close()
         except Exception:  # pragma: no cover - 关闭已失效会话的兜底。
+            pass
+        try:
+            self._adapter.close()
+        except Exception:  # pragma: no cover - 关闭已失效连接池的兜底。
             pass
 
     def __del__(self) -> None:  # pragma: no cover - 异常退出时的兜底回收。
@@ -324,11 +389,22 @@ class AliSliderClient:
         )
         return params
 
-    def _post_rpc(self, url: str, params: dict[str, str]) -> dict[str, Any]:
-        """发送一次 RPC 并返回 JSON 对象。"""
+    def _post_rpc(
+        self,
+        url: str,
+        params: dict[str, str],
+        *,
+        session: Any | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """发送一次 RPC 并返回 JSON 对象。
+
+        ``session`` 用于把 UploadLog 挪到独立会话上——它与 PE/Verify 并发在跑，
+        不能和主 RPC 会话共用一个 ``requests.Session``。
+        """
 
         try:
-            response = self.session.post(
+            response = (session or self.session).post(
                 url,
                 data=js_form_urlencode(params),
                 headers={
@@ -339,7 +415,7 @@ class AliSliderClient:
                         "application/x-www-form-urlencoded; charset=UTF-8"
                     ),
                 },
-                timeout=self.timeout,
+                timeout=self.timeout if timeout is None else timeout,
             )
             response.raise_for_status()
         except Exception as exc:
@@ -465,6 +541,9 @@ class AliSliderClient:
         **任何失败都只返回 ``False``**：公开 SDK 不 await 这次上传，无论同步异常
         与否都立刻标记 logUploaded。遥测的构造、落盘或网络失败都不能改变本轮的
         PE/Verify 控制流，也不得把原异常内容带进日志。
+
+        本方法在后台线程里与 PE 并发执行，因此走**独立 Session**（只共享线程安全
+        的连接池），不碰主 RPC 会话。
         """
 
         try:
@@ -501,10 +580,18 @@ class AliSliderClient:
                 ),
                 "rt": max(0, ready_ms - challenge.init_started_ms),
             }
-            self._post_rpc(
-                self.upload_url,
-                self._rpc_params("UploadLog", [("log", compact_json(log_info))]),
-            )
+            with pooled_session(
+                self._requests, self._adapter, proxies=self.proxies
+            ) as upload_session:
+                self._post_rpc(
+                    self.upload_url,
+                    self._rpc_params(
+                        "UploadLog", [("log", compact_json(log_info))]
+                    ),
+                    session=upload_session,
+                    # 遥测不值得让本轮收尾时陪它等满主超时；上限压到 5 秒。
+                    timeout=min(self.timeout, 5.0),
+                )
         except Exception:
             return False
         return True
@@ -519,7 +606,6 @@ class AliSliderClient:
         device: DeviceRuntimeResult,
         init_begin_time: int,
         target_first_touch_age_ms: int,
-        upload_log_succeeded: bool,
         fixture_path: str | Path | None = None,
     ) -> VerifyBuild:
         """在隔离 Node VM 中让动态 PE 原生生成 data，并复核 getter 合同。
@@ -528,9 +614,6 @@ class AliSliderClient:
         目标轨迹一致，以及 getter 恰好被调用一次、恰好收到一个非空字符串实参——
         后者是刷新 Verify DeviceToken 的唯一依据。
         """
-
-        if not isinstance(upload_log_succeeded, bool):
-            raise ValueError("upload_log_succeeded 必须是 bool")
 
         track = load_scaled_touch_track(
             target_distance=vision.slide_pos,
@@ -594,7 +677,6 @@ class AliSliderClient:
             touch_duration_ms=native.touch_duration_ms,
             last_touch_to_verify_ms=native.last_touch_to_verify_ms,
             post_interaction_delay_ms=native.post_interaction_delay_ms,
-            upload_log_succeeded=upload_log_succeeded,
             device_getter_arguments=(getter_argument,),
             feilin_interaction_events=native.mousemove_events,
         )
@@ -706,6 +788,10 @@ class AliSliderClient:
         if not 0.0 <= minimum_confidence <= 1.0:
             raise ValueError("minimum_confidence 必须位于 0..1")
 
+        # 设备链是本轮第一段长阻塞，且期间 Python 无事可做；五个出网主机的 TLS
+        # 握手全部塞进这段空窗，其中 Verify 主机原本要等到最后一步才第一次握手。
+        self.prewarm_connections()
+
         with ExitStack() as stack:
             # FeiLin VM 必须跨越整个 Init→PE→Verify 过程保持存活。
             device_session = stack.enter_context(
@@ -724,23 +810,24 @@ class AliSliderClient:
 
             assets = self.download_assets(challenge, directory)
 
-            # 公开 SDK 不 await UploadLog，所以让 best-effort 遥测与本地识别重叠；
-            # 但必须在 PE/Verify 占用主 RPC session 之前回收这个 worker。
-            with ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="ali-upload-log"
-            ) as executor:
-                upload_future = executor.submit(
-                    self.upload_initialization_log, challenge, assets
+            # UploadLog 是 best-effort 遥测，不参与任何控制流，公开 SDK 也不 await
+            # 它；因此只需在本轮返回前回收，不能让 PE 站在这里干等一次完整的网络
+            # 往返。executor 注册在 ExitStack 上，任何路径退出都会 join，不留悬挂。
+            executor = stack.enter_context(
+                ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="ali-upload-log"
                 )
-                vision = self.solve_assets(
-                    assets, x_pos_override=x_pos_override
+            )
+            upload_future = executor.submit(
+                self.upload_initialization_log, challenge, assets
+            )
+
+            vision = self.solve_assets(assets, x_pos_override=x_pos_override)
+            if vision.confidence < minimum_confidence:
+                raise AliSliderError(
+                    "缺口置信度不足，已停止且未发送 Verify："
+                    f"{vision.confidence:.3f} < {minimum_confidence:.3f}"
                 )
-                if vision.confidence < minimum_confidence:
-                    raise AliSliderError(
-                        "缺口置信度不足，已停止且未发送 Verify："
-                        f"{vision.confidence:.3f} < {minimum_confidence:.3f}"
-                    )
-            upload_log_succeeded = upload_future.result()
 
             # 首触年龄的门控发生在 PE slider ready 之后、真正 dispatch 之前，
             # 因此 Node 启动与 SDK/PE 初始化的耗时不会叠加到目标年龄上。
@@ -754,7 +841,6 @@ class AliSliderClient:
                 target_first_touch_age_ms=(
                     device_session.target_first_touch_age_ms
                 ),
-                upload_log_succeeded=upload_log_succeeded,
                 fixture_path=fixture_path,
             )
 
@@ -778,12 +864,18 @@ class AliSliderClient:
                 challenge, device.verify_token, build
             )
 
+            # 遥测 worker 注册在 ExitStack 上，本轮返回前无论如何都要 join，所以在
+            # Verify 之后取结果不增加任何等待——只是把同一段 join 提前几行，换来
+            # 精确的记录。上限与它自己的请求超时一致，异常情况下也不会挂死。
+            upload_log_succeeded = _settled_flag(upload_future, timeout=5.0)
+
         return ChallengeOutcome(
             device=device,
             challenge=challenge,
             vision=vision,
             build=build,
             verify=verify,
+            upload_log_succeeded=upload_log_succeeded,
         )
 
 

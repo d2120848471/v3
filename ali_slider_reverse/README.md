@@ -73,6 +73,7 @@ ali_slider_reverse/
 ├── challenge/             编排层，持有全部对外网络出口
 │   ├── session.py         一轮挑战的状态机与单次 Verify 边界
 │   ├── assets.py          四项公开资源的并发下载与 PNG 尺寸解析
+│   ├── transport.py       共享连接池与设备链空窗期的 TLS 预热
 │   ├── track.py           触摸轨迹资产的读取与缩放
 │   ├── business.py        可选的业务请求提交
 │   └── default_touch_track.json    脱敏触摸轨迹（运行必需资产）
@@ -249,8 +250,32 @@ JavaScript `Math.round` 语义（即 `floor(value + 0.5)`，不能用 Python 的
 
 Init 之前没有本轮图片和 `StaticPath`，无法安全预取 challenge-bound 资源。Init 之后
 可并行的只有四项公开资源下载，以及只尝试一次的 best-effort `UploadLog` 与本地
-OpenCV 识别。所有 worker 都会在 PE/Verify 前回收，不共享跨线程 `requests.Session`，
-也不让 UploadLog 在后台悬空。
+OpenCV 识别。
+
+`UploadLog` **不挡 PE**。它不参与任何控制流，公开 SDK 也不 await 它，因此没有理由
+让 PE 站在那里干等一次完整的网络往返（实测约 300ms）。它的 worker 注册在本轮的
+`ExitStack` 上，任何退出路径都会 join，不会在后台悬空；结果在 Verify 之后读取——
+那时这次 join 反正要发生，取值不增加任何等待。它也走独立的 `requests.Session`，
+不与主 RPC 会话并发共用。
+
+还有一段容易被忽略的空窗：设备链（SDK 准备 → Node 启动 → Log1 → Log2）期间
+Python 侧完全阻塞在读子进程输出上。本轮五个出网主机的 TLS 握手就安排在这里：
+
+```text
+o.alicdn.com                       公开 SDK（命中缓存时不出网）
+<prefix>.captcha-open              Init
+<prefix>-verify.captcha-open       Verify   ← 原本要等到最后一步才第一次握手
+upload.captcha-open                UploadLog
+static-captcha / g.alicdn          图片与动态 PE
+```
+
+预热只建立 TCP + TLS 连接并放回 urllib3 连接池，**不发送任何 HTTP 字节**，没有协议
+侧副作用。走代理时整体跳过——urllib3 的 `CONNECT` 隧道要到 `urlopen` 内部才建立，
+直接预连只会得到没有隧道的半成品连接。
+
+`requests.Session` 仍然按线程隔离（它不承诺跨线程共享），但底层 `HTTPAdapter` 由
+整轮共享——真正持有热连接的 `PoolManager` 本身是线程安全的。短会话结束时必须先把
+共享 adapter 摘掉再 `close()`，否则一次下载就把整轮预热的连接全部销毁。
 
 单轮之内不并发多个挑战。HTTP 接口允许多轮同时进行，但每轮持有自己的客户端、FeiLin
 worker、临时目录和 `CertifyId`，轮与轮之间没有共享可变状态。
@@ -259,6 +284,22 @@ worker、临时目录和 `CertifyId`，轮与轮之间没有共享可变状态�
 阶段各测一次采集耗时，空闲时两次都落到 0ms 并被统一归一化，并发抢占 CPU 时两次都
 会超过下限且互不相等。这属于桥的测量方式，不代表 FeiLin session 不一致，因此统一取
 先发生的 Init 耗时——真实页面里 Verify token 复用的也正是 Init 之前那次采集。
+
+
+### 4.9 逻辑时间不 sleep，宿主 turn 也不该 sleep
+
+虚拟时钟已经保证不按逻辑 `dt` 真实等待，但回放循环里"每条事件跨一个宿主 turn"
+这件事本身也有代价：Node 把 `setTimeout(0)` 抬到 1ms，86 条事件就是 106ms。
+
+`setImmediate` 跨的是同一个完整事件循环轮次（timers → poll → check），已到期的
+timer 与排队的 microtask 照常执行，语义等价但没有那 1ms 下限——实测 86 次从
+106ms 降到 1.7ms。设备桥回放 FeiLin mousemove 流时用的就是它。
+
+动态 PE 桥的回放循环**没有**跟着改：那里的 `requestAnimationFrame` 是用
+`setTimeout(cb, 1)` 实现的，宿主 turn 必须久到让当帧 RAF 回调在下一条事件前跑完，
+否则会破坏 4.3 节的 `86 → 86 → 87` 合同。要拿掉那 106ms，得先把 RAF 换成桥自己
+维护、每条事件后显式 drain 的队列，并重新验证 mm 计数。
+
 
 ## 5. 环境与安装
 
@@ -318,6 +359,11 @@ PYTHONPATH="$PWD" python3 -m ali_slider_reverse run \
 
 `--sdk-js` 可以省略；省略时会下载官方公开 SDK。要锁定本地副本时传
 `--sdk-js /path/to/public/AliyunCaptcha.js`。
+
+省略时下载到的 SDK 会缓存在 `${XDG_CACHE_HOME:-~/.cache}/ali-slider/`，默认 15 分钟
+内复用（`config.SDK_CACHE_TTL_SECONDS`）。它是个 225KB 的公开静态文件，更新频率是
+天/周级，而每轮重下要付一次 CDN 往返。写入是先写临时文件再 `os.replace`，并发的另
+一轮不会读到半个脚本。想每轮强制重下就把 TTL 设为 0；想完全脱离网络就用 `--sdk-js`。
 
 默认不写运行产物，图片和动态 PE 位于自动清理的临时目录。仅在调试时显式保留：
 
@@ -436,6 +482,10 @@ Init/Verify/日志   <prefix>.captcha-open.aliyuncs.com
 默认阈值 0.45 下置信度放行           50 / 50   最低 0.47
 单张耗时                            约 13 ms（不含 OpenCV 冷导入）
 ```
+
+冷导入之后的**首次** `solve_gap` 还要再付约 77ms 的 OpenCV 算子初始化。worker 预热
+时会用一张合成图空跑一次求解，把这笔也提前付掉——预热窗口本来就有几百毫秒余量，
+而真实图片到达时只应剩热调用的耗时。
 
 置信度的负样本基准用同一批图做缺口修补（OpenCV `inpaint`）后得到——即"图里真的没有
 缺口"的情形，此时 50 张中有 6 张会误过 0.45 门槛。

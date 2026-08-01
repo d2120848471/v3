@@ -3,12 +3,13 @@
 两种运行方式：
 
 ```text
---worker                 常驻模式：先预载 OpenCV，再按行读取 JSON 请求
+--worker                 常驻模式：先预载 OpenCV 并空跑一次求解，再按行读 JSON
 --background/--shadow    一次性模式：算完即退
 ```
 
-worker 模式的意义在于把 OpenCV/NumPy 约 200ms 的冷导入提前到收到图片之前完成，
-让调用方能把这段固定成本与 DeviceToken 生成、Init 请求和资源下载重叠掉。
+worker 模式的意义在于把两笔固定成本都提前到收到图片之前：OpenCV/NumPy 约 200ms
+的冷导入，以及**首次** ``solve_gap`` 约 77ms 的算子初始化。只预载导入是不够的——
+实测冷导入之后的第一次求解仍要约 94ms，而热调用只要约 17ms。
 """
 
 from __future__ import annotations
@@ -16,8 +17,41 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import tempfile
+from pathlib import Path
 
 from ..vision.gap_solver import solve_gap
+
+
+def _warm_algorithm() -> None:
+    """用一张合成图空跑一次完整求解，把算子首次初始化的开销提前付掉。
+
+    合成图只需要能走完"候选 → 复核"全流程，不需要像真实挑战图：平滑噪声背景配
+    一块矩形 alpha 就够。
+
+    任何失败都静默忽略——预热失败最多退回原来的耗时，绝不能让 worker 起不来。
+    """
+
+    try:
+        import cv2
+        import numpy
+
+        with tempfile.TemporaryDirectory(prefix="ali-vision-warm-") as directory:
+            root = Path(directory)
+            background_path = root / "back.png"
+            shadow_path = root / "shadow.png"
+
+            rng = numpy.random.default_rng(0)
+            background = (rng.random((200, 296, 3)) * 80 + 100).astype(numpy.uint8)
+            cv2.imwrite(str(background_path), cv2.GaussianBlur(background, (15, 15), 0))
+
+            shadow = numpy.zeros((200, 52, 4), dtype=numpy.uint8)
+            shadow[40:150, 5:47] = 255
+            cv2.imwrite(str(shadow_path), shadow)
+
+            solve_gap(background_path, shadow_path)
+    except Exception:
+        return
 
 
 def _solve_payload(background: str, shadow: str) -> dict[str, object]:
@@ -49,11 +83,12 @@ def _emit(payload: dict[str, object]) -> None:
 
 
 def _run_worker() -> int:
-    """常驻模式：预载依赖后按行处理请求。"""
+    """常驻模式：预载依赖并热身后按行处理请求。"""
 
-    # 在收到图片路径前完成冷导入，并用 ready 信号告知调用方可以开始计时。
+    # 在收到图片路径前完成冷导入与算子初始化，再用 ready 信号告知调用方。
     __import__("cv2")
     __import__("numpy")
+    _warm_algorithm()
     print('{"ready":true}', flush=True)
 
     for line in sys.stdin:

@@ -27,15 +27,17 @@ token 容器/session/时序；浏览器环境依赖较重的 Log1、DeviceConfig
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import os
 import secrets
 import select
 import subprocess
 import tempfile
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -59,6 +61,9 @@ _FIELD_TOKEN_TIME = 74
 
 _MAX_INTERACTION_EVENTS = 512
 _MAX_INTERACTION_SPAN_MS = 60_000
+
+_SDK_MINIMUM_BYTES = 50_000
+"""公开 SDK 的最小合理体积；低于此值一定不是那个脚本。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -466,13 +471,12 @@ def _normalize_interaction_events(
     return tuple(normalized)
 
 
-def _download_public_sdk(
+def _fetch_public_sdk(
     url: str,
-    destination: Path,
     *,
     timeout: float,
     proxies: dict[str, str] | None = None,
-) -> None:
+) -> bytes:
     """下载公开 AliyunCaptcha.js 并做结构性检查。
 
     检查的是"看起来像不像那个 SDK"，不是固定版本锁定——验证码前端会正常热更新，
@@ -490,9 +494,76 @@ def _download_public_sdk(
     response = requests.get(url, timeout=timeout, proxies=proxies)
     response.raise_for_status()
     source = response.content
-    if len(source) < 50_000 or b"AliyunCaptchaConfig" not in source:
+    if len(source) < _SDK_MINIMUM_BYTES or b"AliyunCaptchaConfig" not in source:
         raise DeviceRuntimeError("下载内容不像 AliyunCaptcha.js")
-    destination.write_bytes(source)
+    return source
+
+
+# ==========================================================================
+# 公开 SDK 的本地缓存
+#
+# SDK 是公开静态资源，与本轮挑战无关，却在每轮最开头串行下载一次。缓存只按
+# TTL 失效：条件请求同样要付一次完整往返，省不下多少，不如过期就重下。
+# ==========================================================================
+
+
+def _sdk_cache_path(url: str) -> Path | None:
+    """返回该 URL 的缓存文件路径；无法确定缓存目录时返回 ``None``。"""
+
+    try:
+        base = os.environ.get("XDG_CACHE_HOME")
+        root = Path(base) if base else Path.home() / ".cache"
+        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+        return root / "ali-slider" / f"AliyunCaptcha-{digest}.js"
+    except Exception:  # pragma: no cover - 取不到家目录时退回不缓存。
+        return None
+
+
+def _fresh_cached_sdk(url: str, *, ttl_seconds: float) -> Path | None:
+    """命中且仍在有效期内的缓存文件，否则 ``None``。
+
+    只做 stat 级检查：文件是写入前已通过结构校验的，重新读一遍 225KB 只为再确认
+    一次并不划算；大小明显不对则视为未命中。
+    """
+
+    if ttl_seconds <= 0:
+        return None
+    path = _sdk_cache_path(url)
+    if path is None:
+        return None
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    if stat.st_size < _SDK_MINIMUM_BYTES:
+        return None
+    if time.time() - stat.st_mtime > ttl_seconds:
+        return None
+    return path
+
+
+def _store_cached_sdk(url: str, source: bytes) -> Path | None:
+    """把已校验的 SDK 原子写入缓存；不可写时返回 ``None`` 由调用方兜底。
+
+    先写临时文件再 ``os.replace``：并发的另一轮可能正在读同一路径，绝不能让它
+    读到写了一半的脚本。
+    """
+
+    path = _sdk_cache_path(url)
+    if path is None:
+        return None
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_bytes(source)
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:  # pragma: no cover - 清理失败无需上报。
+            pass
+        return None
+    return path
 
 
 # ==========================================================================
@@ -537,6 +608,7 @@ class DeviceRuntimeClient:
         first_touch_age_range: tuple[int, int] = (
             config.DEFAULT_FIRST_TOUCH_AGE_RANGE
         ),
+        sdk_cache_ttl_seconds: float = config.SDK_CACHE_TTL_SECONDS,
         proxies: dict[str, str] | None = None,
     ) -> None:
         if timeout <= 0:
@@ -565,33 +637,52 @@ class DeviceRuntimeClient:
         self.timeout = float(timeout)
         self.gather_cost_range = gather_cost_range
         self.first_touch_age_range = first_touch_age_range
+        self.sdk_cache_ttl_seconds = float(sdk_cache_ttl_seconds)
         self.proxies = dict(proxies) if proxies else None
 
     @contextmanager
     def challenge_session(self) -> Iterator["DeviceRuntimeSession"]:
-        """开启一轮挑战：准备好 SDK 文件，并保证退出时回收 Node 进程。
+        """开启一轮挑战：准备好 SDK 文件，并保证退出时回收 Node 进程。"""
 
-        未指定本地 SDK 时下载到临时目录；临时目录的生命周期覆盖整个 session，
-        因为 Node 进程会一直读它。
+        with ExitStack() as stack:
+            sdk_path = self._prepare_sdk(stack)
+            yield stack.enter_context(DeviceRuntimeSession(self, sdk_path))
+
+    def _prepare_sdk(self, stack: ExitStack) -> Path:
+        """定位本轮要用的公开 SDK 文件。
+
+        优先级：显式指定的本地副本 → 仍在有效期内的缓存 → 现下载。下载后尽量写入
+        缓存；缓存目录不可写时退回临时目录，临时目录的生命周期由调用方的 stack
+        覆盖整个 session，因为 Node 进程会一直读它。
         """
 
         if self.sdk_path is not None:
             if not self.sdk_path.is_file():
                 raise DeviceRuntimeError(f"SDK 文件不存在：{self.sdk_path}")
-            with DeviceRuntimeSession(self, self.sdk_path) as session:
-                yield session
-            return
+            return self.sdk_path
 
-        with tempfile.TemporaryDirectory(prefix="ali-slider-sdk-") as directory:
-            sdk_path = Path(directory, "AliyunCaptcha.js")
-            _download_public_sdk(
-                self.sdk_url,
-                sdk_path,
-                timeout=self.timeout,
-                proxies=self.proxies,
-            )
-            with DeviceRuntimeSession(self, sdk_path) as session:
-                yield session
+        cached = _fresh_cached_sdk(
+            self.sdk_url, ttl_seconds=self.sdk_cache_ttl_seconds
+        )
+        if cached is not None:
+            return cached
+
+        source = _fetch_public_sdk(
+            self.sdk_url,
+            timeout=self.timeout,
+            proxies=self.proxies,
+        )
+        if self.sdk_cache_ttl_seconds > 0:
+            stored = _store_cached_sdk(self.sdk_url, source)
+            if stored is not None:
+                return stored
+
+        directory = stack.enter_context(
+            tempfile.TemporaryDirectory(prefix="ali-slider-sdk-")
+        )
+        path = Path(directory, "AliyunCaptcha.js")
+        path.write_bytes(source)
+        return path
 
 
 class DeviceRuntimeSession:

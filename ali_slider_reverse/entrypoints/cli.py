@@ -58,12 +58,14 @@ def _prepared_client(
     args: argparse.Namespace,
     settings: RuntimeSettings,
 ) -> AliSliderClient:
-    """装配客户端，并在会用到 OpenCV 时提前预热视觉进程。"""
+    """装配客户端，并把固定成本提前到设备链之前。"""
 
     client = settings.build_client(scene_id=args.scene_id)
     if args.x_pos is None:
         # OpenCV 冷导入与 DeviceToken、Init 和资源下载重叠。
         client.prewarm_vision()
+    # 本轮五个出网主机的 TLS 握手与设备链重叠。
+    client.prewarm_connections()
     return client
 
 
@@ -248,7 +250,7 @@ def _run_command(args: argparse.Namespace) -> int:
             "track": _track_summary(outcome.build),
             "initializationLog": {
                 "attempted": True,
-                "succeeded": outcome.build.upload_log_succeeded,
+                "succeeded": outcome.upload_log_succeeded,
             },
             "verify": {
                 "code": outcome.verify.verify_code,

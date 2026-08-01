@@ -10,6 +10,10 @@ Init 返回后需要拿四样东西：背景图、拼图图、本轮动态 PE、
   路径严格校验，防止被响应内容诱导去访问任意 URL；
 * 每个并发 worker 用自己的短会话。``requests.Session`` 不承诺跨线程共享，而
   公开静态资源也不需要 Init/Verify 的 cookie。
+
+Session 逐 worker 隔离，但底层连接池由整轮共享（见 :mod:`.transport`）：四项
+资源只落在两个主机上，共享连接池才能复用设备链空窗期预热好的 TLS 连接，否则
+每个 worker 都要现场重新握手。
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from urllib.parse import urlparse
 
 from .. import config
 from ..errors import AliSliderError
+from .transport import pooled_session
 
 
 _ASSET_PATH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
@@ -103,6 +108,7 @@ class AssetDownloader:
         referer: str = config.REFERER,
         image_base: str = config.IMAGE_BASE,
         pe_base: str = config.PE_BASE,
+        adapter: Any | None = None,
     ) -> None:
         self._requests = requests_module
         self.timeout = timeout
@@ -110,6 +116,7 @@ class AssetDownloader:
         self.referer = referer
         self.image_base = image_base
         self.pe_base = pe_base
+        self._adapter = adapter
 
     def download(
         self,
@@ -186,9 +193,9 @@ class AssetDownloader:
 
         started_ms = int(time.time() * 1000)
         try:
-            with self._requests.Session() as session:
-                if self.proxies is not None:
-                    session.proxies.update(self.proxies)
+            with pooled_session(
+                self._requests, self._adapter, proxies=self.proxies
+            ) as session:
                 response = session.get(
                     url,
                     headers=config.browser_headers(
