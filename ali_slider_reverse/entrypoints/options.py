@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 from .. import config
 from ..challenge.session import AliSliderClient
+from ..device_profile import DeviceProfile
 from ..runtime.node_device import DeviceRuntimeClient
 
 
@@ -117,8 +118,8 @@ def add_server_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help=(
             "在上一轮响应之后预备下一轮的 FeiLin 会话，省掉约 460ms 设备链；"
-            "预备的会话无人领取时那次 Log1/Log2 就是白发的请求，因此默认关闭，"
-            "且仅对固定出口（不换代理）的部署有意义"
+            "设备画像默认逐轮重抽，每轮都是新桶，命中率为零——除非你自己固定"
+            "画像与出口，否则开启它只会白发 Log1/Log2"
         ),
     )
 
@@ -160,10 +161,15 @@ class RuntimeSettings:
     def build_device_runtime(
         self,
         *,
+        device_profile: DeviceProfile,
         prefix: str = config.DEFAULT_PREFIX,
         proxies: dict[str, str] | None = None,
     ) -> DeviceRuntimeClient:
-        """装配设备运行时客户端。"""
+        """装配设备运行时客户端。
+
+        ``device_profile`` 必须与同一轮的 :meth:`build_client` 用同一个对象——
+        两者分别决定 FeiLin 指纹与 HTTP 头，不同步就等于一轮里出现两台设备。
+        """
 
         return DeviceRuntimeClient(
             node_binary=self.node_binary,
@@ -174,11 +180,13 @@ class RuntimeSettings:
             gather_cost_range=self.gather_cost_range,
             first_touch_age_range=self.first_touch_age_range,
             proxies=proxies,
+            device_profile=device_profile,
         )
 
     def build_client(
         self,
         *,
+        device_profile: DeviceProfile,
         scene_id: str = config.DEFAULT_SCENE_ID,
         prefix: str = config.DEFAULT_PREFIX,
         proxies: dict[str, str] | None = None,
@@ -194,6 +202,7 @@ class RuntimeSettings:
             timeout=self.timeout,
             proxies=proxies,
             rpc_key_id=rpc_key_id,
+            device_profile=device_profile,
         )
 
 

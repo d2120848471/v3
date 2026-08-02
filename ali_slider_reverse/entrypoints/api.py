@@ -47,6 +47,7 @@ from urllib.parse import parse_qs, urlsplit
 from .. import config
 from ..challenge.device_pool import DeviceSessionPool
 from ..challenge.session import normalize_proxies
+from ..device_profile import generate_device_profile
 from ..errors import AliSliderError, ApiRequestError
 from .options import (
     RuntimeSettings,
@@ -143,14 +144,19 @@ def solve_once(
     只用一个会话、一个 ``CertifyId`` 的语义；未开启时行为与之前完全一致。
     """
 
+    # 一轮一套设备画像：HTTP 头、FeiLin 指纹与动态 PE 环境共用同一个对象。
+    device_profile = generate_device_profile()
     client = settings.build_client(
         scene_id=request.scene_id,
         prefix=request.prefix,
         proxies=request.proxies,
         rpc_key_id=request.rpc_key_id,
+        device_profile=device_profile,
     )
     device_runtime = settings.build_device_runtime(
-        prefix=request.prefix, proxies=request.proxies
+        prefix=request.prefix,
+        proxies=request.proxies,
+        device_profile=device_profile,
     )
     with closing(client):
         # 视觉解释器的冷导入与 DeviceToken、Init、资源下载重叠；五个出网主机的

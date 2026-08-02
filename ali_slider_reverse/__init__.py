@@ -20,13 +20,18 @@ entrypoints/         CLI、HTTP 接口与视觉 worker
 
 ```python
 from ali_slider_reverse import AliSliderClient
+from ali_slider_reverse.device_profile import generate_device_profile
 from ali_slider_reverse.entrypoints.options import RuntimeSettings
 
 settings = RuntimeSettings(vision_python="/path/to/vision-python")
-client = settings.build_client()
+# 一轮一套设备画像，协议客户端与设备运行时必须共用同一个对象。
+profile = generate_device_profile()
+client = settings.build_client(device_profile=profile)
 try:
     client.prewarm_vision()
-    outcome = client.run_captcha(settings.build_device_runtime())
+    outcome = client.run_captcha(
+        settings.build_device_runtime(device_profile=profile)
+    )
     print(outcome.verify.verify_code, outcome.verify.succeeded)
 finally:
     client.close()

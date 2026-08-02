@@ -28,6 +28,15 @@
 
 轮换代理的部署几乎命中不了池（每个代理都是新桶），此时开启它只会白发请求，不如
 保持关闭。
+
+## 与逐轮设备画像的冲突
+
+同样的道理适用于设备画像：``DeviceToken`` 里的指纹是**预热那一刻**用当时那套画像
+采集的，交给另一套画像的一轮就会让 HTTP 头和指纹对不上。画像默认逐轮重抽，因此
+每一轮都是新桶——开启预热池只会白发 Log1/Log2，一次也命中不了。
+
+**当前默认配置下，这个开关应当保持关闭。** 只有当部署方显式固定画像（比如自己
+持有一个 :class:`DeviceProfile` 复用若干轮）时，它才重新有意义。
 """
 
 from __future__ import annotations
@@ -53,7 +62,7 @@ MAX_AGE_SECONDS = 20.0
 def configuration_key(client: DeviceRuntimeClient) -> str:
     """能影响 FeiLin 会话本身的全部配置的签名。
 
-    代理必须进签名——理由见模块文档。
+    代理与设备画像都必须进签名——理由见模块文档。
     """
 
     proxies = client.proxies or {}
@@ -68,6 +77,7 @@ def configuration_key(client: DeviceRuntimeClient) -> str:
             f"{client.timeout:g}",
             f"{client.gather_cost_range}",
             f"{client.first_touch_age_range}",
+            client.device_profile.profile_id,
             *(f"{name}={proxies[name]}" for name in sorted(proxies)),
         )
     )

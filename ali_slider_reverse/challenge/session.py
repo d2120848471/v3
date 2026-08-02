@@ -47,6 +47,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from .. import config
+from ..device_profile import DeviceProfile
 from ..errors import AliSliderError
 from ..protocol.params import build_verify_captcha_param
 from ..protocol.secrets import resolve_frontend_secrets
@@ -244,9 +245,12 @@ class AliSliderClient:
         referer: str = config.REFERER,
         proxies: dict[str, str] | None = None,
         rpc_key_id: str | None = None,
+        device_profile: DeviceProfile,
     ) -> None:
         if not scene_id or not prefix:
             raise ValueError("scene_id 和 prefix 不能为空")
+        if not isinstance(device_profile, DeviceProfile):
+            raise ValueError("device_profile 必须是本轮生成的 DeviceProfile")
         if timeout <= 0:
             raise ValueError("timeout 必须为正数")
         if proxies is not None and not isinstance(proxies, dict):
@@ -270,6 +274,8 @@ class AliSliderClient:
             (referer_url.scheme, referer_url.netloc, "", "", "")
         )
         self.proxies = dict(proxies) if proxies else None
+        # 本轮的设备画像：HTTP 头、FeiLin 环境与动态 PE 环境共用同一套。
+        self.device_profile = device_profile
 
         self._requests = _requests_module()
         # 本轮共享的连接池：Session 仍按线程隔离，但热连接集中在这个 adapter 上，
@@ -289,6 +295,7 @@ class AliSliderClient:
         self.assets = AssetDownloader(
             requests_module=self._requests,
             timeout=self.timeout,
+            device_profile=device_profile,
             proxies=self.proxies,
             referer=referer,
             adapter=self._adapter,
@@ -298,6 +305,7 @@ class AliSliderClient:
             prefix=prefix,
             region=config.DEFAULT_REGION,
             timeout=self.timeout,
+            device_profile=device_profile,
         )
         self.vision = VisionWorker(
             python_executable=vision_python or config.DEFAULT_VISION_PYTHON,
@@ -409,7 +417,9 @@ class AliSliderClient:
                 data=js_form_urlencode(params),
                 headers={
                     **config.browser_headers(
-                        referer=self.referer, origin=self.origin
+                        profile=self.device_profile,
+                        referer=self.referer,
+                        origin=self.origin,
                     ),
                     "Content-Type": (
                         "application/x-www-form-urlencoded; charset=UTF-8"

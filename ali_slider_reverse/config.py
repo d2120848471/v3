@@ -16,6 +16,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from .device_profile import DeviceProfile
+
 
 # ==========================================================================
 # 冻结分发（PyInstaller）
@@ -146,7 +148,11 @@ def verify_url(prefix: str = DEFAULT_PREFIX) -> str:
 
 
 # ==========================================================================
-# 浏览器画像：随请求头发出，需与 Node 桥内的 UA 保持一致
+# 页面来源：与设备无关，因此仍是常量
+#
+# 设备相关的 UA、Sec-CH-UA、语言全部来自逐轮生成的
+# :class:`~ali_slider_reverse.device_profile.DeviceProfile`——写死它们等于让
+# 服务端拿到一个恒定的设备主键。
 # ==========================================================================
 
 ORIGIN = "http://localhost:38185"
@@ -154,45 +160,38 @@ ORIGIN = "http://localhost:38185"
 
 REFERER = ORIGIN + "/"
 
-USER_AGENT = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 "
-    "Mobile/15E148 Safari/604.1"
-)
-
-SEC_CH_UA = (
-    '"Not;A=Brand";v="8", "Chromium";v="150", '
-    '"Google Chrome";v="150"'
-)
-
 
 def browser_headers(
     *,
+    profile: DeviceProfile,
     referer: str = REFERER,
     origin: str = ORIGIN,
     destination: str = "empty",
     mode: str = "cors",
     include_origin: bool = True,
 ) -> dict[str, str]:
-    """构造与真实页面一致的请求头。
+    """构造与本轮设备画像一致的请求头。
 
     ``Sec-Fetch-*`` 三兄弟随请求类型变化：RPC 是 ``empty/cors``，静态资源是
     ``image|script|style`` 配 ``no-cors`` 且不带 ``Origin``。这些值浏览器会自动
     填，服务端也可能据此判断请求来源，因此按实际场景传参而不是写死一套。
+
+    ``profile`` 必须与本轮两个 Node 桥用的是同一套，否则服务端会同时看到 HTTP
+    层与指纹层两台不同的设备。
     """
 
     headers = {
         "Accept": "*/*",
-        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Accept-Language": profile.accept_language,
         "Referer": referer,
-        "Sec-CH-UA": SEC_CH_UA,
-        "Sec-CH-UA-Mobile": "?1",
-        "Sec-CH-UA-Platform": '"iOS"',
+        "Sec-CH-UA": profile.sec_ch_ua,
+        "Sec-CH-UA-Mobile": profile.sec_ch_ua_mobile,
+        "Sec-CH-UA-Platform": profile.sec_ch_ua_platform,
         "Sec-Fetch-Dest": destination,
         "Sec-Fetch-Mode": mode,
         "Sec-Fetch-Site": "cross-site",
         "Priority": "u=1, i",
-        "User-Agent": USER_AGENT,
+        "User-Agent": profile.user_agent,
     }
     if include_origin:
         headers["Origin"] = origin
@@ -320,11 +319,9 @@ __all__ = [
     "SDK_CACHE_TTL_SECONDS",
     "SDK_DEVICE_BRIDGE",
     "SDK_URL",
-    "SEC_CH_UA",
     "SLIDER_HANDLE_WIDTH",
     "SLIDER_RENDERED_WIDTH",
     "UPLOAD_URL",
-    "USER_AGENT",
     "VERIFY_FUTURE_SKEW_LIMIT_MS",
     "VISION_IN_PROCESS",
     "browser_headers",

@@ -13,16 +13,17 @@ Python 一侧不猜测任何密文，只做独立复核——把 data 离线解�
 
 ## 三个时序合同
 
-当前 PE 的关键观察是这三个数**互不相等**，混淆它们是最容易出错的地方：
+当前 PE 的关键观察是这三个数**互不相等**，混淆它们是最容易出错的地方（下面的
+数字取自某一轮，轨迹逐轮扰动后长度会变，不变的是三者之间的关系）：
 
 ```text
-输入 touch 事件                        86
-getter 调用前已形成的 native mm         86
-最终 data.TrackList.mm                 87   ← 多出 getter 之后的 RAF 尾项
+输入 touch 事件                        N       ← 本轮轨迹的采样点数
+getter 调用前已形成的 native mm         N
+最终 data.TrackList.mm                 N + 1   ← 多出 getter 之后的 RAF 尾项
 ```
 
-所以：Verify 的 ``data`` 必须保留序列化时存在的全部 87 条 mm；FeiLin getter 只能
-看到 getter 调用前的 86 条**连续前缀**；不能把 getter 之后的 RAF 尾项提前回放给
+所以：Verify 的 ``data`` 必须保留序列化时存在的**全部** mm；FeiLin getter 只能
+看到 getter 调用前的那段**连续前缀**；不能把 getter 之后的 RAF 尾项提前回放给
 FeiLin。``mm.timeStamp`` 与 getter 的 ``observedAtMs`` 必须来自同一个 PE VM 的
 ``performance.now()`` 时间域。
 
@@ -44,6 +45,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import config
+from ..device_profile import DeviceProfile, encode_device_profile
 from ..errors import DataCodecError, PeRuntimeError
 from ..protocol.data_codec import (
     DATA_PAYLOAD_FIELDS,
@@ -248,6 +250,23 @@ class _BuildRequest:
                 "touchend",
             }:
                 raise ValueError(f"track[{index}].type 无效")
+            # 压力与接触半径和坐标一样是触点的一部分，桥会原样搬进 TouchEvent，
+            # 这里独立复核一遍取值域。
+            force = sample.get("force")
+            radius_x, radius_y = sample.get("radiusX"), sample.get("radiusY")
+            if (
+                isinstance(force, bool)
+                or not isinstance(force, (int, float))
+                or not 0 <= force <= 1
+            ):
+                raise ValueError(f"track[{index}].force 无效")
+            for label, radius in (("radiusX", radius_x), ("radiusY", radius_y)):
+                if (
+                    isinstance(radius, bool)
+                    or not isinstance(radius, (int, float))
+                    or not 0 < radius <= 100
+                ):
+                    raise ValueError(f"track[{index}].{label} 无效")
             total += dt
 
         if total > _MAX_TRACK_DURATION_MS:
@@ -544,6 +563,7 @@ class PeRuntimeClient:
         prefix: str = config.DEFAULT_PREFIX,
         region: str = config.DEFAULT_REGION,
         timeout: float = config.DEFAULT_TIMEOUT,
+        device_profile: DeviceProfile,
     ) -> None:
         for label, value in (
             ("node_binary", node_binary),
@@ -552,6 +572,8 @@ class PeRuntimeClient:
         ):
             if not isinstance(value, str) or not value:
                 raise ValueError(f"{label} 必须是非空字符串")
+        if not isinstance(device_profile, DeviceProfile):
+            raise ValueError("device_profile 必须是本轮生成的 DeviceProfile")
         if (
             isinstance(timeout, bool)
             or not isinstance(timeout, (int, float))
@@ -567,6 +589,8 @@ class PeRuntimeClient:
         self.prefix = prefix
         self.region = region
         self.timeout = float(timeout)
+        # 与设备桥共用同一套画像：动态 PE 与 FeiLin 必须站在同一台设备上。
+        self.device_profile = device_profile
 
     def build(
         self,
@@ -667,6 +691,8 @@ class PeRuntimeClient:
             self.region,
             "--timeout-ms",
             str(operation_timeout_ms),
+            "--device-profile",
+            encode_device_profile(self.device_profile),
         ]
         try:
             completed = subprocess.run(
@@ -862,7 +888,7 @@ class PeRuntimeClient:
     ) -> dict[str, Any]:
         """校验 touch、getter 与 Verify 三处时序，并切出 getter 前的 mm 前缀。
 
-        这里落实"86 → 86 → 87"合同：data 里的 mm 总数可以多于输入事件数（尾部
+        这里落实"N → N → N+1"合同：data 里的 mm 总数可以多于输入事件数（尾部
         RAF），但 **getter 之前**的 mm 条数必须与输入轨迹严格相等——多一条就说明
         回放给 FeiLin 的状态与 PE 当时看到的不一致。
         """

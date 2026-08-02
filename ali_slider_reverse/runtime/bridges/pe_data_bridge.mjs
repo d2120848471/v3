@@ -16,7 +16,7 @@ import vm from "node:vm";
 import { pathToFileURL } from "node:url";
 
 import {
-  RUNTIME_PROFILE_IDS,
+  decodeDeviceProfile,
   makeBrowserContext,
 } from "./sdk_device_bridge.mjs";
 
@@ -50,7 +50,9 @@ function parseArguments(argv) {
     prefix: "fsgtmi",
     region: "cn",
     timeoutMs: 20_000,
+    deviceProfile: null,
   };
+  let encodedProfile = "";
   for (let index = 2; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--sdk") {
@@ -63,6 +65,8 @@ function parseArguments(argv) {
       options.region = argv[++index] ?? "";
     } else if (argument === "--timeout-ms") {
       options.timeoutMs = Number(argv[++index]);
+    } else if (argument === "--device-profile") {
+      encodedProfile = argv[++index] ?? "";
     } else {
       throw new Error(`未知参数：${argument}`);
     }
@@ -78,6 +82,7 @@ function parseArguments(argv) {
   if (!Number.isInteger(options.timeoutMs) || options.timeoutMs < 1_000) {
     throw new Error("--timeout-ms 必须是至少 1000 的整数");
   }
+  options.deviceProfile = decodeDeviceProfile(encodedProfile);
   return options;
 }
 
@@ -167,7 +172,19 @@ function readInput() {
     ) {
       throw new Error(`track[${index}].type 顺序无效`);
     }
-    return { x, y, dt, type };
+    // 触点的压力与接触面积逐点变化，和坐标一样是轨迹的一部分，由 Python 侧
+    // 一并生成——把它们钉成常量等于给每条轨迹盖同一个戳。
+    const force = Number(sample.force);
+    const radiusX = Number(sample.radiusX);
+    const radiusY = Number(sample.radiusY);
+    if (
+      !(force >= 0 && force <= 1)
+      || !(radiusX > 0 && radiusX <= 100)
+      || !(radiusY > 0 && radiusY <= 100)
+    ) {
+      throw new Error(`track[${index}] 的 force/radius 无效`);
+    }
+    return { x, y, dt, type, force, radiusX, radiusY };
   });
   if (totalDuration > 60_000) {
     throw new Error("track 总时长不能超过 60 秒");
@@ -415,10 +432,10 @@ function installCaptchaDom(context, dimensions) {
 
   function layoutFor(id, tagName) {
     if (tagName === "HTML" || tagName === "BODY") {
-      return { width: 430, height: 932 };
+      return { width: context.innerWidth, height: context.innerHeight };
     }
     if (tagName === "HEAD") {
-      return { width: 430, height: 0 };
+      return { width: context.innerWidth, height: 0 };
     }
     if (id === "aliyunCaptcha-img") {
       return {
@@ -648,7 +665,8 @@ function exposePuzzleConstructor(source) {
 }
 
 
-function makeTouchEvent(context, type, x, y) {
+function makeTouchEvent(context, sample, x, y) {
+  const type = sample.type;
   const point = {
     identifier: 0,
     clientX: x,
@@ -657,10 +675,11 @@ function makeTouchEvent(context, type, x, y) {
     pageY: y,
     screenX: x,
     screenY: y,
-    radiusX: 1,
-    radiusY: 1,
+    radiusX: sample.radiusX,
+    radiusY: sample.radiusY,
     rotationAngle: 0,
-    force: type === "touchend" ? 0 : 0.5,
+    // 抬手瞬间接触面已经离开屏幕，压力恒为 0。
+    force: type === "touchend" ? 0 : sample.force,
     target: null,
   };
   return {
@@ -798,7 +817,7 @@ async function replayTrack(
     );
     const event = makeTouchEvent(
       context,
-      sample.type,
+      sample,
       input.originX + sample.x,
       input.originY + sample.y,
     );
@@ -1011,9 +1030,9 @@ function makePeBrowserContext(options) {
       region: options.region,
       timeoutMs: options.timeoutMs,
       networkEnabled: false,
-      // FeiLin 的 compact profile 是命名实验，不得经共享 factory
-      // 静默污染动态 PE 所见的原 captured-mobile 环境。
-      runtimeProfile: RUNTIME_PROFILE_IDS.CAPTURED_MOBILE,
+      // 与设备桥用的是**同一套**画像：FeiLin 指纹和动态 PE 上报的环境如果各说
+      // 各话，服务端会在一轮里看到两台设备。
+      deviceProfile: options.deviceProfile,
     },
     () => {},
   );

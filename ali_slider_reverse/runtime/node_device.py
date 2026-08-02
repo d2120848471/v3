@@ -45,6 +45,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .. import config
+from ..device_profile import DeviceProfile, encode_device_profile
 from ..errors import DeviceRuntimeError
 from ..protocol.device_token import (
     DeviceConfig,
@@ -611,9 +612,12 @@ class DeviceRuntimeClient:
         ),
         sdk_cache_ttl_seconds: float = config.SDK_CACHE_TTL_SECONDS,
         proxies: dict[str, str] | None = None,
+        device_profile: DeviceProfile,
     ) -> None:
         if timeout <= 0:
             raise ValueError("timeout 必须为正数")
+        if not isinstance(device_profile, DeviceProfile):
+            raise ValueError("device_profile 必须是本轮生成的 DeviceProfile")
         if not prefix:
             raise ValueError("prefix 不能为空")
         if not region:
@@ -640,6 +644,7 @@ class DeviceRuntimeClient:
         self.first_touch_age_range = first_touch_age_range
         self.sdk_cache_ttl_seconds = float(sdk_cache_ttl_seconds)
         self.proxies = dict(proxies) if proxies else None
+        self.device_profile = device_profile
 
     @contextmanager
     def challenge_session(self) -> Iterator["DeviceRuntimeSession"]:
@@ -728,6 +733,8 @@ class DeviceRuntimeSession:
                     self.client.region,
                     "--timeout-ms",
                     str(round(self.client.timeout * 1000)),
+                    "--device-profile",
+                    encode_device_profile(self.client.device_profile),
                 ],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,

@@ -28,6 +28,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .. import config
+from ..device_profile import DeviceProfile
 from ..errors import AliSliderError
 from .transport import pooled_session
 
@@ -104,6 +105,7 @@ class AssetDownloader:
         *,
         requests_module: Any,
         timeout: float,
+        device_profile: DeviceProfile,
         proxies: dict[str, str] | None = None,
         referer: str = config.REFERER,
         image_base: str = config.IMAGE_BASE,
@@ -112,6 +114,7 @@ class AssetDownloader:
     ) -> None:
         self._requests = requests_module
         self.timeout = timeout
+        self.device_profile = device_profile
         self.proxies = proxies
         self.referer = referer
         self.image_base = image_base
@@ -199,6 +202,7 @@ class AssetDownloader:
                 response = session.get(
                     url,
                     headers=config.browser_headers(
+                        profile=self.device_profile,
                         referer=self.referer,
                         destination=_FETCH_DEST_BY_SUFFIX.get(
                             destination.suffix, "image"

@@ -20,45 +20,6 @@ import { pathToFileURL } from "node:url";
 
 const TARGET_ORIGIN = "http://localhost:38185";
 const TARGET_REFERER = `${TARGET_ORIGIN}/`;
-const TARGET_USER_AGENT = (
-  "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) "
-  + "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 "
-  + "Mobile/15E148 Safari/604.1"
-);
-const TARGET_SEC_CH_UA = (
-  '"Not;A=Brand";v="8", "Chromium";v="150", '
-  + '"Google Chrome";v="150"'
-);
-const RUNTIME_PROFILE_IDS = Object.freeze({
-  CAPTURED_MOBILE: "captured-mobile-v1",
-  COMPACT_WINDOWS_FEILIN: "compact-windows-feilin-v1",
-});
-const RUNTIME_PROFILES = Object.freeze({
-  [RUNTIME_PROFILE_IDS.CAPTURED_MOBILE]: Object.freeze({
-    userAgent: TARGET_USER_AGENT,
-    appVersion: (
-      "5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) "
-      + "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 "
-      + "Mobile/15E148 Safari/604.1"
-    ),
-    platform: "MacIntel",
-    uaDataMobile: true,
-    uaDataPlatform: "iOS",
-    uaDataModel: "iPhone",
-    uaDataPlatformVersion: "18.5",
-  }),
-  [RUNTIME_PROFILE_IDS.COMPACT_WINDOWS_FEILIN]: Object.freeze({
-    // 这是由参考 IV8 最小环境启发、按成功 token 长度桶构造的可证伪
-    // FeiLin profile；不把长度相同解释成成功样本明文相同。
-    userAgent: "Mozilla/5.0 (Windows NT 10.0)",
-    appVersion: "5.0 (Windows NT 10.0)",
-    platform: "Win32",
-    uaDataMobile: false,
-    uaDataPlatform: "Windows",
-    uaDataModel: "",
-    uaDataPlatformVersion: "10.0.0",
-  }),
-});
 const DEVICE_TOKEN_MODES = Object.freeze([
   "live-token",
   "profile-token",
@@ -66,28 +27,87 @@ const DEVICE_TOKEN_MODES = Object.freeze([
 ]);
 const WORKER_COMPLETION_MAX_BYTES = 64 * 1024;
 const BRIDGE_EVENT_STATE = Symbol("bridgeEventState");
+const DEVICE_PROFILE_MAX_BYTES = 8 * 1024;
 
 
-function resolveRuntimeProfile(profileId) {
-  const normalized = (
-    profileId ?? RUNTIME_PROFILE_IDS.CAPTURED_MOBILE
-  );
-  const profile = RUNTIME_PROFILES[normalized];
-  if (!profile) {
-    throw new Error(`未知 Node runtime profile：${String(normalized)}`);
+/**
+ * 解开 Python 逐轮生成的设备画像。
+ *
+ * 画像不在 Node 侧生成：本轮的 HTTP 头由 Python 发出，两个 Node 桥各自构造自己
+ * 的 DOM，三处必须是同一台设备。唯一的事实来源因此只能在 Python，这里只负责解
+ * 码与结构校验。经 base64 传递是为了让 argv 里不出现引号、空格与非 ASCII。
+ */
+function decodeDeviceProfile(encoded) {
+  if (typeof encoded !== "string" || !encoded) {
+    throw new Error("必须通过 --device-profile 传入本轮设备画像");
   }
-  return profile;
+  if (encoded.length > DEVICE_PROFILE_MAX_BYTES) {
+    throw new Error("--device-profile 超出长度上限");
+  }
+  let profile;
+  try {
+    profile = JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
+  } catch {
+    throw new Error("--device-profile 不是有效的 base64 JSON");
+  }
+  if (!profile || typeof profile !== "object") {
+    throw new Error("--device-profile 顶层必须是 object");
+  }
+  for (const name of [
+    "userAgent",
+    "platform",
+    "secChUa",
+    "acceptLanguage",
+    "screen",
+    "gpu",
+    "canvasSeed",
+  ]) {
+    if (profile[name] === undefined || profile[name] === null) {
+      throw new Error(`设备画像缺少字段 ${name}`);
+    }
+  }
+  return Object.freeze(profile);
 }
 
 
-function runtimeProfileIdForMode(mode) {
-  return DEVICE_TOKEN_MODES.includes(mode)
-    ? RUNTIME_PROFILE_IDS.COMPACT_WINDOWS_FEILIN
-    : RUNTIME_PROFILE_IDS.CAPTURED_MOBILE;
+/**
+ * 由画像的 canvasSeed 派生一条确定性伪随机字节流。
+ *
+ * Canvas 与字体度量必须同时满足两个相反的要求：同一轮内**每次读取都一致**（真实
+ * GPU 渲染同一幅图不会变），跨轮之间**互不相同**（否则又变回一个恒定主键）。用
+ * 画像自带的种子做 xorshift 正好两头都满足。
+ */
+function makeSeededStream(seed) {
+  let state = 0x811c9dc5;
+  for (const character of String(seed)) {
+    state = Math.imul(state ^ character.charCodeAt(0), 0x01000193) >>> 0;
+  }
+  return function next() {
+    state ^= state << 13;
+    state >>>= 0;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    state >>>= 0;
+    return state;
+  };
+}
+
+
+function seededBase64(seed, length) {
+  const alphabet = (
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  );
+  const next = makeSeededStream(seed);
+  let output = "";
+  while (output.length < length) {
+    output += alphabet[next() % alphabet.length];
+  }
+  return output;
 }
 
 
 function browserRequestHeaders(
+  profile,
   extra = {},
   {
     destination = "empty",
@@ -97,17 +117,17 @@ function browserRequestHeaders(
 ) {
   return {
     Accept: "*/*",
-    "Accept-Language": "zh-CN,zh;q=0.9",
+    "Accept-Language": profile.acceptLanguage,
     ...(includeOrigin ? { Origin: TARGET_ORIGIN } : {}),
     Referer: TARGET_REFERER,
-    "Sec-CH-UA": TARGET_SEC_CH_UA,
-    "Sec-CH-UA-Mobile": "?1",
-    "Sec-CH-UA-Platform": '"iOS"',
+    "Sec-CH-UA": profile.secChUa,
+    "Sec-CH-UA-Mobile": profile.secChUaMobile,
+    "Sec-CH-UA-Platform": profile.secChUaPlatform,
     "Sec-Fetch-Dest": destination,
     "Sec-Fetch-Mode": mode,
     "Sec-Fetch-Site": "cross-site",
     Priority: "u=1, i",
-    "User-Agent": TARGET_USER_AGENT,
+    "User-Agent": profile.userAgent,
     ...extra,
   };
 }
@@ -138,8 +158,9 @@ function parseArguments(argv) {
     region: "cn",
     timeoutMs: 15_000,
     networkEnabled: false,
-    runtimeProfile: RUNTIME_PROFILE_IDS.CAPTURED_MOBILE,
+    deviceProfile: null,
   };
+  let encodedProfile = "";
   for (let index = 2; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--mode") {
@@ -152,6 +173,8 @@ function parseArguments(argv) {
       options.region = argv[++index] ?? "";
     } else if (argument === "--timeout-ms") {
       options.timeoutMs = Number(argv[++index]);
+    } else if (argument === "--device-profile") {
+      encodedProfile = argv[++index] ?? "";
     } else {
       throw new Error(`未知参数：${argument}`);
     }
@@ -177,9 +200,9 @@ function parseArguments(argv) {
     throw new Error("--timeout-ms 必须是至少 1000 的整数");
   }
   options.networkEnabled = DEVICE_TOKEN_MODES.includes(options.mode);
-  // DeviceToken 的 FeiLin 链显式使用命名实验 profile；动态 PE 不经此
-  // 参数解析器，并在自己的消费方显式保留 captured-mobile profile。
-  options.runtimeProfile = runtimeProfileIdForMode(options.mode);
+  // 画像是必填的：没有它就没有"本轮这台设备"，也就无从与 Python 的 HTTP 头和
+  // 动态 PE 的 DOM 对齐。
+  options.deviceProfile = decodeDeviceProfile(encodedProfile);
   return options;
 }
 
@@ -278,302 +301,326 @@ function makeStorage() {
 }
 
 
-function makeElement(tagName = "div") {
-  const attributes = new Map();
-  const children = [];
-  const style = {
-    setProperty(name, value) {
-      this[String(name)] = String(value);
-    },
-    getPropertyValue(name) {
-      return this[String(name)] ?? "";
-    },
-  };
-  const normalizedTag = String(tagName).toUpperCase();
-  return {
-    nodeType: 1,
-    tagName: normalizedTag,
-    nodeName: normalizedTag,
-    style,
-    children,
-    childNodes: children,
-    className: "",
-    id: "",
-    innerHTML: "",
-    textContent: "",
-    parentNode: null,
-    get outerHTML() {
-      if (normalizedTag === "HTML") {
-        return "<html><head></head><body></body></html>";
-      }
-      const name = normalizedTag.toLowerCase();
-      return `<${name}>${this.innerHTML}</${name}>`;
-    },
-    get firstChild() {
-      return children[0] ?? null;
-    },
-    get lastChild() {
-      return children.at(-1) ?? null;
-    },
-    appendChild(child) {
-      if (child && typeof child === "object") {
-        child.parentNode = this;
-      }
-      children.push(child);
-      return child;
-    },
-    insertBefore(child, reference) {
-      if (child && typeof child === "object") {
-        child.parentNode = this;
-      }
-      const index = children.indexOf(reference);
-      if (index < 0) {
+/**
+ * 按本轮画像产出 DOM 元素工厂。
+ *
+ * 元素本身要携带三样与设备强相关的东西：视口尺寸（getBoundingClientRect）、
+ * GPU 标识（WebGL）与 Canvas 读回值。它们必须来自同一台设备，所以统一由画像
+ * 注入，而不是各自写死常量。
+ */
+function makeElementFactory(profile) {
+  const viewportWidth = profile.screen.innerWidth;
+  const viewportHeight = profile.screen.innerHeight;
+  const gpu = profile.gpu;
+  // Canvas 读回值在同一轮里必须稳定，因此在工厂层算一次并共享。
+  const canvasDataUrl = (
+    "data:image/png;base64,"
+    + seededBase64(`${profile.canvasSeed}:canvas`, 3400 + (
+      makeSeededStream(`${profile.canvasSeed}:len`)() % 420
+    ))
+  );
+  const imageDataStream = makeSeededStream(`${profile.canvasSeed}:pixels`);
+  const canvasPixels = Uint8ClampedArray.from(
+    [0, 1, 2, 3],
+    () => imageDataStream() % 256,
+  );
+
+  return function makeElement(tagName = "div") {
+    const attributes = new Map();
+    const children = [];
+    const style = {
+      setProperty(name, value) {
+        this[String(name)] = String(value);
+      },
+      getPropertyValue(name) {
+        return this[String(name)] ?? "";
+      },
+    };
+    const normalizedTag = String(tagName).toUpperCase();
+    return {
+      nodeType: 1,
+      tagName: normalizedTag,
+      nodeName: normalizedTag,
+      style,
+      children,
+      childNodes: children,
+      className: "",
+      id: "",
+      innerHTML: "",
+      textContent: "",
+      parentNode: null,
+      get outerHTML() {
+        if (normalizedTag === "HTML") {
+          return "<html><head></head><body></body></html>";
+        }
+        const name = normalizedTag.toLowerCase();
+        return `<${name}>${this.innerHTML}</${name}>`;
+      },
+      get firstChild() {
+        return children[0] ?? null;
+      },
+      get lastChild() {
+        return children.at(-1) ?? null;
+      },
+      appendChild(child) {
+        if (child && typeof child === "object") {
+          child.parentNode = this;
+        }
         children.push(child);
-      } else {
-        children.splice(index, 0, child);
-      }
-      return child;
-    },
-    removeChild(child) {
-      const index = children.indexOf(child);
-      if (index >= 0) {
-        children.splice(index, 1);
-      }
-      return child;
-    },
-    addEventListener() {},
-    removeEventListener() {},
-    dispatchEvent() {
-      return true;
-    },
-    setAttribute(name, value) {
-      attributes.set(String(name), String(value));
-      this[String(name)] = String(value);
-    },
-    getAttribute(name) {
-      return attributes.get(String(name)) ?? null;
-    },
-    getBoundingClientRect() {
-      return {
-        x: 0,
-        y: 0,
-        top: 0,
-        left: 0,
-        right: 430,
-        bottom: 932,
-        width: 430,
-        height: 932,
-      };
-    },
-    querySelector() {
-      return null;
-    },
-    querySelectorAll() {
-      return [];
-    },
-    getContext(type) {
-      if (normalizedTag !== "CANVAS") {
+        return child;
+      },
+      insertBefore(child, reference) {
+        if (child && typeof child === "object") {
+          child.parentNode = this;
+        }
+        const index = children.indexOf(reference);
+        if (index < 0) {
+          children.push(child);
+        } else {
+          children.splice(index, 0, child);
+        }
+        return child;
+      },
+      removeChild(child) {
+        const index = children.indexOf(child);
+        if (index >= 0) {
+          children.splice(index, 1);
+        }
+        return child;
+      },
+      addEventListener() {},
+      removeEventListener() {},
+      dispatchEvent() {
+        return true;
+      },
+      setAttribute(name, value) {
+        attributes.set(String(name), String(value));
+        this[String(name)] = String(value);
+      },
+      getAttribute(name) {
+        return attributes.get(String(name)) ?? null;
+      },
+      getBoundingClientRect() {
+        return {
+          x: 0,
+          y: 0,
+          top: 0,
+          left: 0,
+          right: viewportWidth,
+          bottom: viewportHeight,
+          width: viewportWidth,
+          height: viewportHeight,
+        };
+      },
+      querySelector() {
         return null;
-      }
-      if (String(type).includes("webgl")) {
-        const extensions = [
-          "ANGLE_instanced_arrays",
-          "EXT_blend_minmax",
-          "EXT_clip_control",
-          "EXT_color_buffer_half_float",
-          "EXT_depth_clamp",
-          "EXT_disjoint_timer_query",
-          "EXT_float_blend",
-          "EXT_frag_depth",
-          "EXT_polygon_offset_clamp",
-          "EXT_shader_texture_lod",
-          "EXT_texture_compression_bptc",
-          "EXT_texture_compression_rgtc",
-          "EXT_texture_filter_anisotropic",
-          "EXT_texture_mirror_clamp_to_edge",
-          "EXT_sRGB",
-          "KHR_parallel_shader_compile",
-          "OES_element_index_uint",
-          "OES_fbo_render_mipmap",
-          "OES_standard_derivatives",
-          "OES_texture_float",
-          "OES_texture_float_linear",
-          "OES_texture_half_float",
-          "OES_texture_half_float_linear",
-          "OES_vertex_array_object",
-          "WEBGL_blend_func_extended",
-          "WEBGL_color_buffer_float",
-          "WEBGL_compressed_texture_astc",
-          "WEBGL_compressed_texture_etc",
-          "WEBGL_compressed_texture_etc1",
-          "WEBGL_compressed_texture_pvrtc",
-          "WEBGL_compressed_texture_s3tc",
-          "WEBGL_compressed_texture_s3tc_srgb",
-          "WEBGL_debug_renderer_info",
-          "WEBGL_debug_shaders",
-          "WEBGL_depth_texture",
-          "WEBGL_draw_buffers",
-          "WEBGL_lose_context",
-          "WEBGL_multi_draw",
-          "WEBGL_polygon_mode",
-        ];
-        const webglParameters = new Map([
-          [7936, "WebKit"],
-          [7937, "WebKit WebGL"],
-          [7938, "WebGL 1.0 (OpenGL ES 2.0 Chromium)"],
-          [3379, 16384],
-          [35724, "WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)"],
-          [37445, "Google Inc. (Apple)"],
-          [
-            37446,
-            "ANGLE (Apple, ANGLE Metal Renderer: Apple M3 Max, "
-              + "Unspecified Version)",
-          ],
-        ]);
-        const webglContext = {
-          VENDOR: 7936,
-          RENDERER: 7937,
-          VERSION: 7938,
-          MAX_TEXTURE_SIZE: 3379,
-          SHADING_LANGUAGE_VERSION: 35724,
-          getExtension(name) {
-            if (name === "WEBGL_debug_renderer_info") {
+      },
+      querySelectorAll() {
+        return [];
+      },
+      getContext(type) {
+        if (normalizedTag !== "CANVAS") {
+          return null;
+        }
+        if (String(type).includes("webgl")) {
+          const extensions = [
+            "ANGLE_instanced_arrays",
+            "EXT_blend_minmax",
+            "EXT_clip_control",
+            "EXT_color_buffer_half_float",
+            "EXT_depth_clamp",
+            "EXT_disjoint_timer_query",
+            "EXT_float_blend",
+            "EXT_frag_depth",
+            "EXT_polygon_offset_clamp",
+            "EXT_shader_texture_lod",
+            "EXT_texture_compression_bptc",
+            "EXT_texture_compression_rgtc",
+            "EXT_texture_filter_anisotropic",
+            "EXT_texture_mirror_clamp_to_edge",
+            "EXT_sRGB",
+            "KHR_parallel_shader_compile",
+            "OES_element_index_uint",
+            "OES_fbo_render_mipmap",
+            "OES_standard_derivatives",
+            "OES_texture_float",
+            "OES_texture_float_linear",
+            "OES_texture_half_float",
+            "OES_texture_half_float_linear",
+            "OES_vertex_array_object",
+            "WEBGL_blend_func_extended",
+            "WEBGL_color_buffer_float",
+            "WEBGL_compressed_texture_astc",
+            "WEBGL_compressed_texture_etc",
+            "WEBGL_compressed_texture_etc1",
+            "WEBGL_compressed_texture_pvrtc",
+            "WEBGL_compressed_texture_s3tc",
+            "WEBGL_compressed_texture_s3tc_srgb",
+            "WEBGL_debug_renderer_info",
+            "WEBGL_debug_shaders",
+            "WEBGL_depth_texture",
+            "WEBGL_draw_buffers",
+            "WEBGL_lose_context",
+            "WEBGL_multi_draw",
+            "WEBGL_polygon_mode",
+          ];
+          const webglParameters = new Map([
+            [7936, "WebKit"],
+            [7937, "WebKit WebGL"],
+            [7938, "WebGL 1.0 (OpenGL ES 2.0 Chromium)"],
+            [3379, gpu.maxTextureSize],
+            [35724, "WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)"],
+            [37445, gpu.unmaskedVendor],
+            [37446, gpu.unmaskedRenderer],
+          ]);
+          const webglContext = {
+            VENDOR: 7936,
+            RENDERER: 7937,
+            VERSION: 7938,
+            MAX_TEXTURE_SIZE: 3379,
+            SHADING_LANGUAGE_VERSION: 35724,
+            getExtension(name) {
+              if (name === "WEBGL_debug_renderer_info") {
+                return {
+                  UNMASKED_VENDOR_WEBGL: 37445,
+                  UNMASKED_RENDERER_WEBGL: 37446,
+                };
+              }
+              return extensions.includes(String(name)) ? {} : null;
+            },
+            getSupportedExtensions() {
+              return [...extensions];
+            },
+            getParameter(name) {
+              return webglParameters.get(name) ?? 0;
+            },
+            getContextAttributes() {
               return {
-                UNMASKED_VENDOR_WEBGL: 37445,
-                UNMASKED_RENDERER_WEBGL: 37446,
+                alpha: true,
+                antialias: true,
+                depth: true,
+                failIfMajorPerformanceCaveat: false,
+                powerPreference: "default",
+                premultipliedAlpha: true,
+                preserveDrawingBuffer: false,
+                stencil: false,
               };
-            }
-            return extensions.includes(String(name)) ? {} : null;
+            },
+            getShaderPrecisionFormat() {
+              return { rangeMin: 127, rangeMax: 127, precision: 23 };
+            },
+          };
+          return new Proxy(webglContext, {
+            get(target, property, receiver) {
+              if (Reflect.has(target, property)) {
+                return Reflect.get(target, property, receiver);
+              }
+              if (typeof property === "string") {
+                const noop = () => null;
+                Reflect.set(target, property, noop);
+                return noop;
+              }
+              return undefined;
+            },
+          });
+        }
+        // FeiLin 只需要可调用、确定性的 Canvas 2D 表面来采集环境特征。
+        const canvasContext = {
+          canvas: this,
+          fillStyle: "#000000",
+          strokeStyle: "#000000",
+          font: "10px sans-serif",
+          textBaseline: "alphabetic",
+          beginPath() {},
+          closePath() {},
+          moveTo() {},
+          lineTo() {},
+          bezierCurveTo() {},
+          quadraticCurveTo() {},
+          arc() {},
+          arcTo() {},
+          ellipse() {},
+          rect() {},
+          fill() {},
+          stroke() {},
+          clip() {},
+          save() {},
+          restore() {},
+          translate() {},
+          rotate() {},
+          scale() {},
+          transform() {},
+          setTransform() {},
+          resetTransform() {},
+          fillRect() {},
+          strokeRect() {},
+          clearRect() {},
+          fillText() {},
+          strokeText() {},
+          drawImage() {},
+          putImageData() {},
+          setLineDash() {},
+          getLineDash() {
+            return [];
           },
-          getSupportedExtensions() {
-            return [...extensions];
+          createLinearGradient() {
+            return { addColorStop() {} };
           },
-          getParameter(name) {
-            return webglParameters.get(name) ?? 0;
+          createRadialGradient() {
+            return { addColorStop() {} };
           },
-          getContextAttributes() {
-            return {
-              alpha: true,
-              antialias: true,
-              depth: true,
-              failIfMajorPerformanceCaveat: false,
-              powerPreference: "default",
-              premultipliedAlpha: true,
-              preserveDrawingBuffer: false,
-              stencil: false,
-            };
+          createPattern() {
+            return null;
           },
-          getShaderPrecisionFormat() {
-            return { rangeMin: 127, rangeMax: 127, precision: 23 };
+          isPointInPath() {
+            return false;
+          },
+          isPointInStroke() {
+            return false;
+          },
+          measureText(text) {
+            // 字体度量是独立的指纹面：同一字符串在不同机器上的宽度并不相同。
+            return { width: String(text).length * profile.textMetricScale };
+          },
+          getImageData() {
+            return { data: canvasPixels };
           },
         };
-        return new Proxy(webglContext, {
+        // FeiLin 的混淆控制流会按运行时字符串访问 Canvas 方法。真实 Canvas 2D
+        // 对象的方法面很大；未知方法按无副作用空函数补齐，避免把环境缺口误当算法失败。
+        return new Proxy(canvasContext, {
           get(target, property, receiver) {
             if (Reflect.has(target, property)) {
               return Reflect.get(target, property, receiver);
             }
             if (typeof property === "string") {
-              const noop = () => null;
+              const noop = () => {};
               Reflect.set(target, property, noop);
               return noop;
             }
             return undefined;
           },
         });
-      }
-      // FeiLin 只需要可调用、确定性的 Canvas 2D 表面来采集环境特征。
-      const canvasContext = {
-        canvas: this,
-        fillStyle: "#000000",
-        strokeStyle: "#000000",
-        font: "10px sans-serif",
-        textBaseline: "alphabetic",
-        beginPath() {},
-        closePath() {},
-        moveTo() {},
-        lineTo() {},
-        bezierCurveTo() {},
-        quadraticCurveTo() {},
-        arc() {},
-        arcTo() {},
-        ellipse() {},
-        rect() {},
-        fill() {},
-        stroke() {},
-        clip() {},
-        save() {},
-        restore() {},
-        translate() {},
-        rotate() {},
-        scale() {},
-        transform() {},
-        setTransform() {},
-        resetTransform() {},
-        fillRect() {},
-        strokeRect() {},
-        clearRect() {},
-        fillText() {},
-        strokeText() {},
-        drawImage() {},
-        putImageData() {},
-        setLineDash() {},
-        getLineDash() {
-          return [];
-        },
-        createLinearGradient() {
-          return { addColorStop() {} };
-        },
-        createRadialGradient() {
-          return { addColorStop() {} };
-        },
-        createPattern() {
-          return null;
-        },
-        isPointInPath() {
-          return false;
-        },
-        isPointInStroke() {
-          return false;
-        },
-        measureText(text) {
-          return { width: String(text).length * 6 };
-        },
-        getImageData() {
-          return { data: new Uint8ClampedArray(4) };
-        },
-      };
-      // FeiLin 的混淆控制流会按运行时字符串访问 Canvas 方法。真实 Canvas 2D
-      // 对象的方法面很大；未知方法按无副作用空函数补齐，避免把环境缺口误当算法失败。
-      return new Proxy(canvasContext, {
-        get(target, property, receiver) {
-          if (Reflect.has(target, property)) {
-            return Reflect.get(target, property, receiver);
-          }
-          if (typeof property === "string") {
-            const noop = () => {};
-            Reflect.set(target, property, noop);
-            return noop;
-          }
-          return undefined;
-        },
-      });
-    },
-    toDataURL() {
-      return normalizedTag === "CANVAS"
-        // 当前页面同尺寸指纹画布约 3530 字符；Node 不做位图渲染，但保留真实外形。
-        ? "data:image/png;base64," + "A".repeat(3508)
-        : "";
-    },
-    offsetWidth: 100,
-    offsetHeight: 20,
-    clientWidth: 100,
-    clientHeight: 20,
+      },
+      toDataURL() {
+        // 指纹画布的长度与内容都由本轮画像的种子决定：同一轮内稳定，跨轮不同。
+        return normalizedTag === "CANVAS" ? canvasDataUrl : "";
+      },
+      offsetWidth: 100,
+      offsetHeight: 20,
+      clientWidth: 100,
+      clientHeight: 20,
+    };
   };
 }
 
 
 function makeBrowserContext(options, onRequest) {
-  const runtimeProfile = resolveRuntimeProfile(options.runtimeProfile);
+  // 本轮唯一的设备事实来源：DOM、navigator、screen、WebGL、Canvas 与外发请求头
+  // 全部由它派生，任何一处另起炉灶都会让服务端看到两台设备。
+  const deviceProfile = options.deviceProfile;
+  const screenProfile = deviceProfile.screen;
+  const makeElement = makeElementFactory(deviceProfile);
   const head = makeElement("head");
   const body = makeElement("body");
   const documentElement = makeElement("html");
@@ -583,8 +630,8 @@ function makeBrowserContext(options, onRequest) {
   let timerSequence = 1;
   const timeoutHandles = new Map();
   const intervalHandles = new Map();
-  documentElement.clientWidth = 430;
-  documentElement.clientHeight = 932;
+  documentElement.clientWidth = screenProfile.innerWidth;
+  documentElement.clientHeight = screenProfile.innerHeight;
 
   function listenerBucket(target, type) {
     if (!eventListeners.has(target)) {
@@ -778,6 +825,7 @@ function makeBrowserContext(options, onRequest) {
           const response = await fetch(sourceUrl, {
             method: "GET",
             headers: browserRequestHeaders(
+              deviceProfile,
               {},
               {
                 destination: "script",
@@ -998,7 +1046,10 @@ function makeBrowserContext(options, onRequest) {
     }
 
     send(body = null) {
-      const effectiveHeaders = browserRequestHeaders(this.headers);
+      const effectiveHeaders = browserRequestHeaders(
+        deviceProfile,
+        this.headers,
+      );
       const request = {
         method: this.method,
         url: this.url,
@@ -1119,17 +1170,22 @@ function makeBrowserContext(options, onRequest) {
       suffixes: "pdf",
       description: "Portable Document Format",
     });
-    const mimeTypes = [
-      makeMimeType("application/pdf"),
-      makeMimeType("text/pdf"),
-    ];
-    const plugins = [
-      "PDF Viewer",
-      "Chrome PDF Viewer",
-      "Chromium PDF Viewer",
-      "Microsoft Edge PDF Viewer",
-      "WebKit built-in PDF",
-    ].map((name) => Object.assign(
+    // 移动版 Chrome 没有内置 PDF 插件，navigator.plugins 与 mimeTypes 恒为空；
+    // 桌面版则固定是这五个。跟着家族走，不要两边都给。
+    const mimeTypes = deviceProfile.pdfViewer
+      ? [makeMimeType("application/pdf"), makeMimeType("text/pdf")]
+      : [];
+    const plugins = (
+      deviceProfile.pdfViewer
+        ? [
+          "PDF Viewer",
+          "Chrome PDF Viewer",
+          "Chromium PDF Viewer",
+          "Microsoft Edge PDF Viewer",
+          "WebKit built-in PDF",
+        ]
+        : []
+    ).map((name) => Object.assign(
       [
         makeMimeType("application/pdf"),
         makeMimeType("text/pdf"),
@@ -1146,24 +1202,20 @@ function makeBrowserContext(options, onRequest) {
         },
       },
     ));
-    const brands = Object.freeze([
-      Object.freeze({ brand: "Not;A=Brand", version: "8" }),
-      Object.freeze({ brand: "Chromium", version: "150" }),
-      Object.freeze({ brand: "Google Chrome", version: "150" }),
-    ]);
+    const brands = Object.freeze(
+      deviceProfile.brands.map((entry) => Object.freeze({ ...entry })),
+    );
     const userAgentData = {
       async getHighEntropyValues(hints) {
         const values = {
-          architecture: "",
-          bitness: "64",
-          model: runtimeProfile.uaDataModel,
-          platformVersion: runtimeProfile.uaDataPlatformVersion,
-          uaFullVersion: "150.0.7871.187",
-          fullVersionList: [
-            { brand: "Not;A=Brand", version: "8.0.0.0" },
-            { brand: "Chromium", version: "150.0.7871.187" },
-            { brand: "Google Chrome", version: "150.0.7871.187" },
-          ],
+          architecture: deviceProfile.uaArchitecture,
+          bitness: deviceProfile.uaBitness,
+          model: deviceProfile.uaModel,
+          platformVersion: deviceProfile.uaPlatformVersion,
+          uaFullVersion: deviceProfile.uaFullVersion,
+          fullVersionList: deviceProfile.fullVersionList.map(
+            (entry) => ({ ...entry }),
+          ),
           wow64: false,
         };
         return Object.fromEntries(
@@ -1177,34 +1229,34 @@ function makeBrowserContext(options, onRequest) {
         enumerable: true,
       },
       mobile: {
-        value: runtimeProfile.uaDataMobile,
+        value: deviceProfile.mobile,
         enumerable: true,
       },
       platform: {
-        value: runtimeProfile.uaDataPlatform,
+        value: deviceProfile.uaPlatform,
         enumerable: true,
       },
     });
     Object.freeze(userAgentData);
 
     const navigator = {
-      language: "zh-CN",
-      languages: Object.freeze(["zh-CN", "zh"]),
-      // 这些值来自目标页当前 Chrome 移动设备模式的只读运行态摘要。
-      hardwareConcurrency: 16,
-      deviceMemory: 32,
-      maxTouchPoints: 1,
+      language: deviceProfile.language,
+      languages: Object.freeze([...deviceProfile.languages]),
+      hardwareConcurrency: deviceProfile.hardwareConcurrency,
+      // Chrome 会把 deviceMemory 量化后再暴露，上限就是 8——报更大的值是穿帮。
+      deviceMemory: deviceProfile.deviceMemory,
+      maxTouchPoints: deviceProfile.maxTouchPoints,
       cookieEnabled: true,
       webdriver: false,
       onLine: true,
-      vendor: "Google Inc.",
+      vendor: deviceProfile.vendor,
       product: "Gecko",
       productSub: "20030107",
       appName: "Netscape",
       appCodeName: "Mozilla",
       doNotTrack: null,
       vendorSub: "",
-      pdfViewerEnabled: true,
+      pdfViewerEnabled: deviceProfile.pdfViewer,
       plugins: Object.assign(plugins, {
         item(index) {
           return this[index] ?? null;
@@ -1241,15 +1293,15 @@ function makeBrowserContext(options, onRequest) {
     };
     Object.defineProperties(navigator, {
       userAgent: {
-        value: runtimeProfile.userAgent,
+        value: deviceProfile.userAgent,
         enumerable: true,
       },
       platform: {
-        value: runtimeProfile.platform,
+        value: deviceProfile.platform,
         enumerable: true,
       },
       appVersion: {
-        value: runtimeProfile.appVersion,
+        value: deviceProfile.appVersion,
         enumerable: true,
       },
       userAgentData: {
@@ -1261,16 +1313,19 @@ function makeBrowserContext(options, onRequest) {
   }
   const navigator = makeNavigator();
   const screen = {
-    width: 430,
-    height: 932,
-    availWidth: 430,
-    availHeight: 932,
-    availLeft: 0,
-    availTop: 0,
-    colorDepth: 30,
-    pixelDepth: 30,
+    width: screenProfile.width,
+    height: screenProfile.height,
+    availWidth: screenProfile.availWidth,
+    availHeight: screenProfile.availHeight,
+    availLeft: screenProfile.availLeft,
+    availTop: screenProfile.availTop,
+    colorDepth: screenProfile.colorDepth,
+    pixelDepth: screenProfile.colorDepth,
     isExtended: false,
-    orientation: { type: "portrait-primary", angle: 0 },
+    orientation: {
+      type: screenProfile.orientationType,
+      angle: screenProfile.orientationAngle,
+    },
   };
 
   function makeIframeRealm(frameElement) {
@@ -1393,11 +1448,11 @@ function makeBrowserContext(options, onRequest) {
           },
         };
       },
-      innerWidth: 430,
-      innerHeight: 932,
-      outerWidth: 430,
-      outerHeight: 932,
-      devicePixelRatio: 3,
+      innerWidth: screenProfile.innerWidth,
+      innerHeight: screenProfile.innerHeight,
+      outerWidth: screenProfile.outerWidth,
+      outerHeight: screenProfile.outerHeight,
+      devicePixelRatio: screenProfile.devicePixelRatio,
     };
     const childContext = vm.createContext(childSandbox);
     childContext.window = childContext;
@@ -1602,11 +1657,11 @@ function makeBrowserContext(options, onRequest) {
     btoa(value) {
       return Buffer.from(String(value), "binary").toString("base64");
     },
-    innerWidth: 430,
-    innerHeight: 932,
-    outerWidth: 430,
-    outerHeight: 932,
-    devicePixelRatio: 3,
+    innerWidth: screenProfile.innerWidth,
+    innerHeight: screenProfile.innerHeight,
+    outerWidth: screenProfile.outerWidth,
+    outerHeight: screenProfile.outerHeight,
+    devicePixelRatio: screenProfile.devicePixelRatio,
     name: "",
     history: {
       length: 1,
@@ -2172,17 +2227,16 @@ async function main() {
 
 
 export {
-  RUNTIME_PROFILE_IDS,
   browserRequestHeaders,
   callFeiLinGetter,
   callPeFeiLinGetter,
+  decodeDeviceProfile,
   makeBrowserContext,
-  makeElement,
+  makeElementFactory,
   parseWorkerCompletionPayload,
   replayFeiLinInteractionEvents,
   refreshFeiLinToken,
   readWorkerCompletionInput,
-  runtimeProfileIdForMode,
   safeDeviceBridgeFailureMessage,
   selectFeiLinGetterOwner,
 };

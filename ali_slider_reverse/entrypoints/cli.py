@@ -37,6 +37,7 @@ from ..challenge.session import (
     ChallengeOutcome,
     VerifyBuild,
 )
+from ..device_profile import DeviceProfile, generate_device_profile
 from ..errors import AliSliderError
 from ..runtime.node_device import DeviceRuntimeResult
 from ..runtime.vision import VisionResult
@@ -57,10 +58,13 @@ def _emit(value: Any, *, stream: Any = sys.stdout) -> None:
 def _prepared_client(
     args: argparse.Namespace,
     settings: RuntimeSettings,
+    device_profile: DeviceProfile,
 ) -> AliSliderClient:
     """装配客户端，并把固定成本提前到设备链之前。"""
 
-    client = settings.build_client(scene_id=args.scene_id)
+    client = settings.build_client(
+        scene_id=args.scene_id, device_profile=device_profile
+    )
     if args.x_pos is None:
         # OpenCV 冷导入与 DeviceToken、Init 和资源下载重叠。
         client.prewarm_vision()
@@ -169,12 +173,15 @@ def _solve_command(args: argparse.Namespace) -> int:
     """执行设备链、Init、下载与识别，但不构造也不发送 Verify。"""
 
     settings = RuntimeSettings.from_args(args)
-    client = _prepared_client(args, settings)
+    device_profile = generate_device_profile()
+    client = _prepared_client(args, settings, device_profile)
 
     with ExitStack() as stack:
         stack.callback(client.close)
         device_session = stack.enter_context(
-            settings.build_device_runtime().challenge_session()
+            settings.build_device_runtime(
+                device_profile=device_profile
+            ).challenge_session()
         )
         challenge = client.init_challenge(device_session.init_token)
 
@@ -224,10 +231,11 @@ def _run_command(args: argparse.Namespace) -> int:
         raise AliSliderError("--submit-business 需要同时提供 --capture 和 --app-bundle")
 
     settings = RuntimeSettings.from_args(args)
-    client = _prepared_client(args, settings)
+    device_profile = generate_device_profile()
+    client = _prepared_client(args, settings, device_profile)
     with closing(client):
         outcome = client.run_captcha(
-            settings.build_device_runtime(),
+            settings.build_device_runtime(device_profile=device_profile),
             artifacts_dir=args.artifacts_dir,
             fixture_path=args.fixture,
             x_pos_override=args.x_pos,
