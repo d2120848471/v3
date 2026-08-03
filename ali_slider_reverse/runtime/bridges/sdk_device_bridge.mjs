@@ -207,6 +207,187 @@ function parseArguments(argv) {
 }
 
 
+const SDK_STATE_CAPTURE_HOOK = "__ALI_SDK_CAPTURE_STATE__";
+const LOG1_PLAINTEXT_CAPTURE_HOOK = "__ALI_LOG1_PLAINTEXT_CAPTURE__";
+
+
+/**
+ * 给公开 SDK 的状态合并方法插入一个只读观察点。
+ *
+ * 这里刻意不引用 SDK 压缩后的局部变量名。`re`、`ve` 一类名字每次重新打包
+ * 都可能变化；`_extend(patch)` 的职责以及 patch 中的 appName/appKey/endpoints/
+ * deviceCallback 等协议字段才是跨构建稳定的结构。参数名同样从源码声明现场
+ * 提取，插入代码只使用 `this` 与那个实参。
+ */
+function instrumentSdkStateCapture(source) {
+  let count = 0;
+  const stateMerger = /((?:_extend|["']_extend["'])\s*:\s*function\s*\(\s*([A-Za-z_$][\w$]*)\s*\)\s*\{)/g;
+  const instrumented = source.replace(
+    stateMerger,
+    (declaration, _method, patchArgument) => {
+      count += 1;
+      return (
+        declaration
+        + `globalThis.${SDK_STATE_CAPTURE_HOOK}?.(this,${patchArgument});`
+      );
+    },
+  );
+  return { source: instrumented, count };
+}
+
+
+function isNonEmptyString(value) {
+  return typeof value === "string" && value.length > 0;
+}
+
+
+/**
+ * 按公开协议字段识别承载 Log1/Log2/FeiLin 状态的配置对象。
+ *
+ * owner 上的四项是 SDK 设备 RPC 的稳定合同；patch 则允许两条证据路径：
+ * 初始化时的设备回调配置，或 Log1 解密后的 DeviceConfig。两条都只看语义字段，
+ * 不看构造函数、闭包位置和任何混淆符号名。
+ */
+function isSdkRuntimeState(owner, patch) {
+  if (
+    owner === null
+    || typeof owner !== "object"
+    || patch === null
+    || typeof patch !== "object"
+    || Array.isArray(patch)
+    || ![
+      "ACCESS_SEC",
+      "SESSION_ID_SALT",
+      "APP_NAME",
+      "APP_KEY",
+    ].every((name) => isNonEmptyString(owner[name]))
+  ) {
+    return false;
+  }
+
+  const bootstrapFields = [
+    "prefix",
+    "region",
+    "appName",
+    "appKey",
+    "endpoints",
+    "deviceCallback",
+  ];
+  const bootstrapScore = bootstrapFields.reduce(
+    (score, name) => score + Number(Object.hasOwn(patch, name)),
+    0,
+  );
+  if (
+    bootstrapScore >= 4
+    && typeof patch.deviceCallback === "function"
+  ) {
+    return true;
+  }
+
+  const deviceConfig = patch.deviceConfig;
+  return (
+    deviceConfig !== null
+    && typeof deviceConfig === "object"
+    && !Array.isArray(deviceConfig)
+    && [
+      "key",
+      "sessionId",
+      "version",
+      "pluginElements",
+      "pluginResource",
+      "globalVariable",
+      "timestamp",
+      "ip",
+    ].every((name) => typeof deviceConfig[name] === "string")
+  );
+}
+
+
+function installSdkStateCapture(context, onCapture) {
+  Object.defineProperty(context, SDK_STATE_CAPTURE_HOOK, {
+    configurable: true,
+    enumerable: false,
+    value(owner, patch) {
+      try {
+        if (isSdkRuntimeState(owner, patch)) {
+          delete context[SDK_STATE_CAPTURE_HOOK];
+          onCapture(owner);
+        }
+      } catch {}
+    },
+    writable: false,
+  });
+}
+
+
+function publicConfigSummary(runtimeConfig) {
+  const verifyType = isNonEmptyString(runtimeConfig.verifyType)
+    ? runtimeConfig.verifyType
+    : "2.0";
+  const region = isNonEmptyString(runtimeConfig.region)
+    ? runtimeConfig.region
+    : "cn";
+  const appName = isNonEmptyString(runtimeConfig.appName)
+    ? runtimeConfig.appName
+    : runtimeConfig.APP_NAME;
+  const appKey = isNonEmptyString(runtimeConfig.appKey)
+    ? runtimeConfig.appKey
+    : runtimeConfig.APP_KEY;
+  const dynamicJsPathTemplate = (
+    typeof runtimeConfig.dynamicJsPath === "function"
+      ? runtimeConfig.dynamicJsPath("__VERSION__")
+      : null
+  );
+  return {
+    appNameMap: { [verifyType]: appName },
+    appKeyMap: { [verifyType]: { [region]: appKey } },
+    apiVersion: runtimeConfig.API_VERSION,
+    appVersion: runtimeConfig.APP_VERSION,
+    platform: runtimeConfig.PLATFORM,
+    defaultAppName: runtimeConfig.APP_NAME,
+    defaultAppKey: runtimeConfig.APP_KEY,
+    accessSec: runtimeConfig.ACCESS_SEC,
+    wafEndpoints: runtimeConfig.WAF_ENDPOINTS,
+    cnEndpoints: runtimeConfig.CN_ENDPOINTS,
+    cdnServers: runtimeConfig.cdnServers,
+    httpsScheme: runtimeConfig.https,
+    dynamicJsPathTemplate,
+  };
+}
+
+
+/**
+ * probe-log1 通过六段稳定 schema 观察加密前的 Data，而不是调用某版 SDK 的
+ * 局部 AES 函数。命中后立即恢复原生 join，避免观察逻辑进入后续 FeiLin 环境。
+ */
+function installLog1PlaintextCapture(context, onCapture) {
+  Object.defineProperty(context, LOG1_PLAINTEXT_CAPTURE_HOOK, {
+    configurable: true,
+    enumerable: false,
+    value: onCapture,
+    writable: false,
+  });
+  vm.runInContext(
+    [
+      "(()=>{",
+      "const nativeJoin=Array.prototype.join;",
+      "Array.prototype.join=function(separator){",
+      "const result=nativeJoin.call(this,separator);",
+      "if(separator==='#'&&this.length===6&&",
+      "this[4]==='CLOUD'&&this[5]===''&&",
+      "this.slice(0,4).every((value)=>typeof value==='string')){",
+      `globalThis.${LOG1_PLAINTEXT_CAPTURE_HOOK}(result);`,
+      "Array.prototype.join=nativeJoin;",
+      "}",
+      "return result;",
+      "};",
+      "})();",
+    ].join(""),
+    context,
+  );
+}
+
+
 function instrumentFeiLinProfile(source) {
   const entry = /function ([A-Za-z_$][\w$]*)\(t,r\)\{var n=Object\.entries\(t\),e=\{\},i=!0,a=!1,o=void 0;/.exec(
     source,
@@ -1958,39 +2139,14 @@ async function replayFeiLinInteractionEvents(context, events) {
 async function main() {
   const options = parseArguments(process.argv);
   let source = fs.readFileSync(options.sdkPath, "utf8");
-  const probeMarker = "if(window.AliyunCaptchaConfig&&";
-  if (!source.includes(probeMarker)) {
-    throw new Error("未找到 SDK 配置探针注入点，公开脚本结构可能已变化");
+  const stateCapture = instrumentSdkStateCapture(source);
+  if (stateCapture.count < 1) {
+    throw new Error("未找到 SDK 状态合并结构，公开脚本结构可能已变化");
   }
-  // 只在内存中的公开脚本副本注入观测点，不修改原始资源。这里导出的都是
-  // Log1 构造所需的公开前端配置；解密函数仅用于核对已截获的 Data 明文边界。
-  source = source.replace(
-    probeMarker,
-    [
-      "window.__ALI_SDK_PROBE__={",
-      "appNameMap:Ft.appName,",
-      "appKeyMap:Ft.appKey,",
-      "apiVersion:nr.API_VERSION,",
-      "appVersion:nr.APP_VERSION,",
-      "platform:nr.PLATFORM,",
-      "defaultAppName:nr.APP_NAME,",
-      "defaultAppKey:nr.APP_KEY,",
-      "accessSec:nr.ACCESS_SEC,",
-      "log1OuterKeyCiphertext:ve[re(196)],",
-      "deviceConfigKeyCiphertext:ve[re(186)],",
-      "deviceFlagKeyCiphertext:ve[re(330)],",
-      "wafEndpoints:nr.WAF_ENDPOINTS,",
-      "cnEndpoints:nr.CN_ENDPOINTS,",
-      "cdnServers:nr.cdnServers,",
-      "httpsScheme:nr.https,",
-      "dynamicJsPath:function(t){return nr.dynamicJsPath(t)},",
-      "runtimeConfig:nr,",
-      "decryptLog1Data:function(t){return ge(he,t)}",
-      "};",
-      probeMarker,
-    ].join(""),
-  );
+  source = stateCapture.source;
   let captured = null;
+  let log1DataPlaintext = null;
+  let runtimeConfig = null;
   const requests = [];
   const context = makeBrowserContext(options, (request) => {
     requests.push(request);
@@ -2000,6 +2156,17 @@ async function main() {
         form: parseForm(request.body),
       };
     }
+  });
+  if (options.mode === "probe-log1") {
+    installLog1PlaintextCapture(context, (value) => {
+      if (typeof value === "string" && value) {
+        log1DataPlaintext = value;
+        delete context[LOG1_PLAINTEXT_CAPTURE_HOOK];
+      }
+    });
+  }
+  installSdkStateCapture(context, (owner) => {
+    runtimeConfig = owner;
   });
 
   try {
@@ -2015,7 +2182,9 @@ async function main() {
   if (captured === null && options.mode === "probe-log1") {
     throw new Error("SDK 未执行到 XHR.send；需要补充首分歧环境");
   }
-  const publicConfig = context.__ALI_SDK_PROBE__;
+  if (options.mode === "probe-log1" && runtimeConfig === null) {
+    throw new Error("未识别 SDK 设备运行态，公开脚本结构可能已变化");
+  }
   if (
     options.mode === "live-token"
     || options.mode === "profile-token"
@@ -2026,26 +2195,30 @@ async function main() {
     let tokenSource = "";
 
     while (Date.now() < deadline) {
-      const runtimeToken = publicConfig.runtimeConfig?.DeviceToken;
+      const runtimeToken = runtimeConfig?.DeviceToken;
       if (typeof runtimeToken === "string" && runtimeToken) {
         deviceToken = runtimeToken;
         tokenSource = "deviceCallback";
-        break;
       }
-      const getterOwner = selectFeiLinGetterOwner(context);
-      if (getterOwner) {
+      const candidateGetterOwner = selectFeiLinGetterOwner(context);
+      if (!deviceToken && candidateGetterOwner) {
         try {
-          const generated = refreshFeiLinToken(getterOwner);
+          const generated = refreshFeiLinToken(candidateGetterOwner);
           if (typeof generated === "string" && generated) {
             deviceToken = generated;
             tokenSource = "getToken";
-            break;
           }
         } catch {}
+      }
+      if (deviceToken && runtimeConfig !== null) {
+        break;
       }
       await wait(25);
     }
 
+    if (runtimeConfig === null) {
+      throw new Error("未识别 SDK 设备运行态，公开脚本结构可能已变化");
+    }
     if (!deviceToken) {
       throw new Error("等待 DeviceToken 超时");
     }
@@ -2069,11 +2242,11 @@ async function main() {
       };
     });
     const deviceConfig = (
-      publicConfig.runtimeConfig?.deviceConfig ?? null
+      runtimeConfig.deviceConfig ?? null
     );
     const verifyArgProfile = {
-      accessSec: publicConfig.runtimeConfig?.ACCESS_SEC,
-      sessionIdSalt: publicConfig.runtimeConfig?.SESSION_ID_SALT,
+      accessSec: runtimeConfig.ACCESS_SEC,
+      sessionIdSalt: runtimeConfig.SESSION_ID_SALT,
     };
     for (const [name, value] of Object.entries(verifyArgProfile)) {
       if (
@@ -2199,27 +2372,9 @@ async function main() {
     process.exit(0);
   }
 
-  captured.publicConfig = {
-    appNameMap: publicConfig.appNameMap,
-    appKeyMap: publicConfig.appKeyMap,
-    apiVersion: publicConfig.apiVersion,
-    appVersion: publicConfig.appVersion,
-    platform: publicConfig.platform,
-    defaultAppName: publicConfig.defaultAppName,
-    defaultAppKey: publicConfig.defaultAppKey,
-    accessSec: publicConfig.accessSec,
-    log1OuterKeyCiphertext: publicConfig.log1OuterKeyCiphertext,
-    deviceConfigKeyCiphertext: publicConfig.deviceConfigKeyCiphertext,
-    deviceFlagKeyCiphertext: publicConfig.deviceFlagKeyCiphertext,
-    wafEndpoints: publicConfig.wafEndpoints,
-    cnEndpoints: publicConfig.cnEndpoints,
-    cdnServers: publicConfig.cdnServers,
-    httpsScheme: publicConfig.httpsScheme,
-    dynamicJsPathTemplate: publicConfig.dynamicJsPath("__VERSION__"),
-  };
-  captured.log1DataPlaintext = publicConfig.decryptLog1Data(
-    captured.form.Data,
-  );
+  captured.publicConfig = publicConfigSummary(runtimeConfig);
+  captured.log1DataPlaintext = log1DataPlaintext;
+  captured.log1DataPlaintextAvailable = isNonEmptyString(log1DataPlaintext);
   // 使用同步写入并立即退出，避免探针的伪 XHR 触发 SDK 五秒超时重试。
   fs.writeFileSync(1, `${JSON.stringify(captured)}\n`);
   process.exit(0);
@@ -2231,6 +2386,9 @@ export {
   callFeiLinGetter,
   callPeFeiLinGetter,
   decodeDeviceProfile,
+  installSdkStateCapture,
+  instrumentSdkStateCapture,
+  isSdkRuntimeState,
   makeBrowserContext,
   makeElementFactory,
   parseWorkerCompletionPayload,

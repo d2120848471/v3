@@ -17,6 +17,8 @@ import { pathToFileURL } from "node:url";
 
 import {
   decodeDeviceProfile,
+  installSdkStateCapture,
+  instrumentSdkStateCapture,
   makeBrowserContext,
 } from "./sdk_device_bridge.mjs";
 
@@ -1039,6 +1041,26 @@ function makePeBrowserContext(options) {
 }
 
 
+function loadSdkRuntime(context, source, filename, timeoutMs) {
+  const stateCapture = instrumentSdkStateCapture(source);
+  if (stateCapture.count < 1) {
+    throw new Error("公开 SDK 结构变化：未找到状态合并结构");
+  }
+  let sdkRuntime = null;
+  installSdkStateCapture(context, (owner) => {
+    sdkRuntime = owner;
+  });
+  vm.runInContext(stateCapture.source, context, {
+    filename,
+    timeout: timeoutMs,
+  });
+  if (!sdkRuntime || typeof sdkRuntime !== "object") {
+    throw new Error("公开 SDK 没有导出动态 PE 运行配置");
+  }
+  return sdkRuntime;
+}
+
+
 async function main() {
   const options = parseArguments(process.argv);
   const HostDate = globalThis.Date;
@@ -1114,19 +1136,12 @@ async function main() {
   context.HTMLCollection = class HTMLCollection extends Array {};
   const dom = installCaptchaDom(context, input.dimensions);
 
-  const sdkProbeMarker = "if(window.AliyunCaptchaConfig&&";
-  let sdkSource = fs.readFileSync(options.sdkPath, "utf8");
-  if (!sdkSource.includes(sdkProbeMarker)) {
-    throw new Error("公开 SDK 结构变化：未找到运行配置导出点");
-  }
-  sdkSource = sdkSource.replace(
-    sdkProbeMarker,
-    `window.__ALI_PE_SDK_RUNTIME__=nr;${sdkProbeMarker}`,
+  const sdkRuntime = loadSdkRuntime(
+    context,
+    fs.readFileSync(options.sdkPath, "utf8"),
+    options.sdkPath,
+    Math.min(options.timeoutMs, 10_000),
   );
-  vm.runInContext(sdkSource, context, {
-    filename: options.sdkPath,
-    timeout: Math.min(options.timeoutMs, 10_000),
-  });
   vm.runInContext(
     `(() => {
       const nativeStringify = JSON.stringify;
@@ -1179,10 +1194,6 @@ async function main() {
   });
   if (typeof context.__ALI_PE_PUZZLE_CTOR__ !== "function") {
     throw new Error("当前 PE 没有暴露 Puzzle constructor");
-  }
-  const sdkRuntime = context.__ALI_PE_SDK_RUNTIME__;
-  if (!sdkRuntime || typeof sdkRuntime !== "object") {
-    throw new Error("公开 SDK 没有导出动态 PE 运行配置");
   }
   const runtimeDeviceConfig = {};
   const runtimeChain = [];
@@ -1334,6 +1345,7 @@ export {
   exposePuzzleConstructor,
   installDeviceGetterProbe,
   installCaptchaDom,
+  loadSdkRuntime,
   makeLogicalClock,
   makePeBrowserContext,
   replayTrack,
