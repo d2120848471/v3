@@ -4,7 +4,6 @@ import vm from "node:vm";
 
 import {
   installSdkStateCapture,
-  instrumentSdkStateCapture,
   isSdkRuntimeState,
 } from "../ali_slider_reverse/runtime/bridges/sdk_device_bridge.mjs";
 import {
@@ -12,48 +11,81 @@ import {
 } from "../ali_slider_reverse/runtime/bridges/pe_data_bridge.mjs";
 
 
-function exerciseVariant({ methodDeclaration, ownerName, patchName }) {
+function exerciseVariant({
+  inheritedDeviceCallback = false,
+  methodDeclaration,
+  methodName,
+  ownerName,
+  patchName,
+  shadowObject = false,
+}) {
   const source = [
     "(()=>{",
     "const statePrototype={",
     "ACCESS_SEC:'access',SESSION_ID_SALT:'salt',",
     "APP_NAME:'app',APP_KEY:'key',",
+    inheritedDeviceCallback ? "deviceCallback(){}," : "",
     `${methodDeclaration}{Object.assign(this,${patchName})}`,
     "};",
     `const ${ownerName}=Object.create(statePrototype);`,
-    `${ownerName}._extend({prefix:'p',region:'cn',appName:'app',`,
+    `${ownerName}[${JSON.stringify(methodName)}]({prefix:'p',region:'cn',appName:'app',`,
     "appKey:'key',endpoints:['https://example.invalid'],",
     "deviceCallback(){}});",
     `globalThis.result=${ownerName};`,
     "})();",
   ].join("");
-  const transformed = instrumentSdkStateCapture(source);
   let captured = null;
-  const context = vm.createContext({});
-  installSdkStateCapture(context, (owner) => {
+  const context = vm.createContext(shadowObject ? { Object } : {});
+  const capture = installSdkStateCapture(context, (owner) => {
     captured = owner;
   });
-  vm.runInContext(transformed.source, context);
-  return { captured, context, transformed };
+  vm.runInContext(source, context);
+  capture.flush();
+  return { captured, context };
 }
 
 
-test("SDK 状态探针不依赖 owner 或 patch 的混淆变量名", () => {
+test("SDK 状态探针不依赖变量名、合并方法名或方法声明形态", () => {
   for (const variant of [
     {
       methodDeclaration: "_extend:function(payload)",
+      methodName: "_extend",
       ownerName: "renamedRuntime",
       patchName: "payload",
     },
     {
-      methodDeclaration: "'_extend':function($0)",
+      methodDeclaration: "applyState($0)",
+      methodName: "applyState",
       ownerName: "$state9",
       patchName: "$0",
     },
+    {
+      methodDeclaration: "['nextVersionMerge'](next)",
+      methodName: "nextVersionMerge",
+      ownerName: "futureOwner",
+      patchName: "next",
+    },
+    {
+      inheritedDeviceCallback: true,
+      methodDeclaration: "mergeWithInheritedTail(next)",
+      methodName: "mergeWithInheritedTail",
+      ownerName: "prototypeHeavyOwner",
+      patchName: "next",
+      shadowObject: true,
+    },
   ]) {
-    const { captured, context, transformed } = exerciseVariant(variant);
-    assert.equal(transformed.count, 1);
+    const { captured, context } = exerciseVariant(variant);
     assert.equal(captured, context.result);
+    assert.equal(
+      vm.runInContext(
+        [
+          "Object.prototype.hasOwnProperty.call(",
+          "Object.getPrototypeOf({}),'deviceCallback')",
+        ].join(""),
+        context,
+      ),
+      false,
+    );
   }
 });
 
@@ -101,7 +133,7 @@ test("SDK 状态探针支持以解密后的 DeviceConfig 作为第二条结构�
 });
 
 
-test("PE 桥通过共享语义探针取得运行态，不依赖 SDK 压缩变量名", () => {
+test("PE 桥通过共享运行时探针取得状态，不依赖 SDK 合并函数文本", () => {
   const context = vm.createContext({});
   const runtime = loadSdkRuntime(
     context,
@@ -109,10 +141,10 @@ test("PE 桥通过共享语义探针取得运行态，不依赖 SDK 压缩变量
       "(()=>{",
       "const proto={ACCESS_SEC:'access',SESSION_ID_SALT:'salt',",
       "APP_NAME:'app',APP_KEY:'key',",
-      "_extend:function(nextState){Object.assign(this,nextState)}",
+      "applyFutureState(nextState){Object.assign(this,nextState)}",
       "};",
       "const completelyRenamedOwner=Object.create(proto);",
-      "completelyRenamedOwner._extend({prefix:'p',region:'cn',",
+      "completelyRenamedOwner.applyFutureState({prefix:'p',region:'cn',",
       "appName:'app',appKey:'key',endpoints:[],deviceCallback(){}});",
       "})();",
     ].join(""),

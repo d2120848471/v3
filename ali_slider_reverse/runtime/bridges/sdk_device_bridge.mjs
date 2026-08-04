@@ -207,35 +207,25 @@ function parseArguments(argv) {
 }
 
 
-const SDK_STATE_CAPTURE_HOOK = "__ALI_SDK_CAPTURE_STATE__";
 const LOG1_PLAINTEXT_CAPTURE_HOOK = "__ALI_LOG1_PLAINTEXT_CAPTURE__";
+const SDK_STATE_CAPTURE_FIELDS = Object.freeze([
+  "prefix",
+  "region",
+  "appName",
+  "appKey",
+  "endpoints",
+  "deviceCallback",
+  "deviceConfig",
+  "DeviceConfig",
+]);
 
 
 /**
- * 给公开 SDK 的状态合并方法插入一个只读观察点。
- *
- * 这里刻意不引用 SDK 压缩后的局部变量名。`re`、`ve` 一类名字每次重新打包
- * 都可能变化；`_extend(patch)` 的职责以及 patch 中的 appName/appKey/endpoints/
- * deviceCallback 等协议字段才是跨构建稳定的结构。参数名同样从源码声明现场
- * 提取，插入代码只使用 `this` 与那个实参。
+ * 公开 SDK 热更新会重命名闭包变量，也可能改变对象方法的压缩写法。状态探针
+ * 因此不再改写 `_extend:function(...)` 一类源码文本，而是在 VM 内短暂观察这些
+ * 稳定协议字段的首次赋值。赋值会立即落成普通自有属性；捕获目标后所有探针
+ * 都会恢复，所以不会进入后续 FeiLin 指纹采集。
  */
-function instrumentSdkStateCapture(source) {
-  let count = 0;
-  const stateMerger = /((?:_extend|["']_extend["'])\s*:\s*function\s*\(\s*([A-Za-z_$][\w$]*)\s*\)\s*\{)/g;
-  const instrumented = source.replace(
-    stateMerger,
-    (declaration, _method, patchArgument) => {
-      count += 1;
-      return (
-        declaration
-        + `globalThis.${SDK_STATE_CAPTURE_HOOK}?.(this,${patchArgument});`
-      );
-    },
-  );
-  return { source: instrumented, count };
-}
-
-
 function isNonEmptyString(value) {
   return typeof value === "string" && value.length > 0;
 }
@@ -304,19 +294,85 @@ function isSdkRuntimeState(owner, patch) {
 
 
 function installSdkStateCapture(context, onCapture) {
-  Object.defineProperty(context, SDK_STATE_CAPTURE_HOOK, {
-    configurable: true,
-    enumerable: false,
-    value(owner, patch) {
+  // makeBrowserContext 会把全局 Object 映射到宿主实现；对象字面量仍继承 VM
+  // realm 自己的 intrinsic prototype，必须从字面量反查，不能读 Object.prototype。
+  const objectPrototype = vm.runInContext("Object.getPrototypeOf({})", context);
+  const installed = [];
+  const candidates = new Set();
+  let active = true;
+
+  const stop = () => {
+    if (!active) {
+      return;
+    }
+    active = false;
+    candidates.clear();
+    for (const { field, setter } of installed) {
+      const descriptor = Object.getOwnPropertyDescriptor(
+        objectPrototype,
+        field,
+      );
+      if (descriptor?.set === setter) {
+        delete objectPrototype[field];
+      }
+    }
+  };
+
+  const observe = (owner) => {
+    if (!active) {
+      return;
+    }
+    try {
+      if (isSdkRuntimeState(owner, owner)) {
+        stop();
+        onCapture(owner);
+      }
+    } catch {}
+  };
+
+  const flush = () => {
+    if (!active) {
+      return;
+    }
+    for (const owner of candidates) {
+      observe(owner);
+      if (!active) {
+        return;
+      }
+    }
+  };
+
+  for (const field of SDK_STATE_CAPTURE_FIELDS) {
+    // 不覆盖 SDK 或宿主已经显式定义的 Object.prototype 合同。
+    if (Object.hasOwn(objectPrototype, field)) {
+      continue;
+    }
+    const setter = function captureSdkStateField(value) {
+      candidates.add(this);
+      Object.defineProperty(this, field, {
+        configurable: true,
+        enumerable: true,
+        value,
+        writable: true,
+      });
       try {
-        if (isSdkRuntimeState(owner, patch)) {
-          delete context[SDK_STATE_CAPTURE_HOOK];
-          onCapture(owner);
-        }
+        observe(this);
+        // 某些版本把末尾字段预先放在自定义原型上，因此最后一次赋值不会命中
+        // Object.prototype。等本轮同步 merge 结束后，再用完整 owner 复核一次。
+        queueMicrotask(flush);
       } catch {}
-    },
-    writable: false,
-  });
+    };
+    Object.defineProperty(objectPrototype, field, {
+      configurable: true,
+      enumerable: false,
+      get() {
+        return undefined;
+      },
+      set: setter,
+    });
+    installed.push({ field, setter });
+  }
+  return Object.freeze({ flush, stop });
 }
 
 
@@ -2138,12 +2194,7 @@ async function replayFeiLinInteractionEvents(context, events) {
 
 async function main() {
   const options = parseArguments(process.argv);
-  let source = fs.readFileSync(options.sdkPath, "utf8");
-  const stateCapture = instrumentSdkStateCapture(source);
-  if (stateCapture.count < 1) {
-    throw new Error("未找到 SDK 状态合并结构，公开脚本结构可能已变化");
-  }
-  source = stateCapture.source;
+  const source = fs.readFileSync(options.sdkPath, "utf8");
   let captured = null;
   let log1DataPlaintext = null;
   let runtimeConfig = null;
@@ -2165,7 +2216,7 @@ async function main() {
       }
     });
   }
-  installSdkStateCapture(context, (owner) => {
+  const runtimeStateCapture = installSdkStateCapture(context, (owner) => {
     runtimeConfig = owner;
   });
 
@@ -2175,10 +2226,12 @@ async function main() {
       timeout: 10_000,
     });
   } catch (error) {
+    runtimeStateCapture.flush();
     if (captured === null) {
       throw error;
     }
   }
+  runtimeStateCapture.flush();
   if (captured === null && options.mode === "probe-log1") {
     throw new Error("SDK 未执行到 XHR.send；需要补充首分歧环境");
   }
@@ -2387,7 +2440,6 @@ export {
   callPeFeiLinGetter,
   decodeDeviceProfile,
   installSdkStateCapture,
-  instrumentSdkStateCapture,
   isSdkRuntimeState,
   makeBrowserContext,
   makeElementFactory,

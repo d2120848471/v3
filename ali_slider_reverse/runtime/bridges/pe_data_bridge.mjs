@@ -18,7 +18,6 @@ import { pathToFileURL } from "node:url";
 import {
   decodeDeviceProfile,
   installSdkStateCapture,
-  instrumentSdkStateCapture,
   makeBrowserContext,
 } from "./sdk_device_bridge.mjs";
 
@@ -1042,19 +1041,22 @@ function makePeBrowserContext(options) {
 
 
 function loadSdkRuntime(context, source, filename, timeoutMs) {
-  const stateCapture = instrumentSdkStateCapture(source);
-  if (stateCapture.count < 1) {
-    throw new Error("公开 SDK 结构变化：未找到状态合并结构");
-  }
   let sdkRuntime = null;
-  installSdkStateCapture(context, (owner) => {
+  const stateCapture = installSdkStateCapture(context, (owner) => {
     sdkRuntime = owner;
   });
-  vm.runInContext(stateCapture.source, context, {
-    filename,
-    timeout: timeoutMs,
-  });
+  try {
+    vm.runInContext(source, context, {
+      filename,
+      timeout: timeoutMs,
+    });
+    stateCapture.flush();
+  } catch (error) {
+    stateCapture.stop();
+    throw error;
+  }
   if (!sdkRuntime || typeof sdkRuntime !== "object") {
+    stateCapture.stop();
     throw new Error("公开 SDK 没有导出动态 PE 运行配置");
   }
   return sdkRuntime;
