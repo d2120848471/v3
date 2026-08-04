@@ -2,22 +2,30 @@
 
 from __future__ import annotations
 
+import io
+import json
 import threading
 import time
 import unittest
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+import urllib.request
+from contextlib import contextmanager, redirect_stderr
+from http.server import ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest import mock
 
+from ali_slider_reverse import config
 from ali_slider_reverse.challenge.device_pool import DeviceSessionPool
 from ali_slider_reverse.challenge.session import AliSliderClient
 from ali_slider_reverse.challenge.transport import (
     SharedHttpAdapterPool,
     warm_connections,
 )
-from ali_slider_reverse.entrypoints import desktop
-from ali_slider_reverse.entrypoints.api import SolveRequest, solve_once
+from ali_slider_reverse.entrypoints import api, desktop
+from ali_slider_reverse.entrypoints.api import (
+    SliderApiHandler,
+    SolveRequest,
+    solve_once,
+)
 
 
 class _FakeDeviceClient:
@@ -365,8 +373,7 @@ class SharedTransportPoolTests(unittest.TestCase):
             ["https://one.invalid/"] * 3 + ["https://two.invalid/"] * 3,
         )
 
-    def test_service_upload_executor_does_not_block_response(self) -> None:
-        release_upload = threading.Event()
+    def test_disabled_upload_log_is_not_scheduled(self) -> None:
         verify = SimpleNamespace(succeeded=True)
         completed_device = SimpleNamespace(
             getter_argument_count=1,
@@ -398,8 +405,8 @@ class SharedTransportPoolTests(unittest.TestCase):
         client.prewarm_connections = lambda: None
         client.init_challenge = lambda token: SimpleNamespace(init_started_ms=1)
         client.download_assets = lambda challenge, directory: SimpleNamespace()
-        client.upload_initialization_log = (
-            lambda challenge, assets: release_upload.wait(timeout=1.0)
+        client.upload_initialization_log = mock.Mock(
+            side_effect=AssertionError("UploadLog must stay disabled")
         )
         client.solve_assets = lambda assets, x_pos_override=None: SimpleNamespace(
             confidence=1.0
@@ -407,18 +414,120 @@ class SharedTransportPoolTests(unittest.TestCase):
         client.build_verify_data = lambda *args, **kwargs: build
         client.verify_challenge = lambda *args, **kwargs: verify
 
-        executor = ThreadPoolExecutor(max_workers=1)
-        client._upload_executor = executor
-        try:
+        client._upload_executor = None
+        with (
+            mock.patch.object(config, "UPLOAD_LOG_ENABLED", False),
+            mock.patch(
+                "ali_slider_reverse.challenge.session.ThreadPoolExecutor"
+            ) as executor,
+        ):
             started = time.monotonic()
             outcome = AliSliderClient.run_captcha(client, Runtime())
             elapsed = time.monotonic() - started
-        finally:
-            release_upload.set()
-            executor.shutdown(wait=True)
 
         self.assertLess(elapsed, 0.5)
         self.assertFalse(outcome.upload_log_succeeded)
+        client.upload_initialization_log.assert_not_called()
+        executor.assert_not_called()
+
+    def test_disabled_upload_log_method_returns_without_network(self) -> None:
+        client = object.__new__(AliSliderClient)
+        client._post_rpc = mock.Mock(
+            side_effect=AssertionError("UploadLog network call is forbidden")
+        )
+
+        with mock.patch.object(config, "UPLOAD_LOG_ENABLED", False):
+            result = AliSliderClient.upload_initialization_log(
+                client, object(), object()
+            )
+
+        self.assertFalse(result)
+        client._post_rpc.assert_not_called()
+
+    def test_disabled_upload_host_is_not_prewarmed(self) -> None:
+        with mock.patch.object(config, "UPLOAD_LOG_ENABLED", False):
+            urls = api._startup_warm_urls()
+
+        self.assertNotIn(config.UPLOAD_URL, urls)
+        self.assertIn(config.init_url(), urls)
+        self.assertIn(config.verify_url(), urls)
+
+
+class ApiDocumentationTests(unittest.TestCase):
+    @staticmethod
+    @contextmanager
+    def _running_server(handler: type[SliderApiHandler]):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        server.daemon_threads = True
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            host, port = server.server_address[:2]
+            yield f"http://{host}:{port}"
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=2.0)
+
+    def test_docs_and_openapi_are_served_locally(self) -> None:
+        class Handler(SliderApiHandler):
+            result_hook = None
+
+        with self._running_server(Handler) as base_url:
+            with urllib.request.urlopen(base_url + "/docs") as response:
+                docs = response.read().decode("utf-8")
+            with urllib.request.urlopen(base_url + "/openapi.json") as response:
+                spec = json.loads(response.read().decode("utf-8"))
+
+        self.assertIn("AliSlider API", docs)
+        self.assertIn(config.API_SOLVE_PATH, docs)
+        self.assertIn("完整响应", docs)
+        self.assertIn(config.API_SOLVE_PATH, spec["paths"])
+
+    def test_api_response_and_console_hook_receive_full_json(self) -> None:
+        captured: list[tuple[str, str, int, dict[str, object]]] = []
+
+        class Handler(SliderApiHandler):
+            pass
+
+        Handler.result_hook = staticmethod(
+            lambda method, path, status, body: captured.append(
+                (method, path, status, body)
+            )
+        )
+        expected = {
+            "ok": True,
+            "securityToken": "complete-security-token",
+            "VerifyCode": "T001",
+            "VerifyResult": True,
+            "certifyId": "certify-id",
+            "sceneId": config.DEFAULT_SCENE_ID,
+            "proxied": False,
+            "elapsedMs": 1234,
+        }
+        payload = json.dumps({"SceneId": config.DEFAULT_SCENE_ID}).encode()
+
+        with (
+            mock.patch.object(api, "solve_once", return_value=expected),
+            self._running_server(Handler) as base_url,
+        ):
+            request = urllib.request.Request(
+                base_url + config.API_SOLVE_PATH,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request) as response:
+                actual = json.loads(response.read().decode("utf-8"))
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(captured, [("POST", config.API_SOLVE_PATH, 200, expected)])
+
+        output = io.StringIO()
+        with redirect_stderr(output):
+            api._print_full_result("POST", config.API_SOLVE_PATH, 200, expected)
+        self.assertIn("complete-security-token", output.getvalue())
+        self.assertIn('"VerifyCode":"T001"', output.getvalue())
 
 
 class StartupMenuTests(unittest.TestCase):
@@ -460,23 +569,28 @@ class StartupMenuTests(unittest.TestCase):
             ],
         )
 
-    def test_no_argument_main_prepares_console_then_dispatches_selection(
-        self,
-    ) -> None:
-        selected = ["--runtime-mode", "fast", "--max-concurrency", "5"]
+    def test_no_argument_main_starts_fast_api_and_opens_docs(self) -> None:
         with (
             mock.patch.object(desktop, "_prepare_console") as prepare,
-            mock.patch.object(
-                desktop, "_select_startup_arguments", return_value=selected
-            ) as choose,
-            mock.patch.object(desktop, "run_console", return_value=17) as run,
+            mock.patch.object(desktop, "_select_startup_arguments") as choose,
+            mock.patch.object(desktop, "run_console") as run,
+            mock.patch.object(desktop, "api_main", return_value=17) as api_run,
         ):
             result = desktop.main([])
 
         self.assertEqual(result, 17)
         prepare.assert_called_once()
-        choose.assert_called_once_with()
-        run.assert_called_once_with(selected)
+        choose.assert_not_called()
+        run.assert_not_called()
+        api_run.assert_called_once_with(
+            [
+                "--runtime-mode",
+                "fast",
+                "--max-concurrency",
+                "5",
+                "--open-docs",
+            ]
+        )
 
 
 if __name__ == "__main__":

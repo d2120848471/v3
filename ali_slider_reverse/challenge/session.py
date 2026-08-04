@@ -75,7 +75,6 @@ from .business import (
 from .track import load_scaled_touch_track
 from .transport import build_pool_adapter, pooled_session, warm_connections
 
-
 _SUPPORTED_PROXY_SCHEMES = frozenset(
     {"http", "https", "socks4", "socks5", "socks5h"}
 )
@@ -567,6 +566,11 @@ class AliSliderClient:
         的连接池），不碰主 RPC 会话。
         """
 
+        # UploadLog 不参与 Verify 语义，真实禁用发包仍可返回 T001。
+        # 保留下方完整发送实现，默认路径在这里直接停止，不产生网络包。
+        if not config.UPLOAD_LOG_ENABLED:
+            return False
+
         try:
             timings = assets.load_timings
             if set(timings) != {"img", "pImg", "js"}:
@@ -831,21 +835,24 @@ class AliSliderClient:
 
             assets = self.download_assets(challenge, directory)
 
-            # 标准/CLI 仍由本轮拥有 executor；快速 HTTP 则借用服务级 executor，
-            # 让公开 SDK 本就不 await 的 best-effort UploadLog 不再挡住响应。
-            background_upload = self._upload_executor is not None
-            if self._upload_executor is None:
-                upload_executor = stack.enter_context(
-                    ThreadPoolExecutor(
-                        max_workers=1,
-                        thread_name_prefix="ali-upload-log",
+            # UploadLog 是不参与 Verify 的遥测。默认关闭时不创建 worker、
+            # 不发送网络包；下方启用分支与完整发送方法均保留以便对照。
+            upload_future: Future[bool] | None = None
+            background_upload = False
+            if config.UPLOAD_LOG_ENABLED:
+                background_upload = self._upload_executor is not None
+                if self._upload_executor is None:
+                    upload_executor = stack.enter_context(
+                        ThreadPoolExecutor(
+                            max_workers=1,
+                            thread_name_prefix="ali-upload-log",
+                        )
                     )
+                else:
+                    upload_executor = self._upload_executor
+                upload_future = upload_executor.submit(
+                    self.upload_initialization_log, challenge, assets
                 )
-            else:
-                upload_executor = self._upload_executor
-            upload_future = upload_executor.submit(
-                self.upload_initialization_log, challenge, assets
-            )
 
             vision = self.solve_assets(assets, x_pos_override=x_pos_override)
             if vision.confidence < minimum_confidence:
@@ -889,11 +896,15 @@ class AliSliderClient:
                 challenge, device.verify_token, build
             )
 
-            # 服务级任务只做一次非阻塞观察；进程停止时由 API 入口统一 shutdown。
-            # 标准/CLI 的本轮 executor 仍会回收，因此继续保留精确结果。
-            upload_log_succeeded = _settled_flag(
-                upload_future,
-                timeout=0.0 if background_upload else 5.0,
+            # 服务级任务只做一次非阻塞观察；默认关闭时直接记为
+            # False，不让遥测状态影响验证码结果。
+            upload_log_succeeded = (
+                _settled_flag(
+                    upload_future,
+                    timeout=0.0 if background_upload else 5.0,
+                )
+                if upload_future is not None
+                else False
             )
 
         return ChallengeOutcome(

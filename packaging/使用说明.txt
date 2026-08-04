@@ -9,11 +9,12 @@
 ----------------------------------------------------------------
 
 1. 把整个文件夹解压出来（不要只复制 AliSlider.exe，运行时都在同级目录里）。
-2. 双击 AliSlider.exe，在启动菜单里选择快速、标准、自定义或环境自检。
-   直接按 Enter 默认进入快速模式：5 并发，并在启动时准备 5 个设备会话。
-3. 服务模式会显示运行环境自检、可复制的调用示例和接口地址。
-4. 接口启动后，在窗口里直接按 Enter 会发起一次示例请求，结果实时打在窗口里。
-   输入 q 回车退出，Ctrl+C 同样退出。
+2. 双击 AliSlider.exe 将直接启动快速 HTTP API：5 并发、共享 HTTP 连接池，
+   启动时会准备 5 个常驻设备会话，不再显示启动菜单。
+3. 服务就绪后会打印接口文档链接，并自动使用默认浏览器打开：
+   http://127.0.0.1:8000/docs
+4. 在接口文档页填写参数并点击“发送请求”，页面和 EXE 窗口都会显示
+   完整 JSON 返回。服务期间无需输入命令；在 EXE 窗口按 Ctrl+C 停止。
 
 目标机器不需要安装 Python、Node.js 或 OpenCV，全都在包里。
 
@@ -22,6 +23,8 @@
 ----------------------------------------------------------------
 
 默认地址：http://127.0.0.1:8000/api/slider
+接口文档地址：http://127.0.0.1:8000/docs
+OpenAPI 描述：http://127.0.0.1:8000/openapi.json
 
 PowerShell：
 
@@ -74,7 +77,7 @@ Python：
 
 在 cmd 或 PowerShell 里：
 
-  AliSlider.exe                  启动模式选择菜单（双击就是这个）
+  AliSlider.exe                  快速 HTTP API（5 并发）并自动打开接口文档
   AliSlider.exe api              纯接口模式，不打印横幅，适合当后台服务
   AliSlider.exe solve            只做 Init/下载/识别，不发 Verify，不消耗挑战
   AliSlider.exe run              完整一轮，只发送一次 Verify
@@ -87,7 +90,7 @@ Python：
   --max-concurrency 4            限制同时进行的挑战数
   --runtime-mode fast            快速模式：固定本进程画像并按并发容量预热
   --runtime-mode standard        标准模式：逐轮画像，不做设备会话预热
-  --show-token                   窗口里显示完整 securityToken
+  --open-docs                    启动后在默认浏览器打开接口文档
   --timeout 30                   单步网络/子进程超时秒数
 
 先跑 AliSlider.exe solve 是确认环境是否正常的最省事办法：它不发送 Verify，

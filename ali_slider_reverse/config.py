@@ -18,7 +18,6 @@ from pathlib import Path
 
 from .device_profile import DeviceProfile
 
-
 # ==========================================================================
 # 冻结分发（PyInstaller）
 #
@@ -101,6 +100,14 @@ DEFAULT_REGION = "cn"
 
 UPLOAD_URL = "https://upload.captcha-open.aliyuncs.com/"
 """best-effort 遥测上报地址；与实例 prefix 无关。"""
+
+UPLOAD_LOG_ENABLED = False
+"""UploadLog 遥测是否启用。
+
+真实无 UploadLog 请求验证仍可正常获得 T001，因此默认关闭这条不参与
+Verify 控制流的 best-effort 遥测。发送实现仍保留，需要对照公开 SDK
+行为时可临时打开。
+"""
 
 IMAGE_BASE = "https://static-captcha.aliyuncs.com/"
 """back.png / shadow.png 的公开 CDN 前缀。"""
@@ -322,6 +329,7 @@ __all__ = [
     "SLIDER_HANDLE_WIDTH",
     "SLIDER_RENDERED_WIDTH",
     "UPLOAD_URL",
+    "UPLOAD_LOG_ENABLED",
     "VERIFY_FUTURE_SKEW_LIMIT_MS",
     "VISION_IN_PROCESS",
     "browser_headers",

@@ -1,12 +1,13 @@
-"""桌面窗口入口：双击即用的一体化启动器。
+"""冻结分发入口：双击直接启动快速 HTTP API。
 
-冻结分发（``AliSlider.exe``）的默认行为就是这里：打开控制台窗口 → 选择快速、标准、
-自定义或自检模式 → 拉起本地 HTTP 接口 → 把每一轮的结果实时打到窗口。
+冻结分发（``AliSlider.exe``）无参数启动时不再进入交互菜单，而是直接转交给
+:mod:`entrypoints.api`：启用 5 并发快速模式、共享 HTTP 连接池和常驻设备会话，
+打印并打开本地接口文档。
 
 它同时是打包后可执行文件的**总入口**，按第一个位置参数分发：
 
 ```text
-（无参数）        启动模式选择菜单（默认回车进入快速模式）
+（无参数）        快速 HTTP API（5 并发）并打开接口文档
 api   [args...]  纯 HTTP 接口，不打印横幅，适合当后台服务跑
 solve [args...]  CLI：只 Init/下载/识别，不发送 Verify，不消耗挑战
 run   [args...]  CLI：完整一轮，只发送一次 Verify
@@ -54,7 +55,6 @@ from .options import (
     effective_server_concurrency,
     fast_mode_enabled,
 )
-
 
 # ==========================================================================
 # 控制台外观
@@ -691,7 +691,7 @@ _TOP_HELP = f"""\
 阿里 V3 滑块纯协议复现 v{__version__}
 
 用法：
-  AliSlider.exe                    启动菜单：快速 / 标准 / 自定义 / 环境自检
+  AliSlider.exe                    启动快速 HTTP API 并打开本地接口文档
   AliSlider.exe api   [参数...]    纯 HTTP 接口，不打印横幅，适合当后台服务
   AliSlider.exe solve [参数...]    只 Init/下载/识别，不发 Verify，不消耗挑战
   AliSlider.exe run   [参数...]    完整一轮，只发送一次 Verify
@@ -702,7 +702,7 @@ _TOP_HELP = f"""\
   AliSlider.exe solve --help
   AliSlider.exe run --help
 
-桌面窗口模式自身的参数如下。
+HTTP API 参数可直接跟在 exe 后，也可使用 api 子命令。
 """
 
 
@@ -803,13 +803,20 @@ def main(argv: list[str] | None = None) -> int:
 
     arguments = list(sys.argv[1:] if argv is None else argv)
     if not arguments:
-        # Windows 双击启动时仍是本地代码页；菜单本身也包含中文，必须先于第一行
-        # 输出准备 UTF-8 控制台。后续服务/doctor 再调用一次是幂等的。
+        # Windows 双击启动时仍是本地代码页，先准备 UTF-8 再让
+        # 纯 API 入口打印可点击的文档链接。
         _prepare_console(f"{_BANNER} v{__version__}")
-        selected = _select_startup_arguments()
-        if selected is None:
-            return 0
-        arguments = selected
+        return int(
+            api_main(
+                [
+                    "--runtime-mode",
+                    "fast",
+                    "--max-concurrency",
+                    "5",
+                    "--open-docs",
+                ]
+            )
+        )
     command = arguments[0].lower() if arguments else ""
 
     if command == "api":
@@ -820,12 +827,14 @@ def main(argv: list[str] | None = None) -> int:
         return int(cli_main(arguments[1:]))
     if command == "doctor":
         return run_doctor()
+    if command == "console":
+        # 仅保留给旧脚本显式调用；双击和普通服务参数不再走交互循环。
+        return run_console(arguments[1:])
     if command in {"help", "-h", "--help"}:
-        # 先给出模式总览，再接上桌面模式自己的参数说明。
+        # 先给出模式总览，再接上 API 参数说明。
         print(_TOP_HELP)
-        build_parser().print_help()
-        return 0
-    return run_console(arguments)
+        return int(api_main(["--help"]))
+    return int(api_main(arguments))
 
 
 __all__ = ["build_parser", "main", "run_console", "run_doctor"]

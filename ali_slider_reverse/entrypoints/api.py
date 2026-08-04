@@ -37,6 +37,7 @@ import json
 import sys
 import threading
 import time
+import webbrowser
 from collections.abc import Callable
 from concurrent.futures import Executor, ThreadPoolExecutor
 from contextlib import closing
@@ -45,7 +46,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from .. import config
+from .. import __version__, config
 from ..challenge.device_pool import DeviceSessionPool
 from ..challenge.session import normalize_proxies
 from ..challenge.transport import SharedHttpAdapterPool, warm_connections
@@ -60,10 +61,182 @@ from .options import (
     fast_mode_enabled,
 )
 
-
 _SCENE_ID_MAX_LENGTH = 64
 _RPC_KEY_ID_MAX_LENGTH = 128
 _PREFIX_MAX_LENGTH = 32
+_DOCS_PATH = "/docs"
+_OPENAPI_PATH = "/openapi.json"
+
+
+_DOCS_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AliSlider API 接口文档</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, "Segoe UI", sans-serif; }
+    body { margin: 0; background: #f6f8fb; color: #172033; }
+    main { max-width: 960px; margin: 36px auto; padding: 0 20px 48px; }
+    h1 { margin-bottom: 6px; }
+    .muted { color: #64748b; }
+    .card { background: #fff; border: 1px solid #dbe2ea; border-radius: 12px;
+      box-shadow: 0 8px 30px rgba(15, 23, 42, .06); margin-top: 20px;
+      padding: 22px; }
+    .route { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .method { background: #16a34a; color: #fff; border-radius: 5px;
+      font-weight: 700; padding: 5px 10px; }
+    code, pre { font-family: "Cascadia Code", Consolas, monospace; }
+    form { display: grid; grid-template-columns: 1fr 1fr; gap: 14px;
+      margin-top: 20px; }
+    label { display: grid; gap: 6px; font-size: 14px; font-weight: 600; }
+    input { border: 1px solid #cbd5e1; border-radius: 7px; padding: 10px;
+      font: inherit; }
+    .wide { grid-column: 1 / -1; }
+    button { background: #2563eb; border: 0; border-radius: 7px; color: white;
+      cursor: pointer; font-weight: 700; padding: 11px 18px; width: fit-content; }
+    button:disabled { cursor: wait; opacity: .65; }
+    pre { background: #0f172a; border-radius: 8px; color: #e2e8f0;
+      min-height: 110px; overflow: auto; padding: 16px; white-space: pre-wrap; }
+    .links a { margin-right: 18px; }
+    @media (max-width: 680px) { form { grid-template-columns: 1fr; }
+      .wide { grid-column: auto; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>AliSlider API</h1>
+  <div class="muted">本地 HTTP 接口文档·快速模式使用共享连接池与常驻设备会话。</div>
+  <div class="card">
+    <div class="route"><span class="method">POST</span>
+      <strong><code>/api/slider</code></strong>
+      <span class="muted">执行一轮滑块验证</span>
+    </div>
+    <form id="request-form">
+      <label>SceneId<input name="SceneId" value="__DEFAULT_SCENE_ID__"></label>
+      <label>prefix（可选）<input name="prefix" placeholder="使用服务默认值"></label>
+      <label>AaduaneId（可选）<input name="AaduaneId"></label>
+      <label>proxy（可选）<input name="proxy"
+        placeholder="http://127.0.0.1:7890"></label>
+      <button type="submit" class="wide">发送请求</button>
+    </form>
+    <h3>完整响应</h3>
+    <pre id="response">点击“发送请求”后，这里会显示 HTTP 状态码和完整 JSON 返回。</pre>
+  </div>
+  <div class="card links">
+    <strong>其他地址</strong><br><br>
+    <a href="/health" target="_blank">健康检查</a>
+    <a href="/openapi.json" target="_blank">OpenAPI JSON</a>
+  </div>
+</main>
+<script>
+const form = document.getElementById("request-form");
+const output = document.getElementById("response");
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = form.querySelector("button");
+  const body = {};
+  for (const [key, value] of new FormData(form).entries()) {
+    if (String(value).trim()) body[key] = String(value).trim();
+  }
+  button.disabled = true;
+  button.textContent = "请求中…";
+  output.textContent = "正在执行挑战…";
+  try {
+    const response = await fetch("/api/slider", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body)
+    });
+    const text = await response.text();
+    let rendered = text;
+    try { rendered = JSON.stringify(JSON.parse(text), null, 2); } catch (_) {}
+    output.textContent = `HTTP ${response.status}\n\n${rendered}`;
+  } catch (error) {
+    output.textContent = `请求失败\n\n${error}`;
+  } finally {
+    button.disabled = false;
+    button.textContent = "发送请求";
+  }
+});
+</script>
+</body>
+</html>
+""".replace("__DEFAULT_SCENE_ID__", config.DEFAULT_SCENE_ID)
+
+
+def _openapi_document() -> dict[str, Any]:
+    """返回文档页和其他工具可直接读取的最小 OpenAPI 合同。"""
+
+    optional_text = {"type": "string", "nullable": True}
+    return {
+        "openapi": "3.0.3",
+        "info": {"title": "AliSlider API", "version": __version__},
+        "paths": {
+            config.API_SOLVE_PATH: {
+                "post": {
+                    "summary": "执行一轮滑块验证",
+                    "requestBody": {
+                        "required": False,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "SceneId": {
+                                            "type": "string",
+                                            "default": config.DEFAULT_SCENE_ID,
+                                        },
+                                        "prefix": optional_text,
+                                        "AaduaneId": optional_text,
+                                        "proxy": optional_text,
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {"description": "完整验证结果"},
+                        "400": {"description": "请求参数无效"},
+                        "429": {"description": "超出并发上限"},
+                        "500": {"description": "协议或运行错误"},
+                    },
+                }
+            },
+            config.API_HEALTH_PATH: {
+                "get": {
+                    "summary": "健康检查",
+                    "responses": {"200": {"description": "ready"}},
+                }
+            },
+        },
+    }
+
+
+def _startup_warm_urls() -> tuple[str, ...]:
+    """返回快速模式需要预建连接的主机；关闭的遥测不建连。"""
+
+    urls = [
+        config.init_url(),
+        config.verify_url(),
+        config.IMAGE_BASE,
+        config.PE_BASE,
+    ]
+    if config.UPLOAD_LOG_ENABLED:
+        urls.append(config.UPLOAD_URL)
+    return tuple(urls)
+
+
+def _print_full_result(
+    method: str, path: str, status: int, body: dict[str, Any]
+) -> None:
+    """把每次接口请求的完整 JSON 返回打到服务窗口。"""
+
+    if path == config.API_HEALTH_PATH:
+        return
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    rendered = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+    print(f"[{stamp}] {method} {path} {status}\n{rendered}", file=sys.stderr)
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,7 +387,7 @@ class _Unlimited:
 
 
 class SliderApiHandler(BaseHTTPRequestHandler):
-    """把 ``/api/slider`` 映射到一轮挑战；其余路径一律 404。"""
+    """提供滑块接口、健康检查和自包含的本地接口文档。"""
 
     protocol_version = "HTTP/1.1"
     server_version = "AliSliderApi"
@@ -250,6 +423,19 @@ class SliderApiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 约定。
         parts = urlsplit(self.path)
+        if parts.path == "/":
+            self._send_redirect(_DOCS_PATH)
+            return
+        if parts.path == _DOCS_PATH:
+            self._send_bytes(
+                200,
+                _DOCS_HTML.encode("utf-8"),
+                content_type="text/html; charset=utf-8",
+            )
+            return
+        if parts.path == _OPENAPI_PATH:
+            self._send_json(200, _openapi_document())
+            return
         if parts.path == config.API_HEALTH_PATH:
             self._send_json(200, {"ok": True, "status": "ready"})
             return
@@ -339,11 +525,11 @@ class SliderApiHandler(BaseHTTPRequestHandler):
         payload = json.dumps(
             body, ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
+        self._send_bytes(
+            status,
+            payload,
+            content_type="application/json; charset=utf-8",
+        )
 
         hook = self.result_hook
         if hook is not None:
@@ -351,6 +537,22 @@ class SliderApiHandler(BaseHTTPRequestHandler):
                 hook(self.command, urlsplit(self.path).path, status, body)
             except Exception:  # pragma: no cover - 展示失败不影响协议响应。
                 pass
+
+    def _send_bytes(
+        self, status: int, payload: bytes, *, content_type: str
+    ) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _send_redirect(self, location: str) -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _send_error(self, status: int, exc: Exception) -> None:
         self._send_json(
@@ -363,18 +565,9 @@ class SliderApiHandler(BaseHTTPRequestHandler):
         )
 
     def log_message(self, format: str, *args: Any) -> None:
-        """只记录方法、路径与状态码。
+        """请求结果由 ``result_hook`` 连同完整 JSON 统一输出。"""
 
-        GET 的 query 可能带有 ``proxy`` 的用户名/口令，默认实现会把整条
-        requestline 写进 stderr，因此这里改为只输出剥掉 query 的路径。
-        """
-
-        status = args[1] if len(args) > 1 else "-"
-        print(
-            f"{self.log_date_time_string()} {self.command} "
-            f"{urlsplit(self.path).path} {status}",
-            file=sys.stderr,
-        )
+        return None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -385,6 +578,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_server_arguments(parser)
     add_runtime_arguments(parser)
     add_confidence_argument(parser)
+    parser.add_argument(
+        "--open-docs",
+        action="store_true",
+        help="启动后用默认浏览器打开本地接口文档",
+    )
     return parser
 
 
@@ -407,6 +605,7 @@ def main(argv: list[str] | None = None) -> int:
         else _Unlimited()
     )
     SliderApiHandler.device_profile = fixed_profile
+    SliderApiHandler.result_hook = staticmethod(_print_full_result)
     transport_pool = (
         SharedHttpAdapterPool(
             pool_size=max(concurrency, 8),
@@ -421,7 +620,7 @@ def main(argv: list[str] | None = None) -> int:
             max_workers=max(concurrency, 1),
             thread_name_prefix="ali-upload-log-service",
         )
-        if fast_mode
+        if fast_mode and config.UPLOAD_LOG_ENABLED
         else None
     )
     SliderApiHandler.upload_executor = upload_executor
@@ -449,13 +648,7 @@ def main(argv: list[str] | None = None) -> int:
         # 后在漫长的 Node prime 期间闲置失效；等开始监听时首批请求也能直接复用。
         warm_connections(
             transport_pool.get(None),
-            (
-                config.init_url(),
-                config.verify_url(),
-                config.UPLOAD_URL,
-                config.IMAGE_BASE,
-                config.PE_BASE,
-            ),
+            _startup_warm_urls(),
             timeout=settings.timeout,
             connections_per_url=max(concurrency, 1),
             wait=True,
@@ -470,11 +663,22 @@ def main(argv: list[str] | None = None) -> int:
         if fast_mode
         else "标准模式"
     )
+    display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    base_url = f"http://{display_host}:{port}"
+    docs_url = base_url + _DOCS_PATH
     print(
-        f"滑块接口已启动：http://{host}:{port}{config.API_SOLVE_PATH}"
-        f"（{limit_label}，{mode_label}）",
+        f"滑块 API 已启动（{limit_label}，{mode_label}）\n"
+        f"接口文档：{docs_url}\n"
+        f"请求地址：{base_url}{config.API_SOLVE_PATH}\n"
+        "接口请求的完整 JSON 返回会输出在本窗口；Ctrl+C 停止服务。",
         file=sys.stderr,
     )
+    if args.open_docs:
+        try:
+            webbrowser.open(docs_url, new=2)
+        except Exception:
+            # 服务本身已就绪；服务器没有图形桌面时仍可复制上方链接。
+            pass
     try:
         server.serve_forever()
     except KeyboardInterrupt:
