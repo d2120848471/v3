@@ -128,6 +128,17 @@ _PROBE_RADIUS = 3
 _MIN_BOUNDARY_SAMPLES = 8
 """边界采样点少于此数时判定该候选不可评估。"""
 
+_CHAMFER_TRIGGER_CONFIDENCE = 0.45
+_CHAMFER_MAX_DISTANCE = 3.0
+_CHAMFER_MIN_MARGIN = 0.70
+_CHAMFER_BORDER_MARGIN = 8
+"""低置信度时才启用的完整轮廓兜底。
+
+正常样本不承担全横轴距离变换的成本。只有当前证据低于默认放行线，且完整 alpha
+轮廓的最优距离、远峰差距和现有候选覆盖同时满足时才接管；无缺口或单条背景边缘
+不会仅凭一个局部相关峰被抬高。
+"""
+
 _CONF_QUALITY_GAIN = 4.5
 _CONF_QUALITY_PIVOT = 0.34
 _CONF_MARGIN_GAIN = 14.0
@@ -205,6 +216,7 @@ class _Frame:
         cv2, np = _opencv()
 
         self.bgr = background.astype(np.float32)
+        self.alpha = alpha
         self.width = background.shape[1]
         self.shadow_width = alpha.shape[1]
         self.max_canvas_left = self.width - self.shadow_width
@@ -419,6 +431,170 @@ class _Frame:
 
 
 # --------------------------------------------------------------------------
+# 低置信度完整轮廓兜底
+# --------------------------------------------------------------------------
+
+
+def _chamfer_distances(frame: _Frame, canvas_lefts: Any) -> dict[int, float]:
+    """计算完整 alpha 轮廓与背景边缘的双向 Chamfer 距离。
+
+    这条路径只在主求解置信度不足时运行。整图 Sobel 只算一次，每个横坐标仅在
+    自己的局部 ROI 内做距离变换；两个方向取平均，避免只贴中一条背景边缘的伪峰。
+    """
+
+    cv2, np = _opencv()
+    positions = tuple(dict.fromkeys(int(value) for value in canvas_lefts))
+    if not positions:
+        return {}
+
+    alpha_mask = np.asarray(frame.alpha > _ALPHA_THRESHOLD, dtype=bool)
+    eroded = cv2.erode(
+        alpha_mask.astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3)),
+    ).astype(bool)
+    alpha_boundary = alpha_mask & ~eroded
+    if not bool(np.any(alpha_boundary)):
+        return {position: math.inf for position in positions}
+
+    gray = cv2.cvtColor(frame.bgr.astype(np.uint8), cv2.COLOR_BGR2GRAY).astype(
+        np.float32
+    )
+    magnitude = cv2.magnitude(
+        cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3),
+        cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3),
+    )
+    alpha_y, alpha_x = np.where(alpha_boundary)
+    margin = 5
+    height = frame.bgr.shape[0]
+
+    distances: dict[int, float] = {}
+    for canvas_left in positions:
+        if not 0 <= canvas_left <= frame.max_canvas_left:
+            distances[canvas_left] = math.inf
+            continue
+
+        roi_left = max(0, canvas_left + frame.alpha_box.left - margin)
+        roi_right = min(
+            frame.width, canvas_left + frame.alpha_box.right + margin
+        )
+        roi_top = max(0, frame.alpha_box.top - margin)
+        roi_bottom = min(height, frame.alpha_box.bottom + margin)
+        if roi_left >= roi_right or roi_top >= roi_bottom:
+            distances[canvas_left] = math.inf
+            continue
+
+        local_magnitude = magnitude[roi_top:roi_bottom, roi_left:roi_right]
+        gradient_threshold = max(
+            120.0, float(np.quantile(local_magnitude, 0.75))
+        )
+        background_boundary = local_magnitude >= gradient_threshold
+        if not bool(np.any(background_boundary)):
+            distances[canvas_left] = math.inf
+            continue
+
+        local_alpha_boundary = np.zeros(background_boundary.shape, dtype=bool)
+        local_x = alpha_x + canvas_left - roi_left
+        local_y = alpha_y - roi_top
+        inside = (
+            (local_x >= 0)
+            & (local_x < local_alpha_boundary.shape[1])
+            & (local_y >= 0)
+            & (local_y < local_alpha_boundary.shape[0])
+        )
+        local_alpha_boundary[local_y[inside], local_x[inside]] = True
+        if not bool(np.any(local_alpha_boundary)):
+            distances[canvas_left] = math.inf
+            continue
+
+        distance_to_background = cv2.distanceTransform(
+            (~background_boundary).astype(np.uint8), cv2.DIST_L2, 5
+        )
+        distance_to_alpha = cv2.distanceTransform(
+            (~local_alpha_boundary).astype(np.uint8), cv2.DIST_L2, 5
+        )
+        distances[canvas_left] = (
+            float(distance_to_background[local_alpha_boundary].mean())
+            + float(distance_to_alpha[background_boundary].mean())
+        ) / 2.0
+    return distances
+
+
+def _chamfer_fallback(
+    frame: _Frame,
+    positions: list[int],
+    *,
+    confidence: float,
+    score_position: Any,
+) -> tuple[int, float] | None:
+    """在低置信度时用全轮廓锁定区域，再用主评分精修局部坐标。"""
+
+    if confidence >= _CHAMFER_TRIGGER_CONFIDENCE:
+        return None
+
+    alignment = _chamfer_distances(
+        frame, range(frame.max_canvas_left + 1)
+    )
+    finite = sorted(
+        (distance, left)
+        for left, distance in alignment.items()
+        if left >= _CHAMFER_BORDER_MARGIN and math.isfinite(distance)
+    )
+    if not finite:
+        return None
+
+    global_distance, global_left = finite[0]
+    runner_separation = max(12, round(frame.alpha_box.width * 0.55))
+    runner_distance = next(
+        (
+            distance
+            for distance, left in finite[1:]
+            if abs(left - global_left) >= runner_separation
+        ),
+        math.inf,
+    )
+    if not (
+        global_distance <= _CHAMFER_MAX_DISTANCE
+        and runner_distance - global_distance >= _CHAMFER_MIN_MARGIN
+        and any(
+            abs(position - global_left) <= _PROBE_RADIUS
+            for position in positions
+        )
+    ):
+        return None
+
+    # Chamfer 的局部平台会有 1~3px 离散偏移；它只负责选中正确区域，最终坐标仍
+    # 由已经针对当前渲染模型标定过的主评分在邻域内精修。
+    local_lefts = range(
+        max(0, global_left - _PROBE_RADIUS),
+        min(frame.max_canvas_left, global_left + _PROBE_RADIUS) + 1,
+    )
+    selected_left = max(
+        local_lefts,
+        key=lambda left: (score_position(left)[0], -abs(left - global_left), -left),
+    )
+    selected_distance = alignment[selected_left]
+    selected_margin = runner_distance - selected_distance
+    if not (
+        selected_distance <= _CHAMFER_MAX_DISTANCE
+        and selected_margin >= _CHAMFER_MIN_MARGIN
+    ):
+        return None
+
+    absolute_score = math.exp(-max(0.0, selected_distance - 1.0) / 2.0)
+    margin_score = (
+        1.0
+        if not math.isfinite(runner_distance)
+        else 1.0 - math.exp(-max(0.0, selected_margin))
+    )
+    fallback_confidence = min(
+        max(0.70 * absolute_score + 0.30 * margin_score, 0.0), 1.0
+    )
+    if fallback_confidence < _CHAMFER_TRIGGER_CONFIDENCE:
+        return None
+    return selected_left, fallback_confidence
+
+
+# --------------------------------------------------------------------------
 # 主入口
 # --------------------------------------------------------------------------
 
@@ -489,10 +665,21 @@ def solve_gap(
     low, high = float(like.min()), float(like.max())
     span = max(high - low, 1e-6)
 
-    ranked: list[tuple[float, int, float, float]] = []
-    for canvas_left in positions:
+    score_cache: dict[int, tuple[float, float, float]] = {}
+
+    def score_position(canvas_left: int) -> tuple[float, float, float]:
+        cached = score_cache.get(canvas_left)
+        if cached is not None:
+            return cached
         quality, step = frame.verify(canvas_left)
         total = 0.62 * quality + 0.38 * ((float(like[canvas_left]) - low) / span)
+        result = (total, quality, step)
+        score_cache[canvas_left] = result
+        return result
+
+    ranked: list[tuple[float, int, float, float]] = []
+    for canvas_left in positions:
+        total, quality, step = score_position(canvas_left)
         ranked.append((total, canvas_left, quality, step))
     ranked.sort(key=lambda item: (-item[0], item[1]))
 
@@ -503,6 +690,27 @@ def solve_gap(
     margin = total - (rival[0] if rival else 0.0)
     confidence = _confidence(quality, margin, step)
 
+    chamfer = _chamfer_fallback(
+        frame,
+        positions,
+        confidence=confidence,
+        score_position=score_position,
+    )
+    chamfer_candidate: GapCandidate | None = None
+    if chamfer is not None:
+        best_left, confidence = chamfer
+        chamfer_candidate = GapCandidate(
+            canvas_left=best_left,
+            score=confidence,
+            method="global-chamfer",
+            bbox=BoundingBox(
+                best_left,
+                frame.alpha_box.top,
+                best_left + frame.shadow_width,
+                frame.alpha_box.bottom,
+            ),
+        )
+
     # 候选清单只保留互相分离的峰：相邻 1~3px 的探测点属于同一个假设，全列出来
     # 会把真正的备选假设淹掉，排查时反而看不出"还有哪里像缺口"。
     distinct: list[tuple[float, int, float, float]] = []
@@ -512,7 +720,7 @@ def solve_gap(
         if len(distinct) >= 8:
             break
 
-    candidates = tuple(
+    ranked_candidates = tuple(
         GapCandidate(
             canvas_left=left,
             score=float(min(max(score, 0.0), 1.0)),
@@ -523,6 +731,12 @@ def solve_gap(
             ),
         )
         for score, left, _, _ in distinct
+        if chamfer_candidate is None
+        or abs(left - chamfer_candidate.canvas_left) >= _PEAK_SEP
+    )
+    candidates = (
+        ((chamfer_candidate,) if chamfer_candidate is not None else ())
+        + ranked_candidates
     )
     return GapEstimate(
         x_pos=int(best_left),

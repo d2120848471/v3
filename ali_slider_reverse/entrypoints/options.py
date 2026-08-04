@@ -19,6 +19,10 @@ from ..device_profile import DeviceProfile
 from ..runtime.node_device import DeviceRuntimeClient
 
 
+FAST_MODE_DEFAULT_CONCURRENCY = 5
+"""快速模式未显式指定并发数时的有界容量。"""
+
+
 def add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
     """添加两个入口共享的运行环境参数。"""
 
@@ -111,17 +115,43 @@ def add_server_arguments(parser: argparse.ArgumentParser) -> None:
         "--max-concurrency",
         type=int,
         default=0,
-        help="同时进行的挑战数上限（默认 0 表示不限制）",
+        help="同时挑战数上限（0：标准模式不限，快速模式使用 5）",
+    )
+    parser.add_argument(
+        "--runtime-mode",
+        choices=("standard", "fast"),
+        default="standard",
+        help=(
+            "服务运行模式：standard 逐轮画像且不投机预热；"
+            "fast 固定本进程画像并按并发容量预热设备会话"
+        ),
     )
     parser.add_argument(
         "--prewarm-device-session",
         action="store_true",
         help=(
-            "在上一轮响应之后预备下一轮的 FeiLin 会话，省掉约 460ms 设备链；"
-            "设备画像默认逐轮重抽，每轮都是新桶，命中率为零——除非你自己固定"
-            "画像与出口，否则开启它只会白发 Log1/Log2"
+            "兼容旧启动命令：等同 --runtime-mode fast；固定本进程画像并按并发"
+            "容量预热 FeiLin 会话"
         ),
     )
+
+
+def fast_mode_enabled(args: argparse.Namespace) -> bool:
+    """兼容新模式名与旧预热开关，返回是否启用快速模式。"""
+
+    return bool(
+        getattr(args, "runtime_mode", "standard") == "fast"
+        or getattr(args, "prewarm_device_session", False)
+    )
+
+
+def effective_server_concurrency(args: argparse.Namespace) -> int:
+    """返回真正执行的并发上限；0 只在标准模式表示不限。"""
+
+    configured = int(args.max_concurrency)
+    if configured > 0:
+        return configured
+    return FAST_MODE_DEFAULT_CONCURRENCY if fast_mode_enabled(args) else 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,8 +237,11 @@ class RuntimeSettings:
 
 
 __all__ = [
+    "FAST_MODE_DEFAULT_CONCURRENCY",
     "RuntimeSettings",
     "add_confidence_argument",
     "add_runtime_arguments",
     "add_server_arguments",
+    "effective_server_concurrency",
+    "fast_mode_enabled",
 ]

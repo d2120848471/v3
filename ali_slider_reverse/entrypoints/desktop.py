@@ -1,12 +1,12 @@
 """桌面窗口入口：双击即用的一体化启动器。
 
-冻结分发（``AliSlider.exe``）的默认行为就是这里：打开控制台窗口 → 自检运行环境
-→ 打印可直接复制的调用示例 → 拉起本地 HTTP 接口 → 把每一轮的结果实时打到窗口。
+冻结分发（``AliSlider.exe``）的默认行为就是这里：打开控制台窗口 → 选择快速、标准、
+自定义或自检模式 → 拉起本地 HTTP 接口 → 把每一轮的结果实时打到窗口。
 
 它同时是打包后可执行文件的**总入口**，按第一个位置参数分发：
 
 ```text
-（无参数）        桌面窗口模式
+（无参数）        启动模式选择菜单（默认回车进入快速模式）
 api   [args...]  纯 HTTP 接口，不打印横幅，适合当后台服务跑
 solve [args...]  CLI：只 Init/下载/识别，不发送 Verify，不消耗挑战
 run   [args...]  CLI：完整一轮，只发送一次 Verify
@@ -36,12 +36,14 @@ import time
 import unicodedata
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from http.server import ThreadingHTTPServer
 from typing import Any
 
 from .. import __version__, config
 from ..challenge.device_pool import DeviceSessionPool
-from .api import SliderApiHandler
+from ..device_profile import generate_device_profile
+from .api import SliderApiHandler, _Unlimited
 from .api import main as api_main
 from .cli import main as cli_main
 from .options import (
@@ -49,6 +51,8 @@ from .options import (
     add_confidence_argument,
     add_runtime_arguments,
     add_server_arguments,
+    effective_server_concurrency,
+    fast_mode_enabled,
 )
 
 
@@ -462,6 +466,9 @@ def run_console(argv: list[str]) -> int:
 
 def _serve(args: argparse.Namespace, palette: _Palette) -> int:
     settings = RuntimeSettings.from_args(args)
+    fast_mode = fast_mode_enabled(args)
+    concurrency = effective_server_concurrency(args)
+    fixed_profile = generate_device_profile() if fast_mode else None
 
     _print_banner(palette)
     print(f"\n{palette.bold}运行环境{palette.reset}")
@@ -473,13 +480,20 @@ def _serve(args: argparse.Namespace, palette: _Palette) -> int:
         return 1
 
     _ConsoleHandler.settings = settings
-    # 类默认值就是"不限并发"，只有显式设了上限才需要换成信号量。
-    if args.max_concurrency > 0:
-        _ConsoleHandler.slots = threading.BoundedSemaphore(args.max_concurrency)
+    _ConsoleHandler.slots = (
+        threading.BoundedSemaphore(concurrency)
+        if concurrency > 0
+        else _Unlimited()
+    )
+    _ConsoleHandler.device_profile = fixed_profile
     _ConsoleHandler.result_hook = _ConsoleReporter(
         palette=palette, show_token=args.show_token
     )
-    device_pool = DeviceSessionPool(enabled=args.prewarm_device_session)
+    device_pool = (
+        DeviceSessionPool(enabled=True, capacity=max(concurrency, 1))
+        if fast_mode
+        else None
+    )
     _ConsoleHandler.device_pool = device_pool
 
     try:
@@ -489,12 +503,30 @@ def _serve(args: argparse.Namespace, palette: _Palette) -> int:
             f"\n{palette.red}端口 {args.port} 无法监听：{exc}{palette.reset}\n"
             f"换一个端口重试，例如：AliSlider.exe --port 8010"
         )
-        device_pool.close()
+        if device_pool is not None:
+            device_pool.close()
         return 1
 
     server.daemon_threads = True
     host, port = server.server_address[:2]
     base_url = f"http://{host}:{port}"
+    prewarmed = 0
+    if device_pool is not None and fixed_profile is not None:
+        print(
+            f"\n{palette.bold}快速模式预热{palette.reset}  "
+            f"正在并行准备 {max(concurrency, 1)} 个设备会话……"
+        )
+        prewarmed = device_pool.prime(
+            settings.build_device_runtime(
+                prefix=config.DEFAULT_PREFIX,
+                proxies=None,
+                device_profile=fixed_profile,
+            )
+        )
+        print(
+            f"  {palette.green}已就绪 {prewarmed}/{max(concurrency, 1)}"
+            f"{palette.reset}；后续按使用量补回，不做定时请求"
+        )
 
     print(f"\n{palette.bold}调用示例{palette.reset}")
     _print_usage(base_url, palette)
@@ -503,6 +535,10 @@ def _serve(args: argparse.Namespace, palette: _Palette) -> int:
     print(
         f"{palette.green}接口已就绪{palette.reset}  {palette.bold}"
         f"{base_url}{config.API_SOLVE_PATH}{palette.reset}"
+    )
+    print(
+        f"{palette.dim}模式：{'快速' if fast_mode else '标准'}；"
+        f"并发：{concurrency if concurrency > 0 else '不限'}{palette.reset}"
     )
     print(
         f"{palette.dim}在本窗口直接按 Enter 发起一次示例请求，输入 q 退出"
@@ -517,7 +553,8 @@ def _serve(args: argparse.Namespace, palette: _Palette) -> int:
         print(f"\n{palette.dim}正在停止……{palette.reset}")
         server.shutdown()
         server.server_close()
-        device_pool.close()
+        if device_pool is not None:
+            device_pool.close()
     return 0
 
 
@@ -654,7 +691,7 @@ _TOP_HELP = f"""\
 阿里 V3 滑块纯协议复现 v{__version__}
 
 用法：
-  AliSlider.exe                    桌面窗口模式：自检 + 示例 + 本地 HTTP 接口
+  AliSlider.exe                    启动菜单：快速 / 标准 / 自定义 / 环境自检
   AliSlider.exe api   [参数...]    纯 HTTP 接口，不打印横幅，适合当后台服务
   AliSlider.exe solve [参数...]    只 Init/下载/识别，不发 Verify，不消耗挑战
   AliSlider.exe run   [参数...]    完整一轮，只发送一次 Verify
@@ -669,10 +706,110 @@ _TOP_HELP = f"""\
 """
 
 
+def _select_startup_arguments(
+    *, input_fn: Callable[[str], str] = input
+) -> list[str] | None:
+    """无参数打开时让用户选择模式；EOF 安全回落到推荐快速模式。"""
+
+    print(
+        "\n请选择启动模式：\n"
+        "  1. 快速模式（推荐）  5 并发 + 5 个预热会话，兼顾单包与吞吐\n"
+        "  2. 标准模式          1 并发 + 逐轮设备画像，不做投机预热\n"
+        "  3. 自定义模式        自己选择并发数、端口与是否预热\n"
+        "  4. 环境自检\n"
+        "  q. 退出"
+    )
+
+    while True:
+        try:
+            choice = input_fn("\n选择 [1]：").strip().lower()
+        except EOFError:
+            choice = ""
+        except KeyboardInterrupt:
+            return None
+
+        if choice in {"", "1"}:
+            return ["--runtime-mode", "fast", "--max-concurrency", "5"]
+        if choice == "2":
+            return ["--runtime-mode", "standard", "--max-concurrency", "1"]
+        if choice == "4":
+            return ["doctor"]
+        if choice in {"q", "quit", "exit"}:
+            return None
+        if choice != "3":
+            print("请输入 1、2、3、4 或 q。")
+            continue
+
+        concurrency = _read_menu_integer(
+            "并发数 [5]：", default=5, minimum=1, maximum=32, input_fn=input_fn
+        )
+        port = _read_menu_integer(
+            f"监听端口 [{config.API_PORT}]：",
+            default=config.API_PORT,
+            minimum=1,
+            maximum=65535,
+            input_fn=input_fn,
+        )
+        while True:
+            try:
+                warm = input_fn("启用快速预热 [Y/n]：").strip().lower()
+            except EOFError:
+                warm = ""
+            if warm in {"", "y", "yes"}:
+                mode = "fast"
+                break
+            if warm in {"n", "no"}:
+                mode = "standard"
+                break
+            print("请输入 y 或 n。")
+        return [
+            "--runtime-mode",
+            mode,
+            "--max-concurrency",
+            str(concurrency),
+            "--port",
+            str(port),
+        ]
+
+
+def _read_menu_integer(
+    prompt: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+    input_fn: Callable[[str], str],
+) -> int:
+    """读取菜单里的有界整数，空值/EOF 使用默认值。"""
+
+    while True:
+        try:
+            raw = input_fn(prompt).strip()
+        except EOFError:
+            return default
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            value = minimum - 1
+        if minimum <= value <= maximum:
+            return value
+        print(f"请输入 {minimum}..{maximum} 的整数。")
+
+
 def main(argv: list[str] | None = None) -> int:
     """打包后可执行文件的总入口，按首个位置参数分发到各模式。"""
 
     arguments = list(sys.argv[1:] if argv is None else argv)
+    if not arguments:
+        # Windows 双击启动时仍是本地代码页；菜单本身也包含中文，必须先于第一行
+        # 输出准备 UTF-8 控制台。后续服务/doctor 再调用一次是幂等的。
+        _prepare_console(f"{_BANNER} v{__version__}")
+        selected = _select_startup_arguments()
+        if selected is None:
+            return 0
+        arguments = selected
     command = arguments[0].lower() if arguments else ""
 
     if command == "api":

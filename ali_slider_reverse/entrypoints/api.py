@@ -47,13 +47,15 @@ from urllib.parse import parse_qs, urlsplit
 from .. import config
 from ..challenge.device_pool import DeviceSessionPool
 from ..challenge.session import normalize_proxies
-from ..device_profile import generate_device_profile
+from ..device_profile import DeviceProfile, generate_device_profile
 from ..errors import AliSliderError, ApiRequestError
 from .options import (
     RuntimeSettings,
     add_confidence_argument,
     add_runtime_arguments,
     add_server_arguments,
+    effective_server_concurrency,
+    fast_mode_enabled,
 )
 
 
@@ -134,18 +136,21 @@ def solve_once(
     request: SolveRequest,
     settings: RuntimeSettings,
     pool: DeviceSessionPool | None = None,
+    *,
+    device_profile: DeviceProfile | None = None,
 ) -> dict[str, Any]:
     """执行一轮完整挑战并返回响应体。
 
     每次调用都新建客户端与设备运行时：``proxy``、``SceneId`` 与 ``AaduaneId``
     逐轮不同，而 FeiLin worker 本身就绑定单轮 session，不适合跨请求复用。
 
-    ``pool`` 只改变 FeiLin 会话是"现建"还是"上一轮之后就备好的"，不改变本轮
-    只用一个会话、一个 ``CertifyId`` 的语义；未开启时行为与之前完全一致。
+    ``pool`` 只改变 FeiLin 会话是"现建"还是"请求前已备好"，不改变本轮只用一个
+    会话、一个 ``CertifyId`` 的语义；未开启时行为与之前完全一致。
     """
 
-    # 一轮一套设备画像：HTTP 头、FeiLin 指纹与动态 PE 环境共用同一个对象。
-    device_profile = generate_device_profile()
+    # 标准模式逐轮生成；快速模式由服务入口传入本进程固定画像。无论哪种模式，
+    # 同一轮的 HTTP 头、FeiLin 指纹与动态 PE 环境始终共用同一个对象。
+    device_profile = device_profile or generate_device_profile()
     client = settings.build_client(
         scene_id=request.scene_id,
         prefix=request.prefix,
@@ -208,6 +213,7 @@ class SliderApiHandler(BaseHTTPRequestHandler):
     settings: RuntimeSettings = RuntimeSettings()
     slots: Any = _Unlimited()
     device_pool: DeviceSessionPool | None = None
+    device_profile: DeviceProfile | None = None
 
     result_hook: Callable[[str, str, int, dict[str, Any]], None] | None = None
     """可选的宿主回调，每次响应发出后以 ``(method, path, status, body)`` 调用。
@@ -255,8 +261,8 @@ class SliderApiHandler(BaseHTTPRequestHandler):
             self._send_error(400, exc)
             return
 
-        # 默认不限并发；仅在显式设置上限时拒绝超出的请求，避免排队让调用方一起
-        # 超时。每轮挑战本身仍是互相独立的 CertifyId，不共享会话或 worker。
+        # 按入口计算出的并发上限拒绝超额请求，避免排队让调用方一起超时。每轮
+        # 挑战仍是互相独立的 CertifyId，不共享会话或 worker。
         if not self.slots.acquire(blocking=False):
             self._send_json(
                 429,
@@ -269,7 +275,12 @@ class SliderApiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            body = solve_once(request, self.settings, self.device_pool)
+            body = solve_once(
+                request,
+                self.settings,
+                self.device_pool,
+                device_profile=self.device_profile,
+            )
         except (AliSliderError, ValueError) as exc:
             self._send_error(500, exc)
             return
@@ -370,29 +381,50 @@ def main(argv: list[str] | None = None) -> int:
     if not 0.0 <= args.min_confidence <= 1.0:
         raise SystemExit("--min-confidence 必须位于 0..1")
 
-    SliderApiHandler.settings = RuntimeSettings.from_args(args)
+    settings = RuntimeSettings.from_args(args)
+    fast_mode = fast_mode_enabled(args)
+    concurrency = effective_server_concurrency(args)
+    fixed_profile = generate_device_profile() if fast_mode else None
+
+    SliderApiHandler.settings = settings
     SliderApiHandler.slots = (
-        threading.BoundedSemaphore(args.max_concurrency)
-        if args.max_concurrency > 0
+        threading.BoundedSemaphore(concurrency)
+        if concurrency > 0
         else _Unlimited()
     )
-    device_pool = DeviceSessionPool(enabled=args.prewarm_device_session)
+    SliderApiHandler.device_profile = fixed_profile
+    device_pool = (
+        DeviceSessionPool(enabled=True, capacity=max(concurrency, 1))
+        if fast_mode
+        else None
+    )
     SliderApiHandler.device_pool = device_pool
 
     server = ThreadingHTTPServer((args.host, args.port), SliderApiHandler)
     server.daemon_threads = True
     host, port = server.server_address[:2]
+    prewarmed = 0
+    if device_pool is not None and fixed_profile is not None:
+        prewarmed = device_pool.prime(
+            settings.build_device_runtime(
+                prefix=config.DEFAULT_PREFIX,
+                proxies=None,
+                device_profile=fixed_profile,
+            )
+        )
     limit_label = (
-        f"并发上限 {args.max_concurrency}"
-        if args.max_concurrency > 0
+        f"并发上限 {concurrency}"
+        if concurrency > 0
         else "不限并发"
     )
-    prewarm_label = (
-        "预热设备会话" if args.prewarm_device_session else "不预热设备会话"
+    mode_label = (
+        f"快速模式，预热 {prewarmed}/{max(concurrency, 1)}"
+        if fast_mode
+        else "标准模式"
     )
     print(
         f"滑块接口已启动：http://{host}:{port}{config.API_SOLVE_PATH}"
-        f"（{limit_label}，{prewarm_label}）",
+        f"（{limit_label}，{mode_label}）",
         file=sys.stderr,
     )
     try:
@@ -401,7 +433,8 @@ def main(argv: list[str] | None = None) -> int:
         print("正在停止……", file=sys.stderr)
     finally:
         server.server_close()
-        device_pool.close()
+        if device_pool is not None:
+            device_pool.close()
     return 0
 
 

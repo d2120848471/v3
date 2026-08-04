@@ -75,7 +75,7 @@ dist\AliSlider-win64.zip         发给别人的压缩包
 ## 4. 包里装了什么
 
 ```text
-AliSlider.exe            入口，双击进桌面窗口模式
+AliSlider.exe            入口，双击进入快速 / 标准 / 自定义启动菜单
 _internal\               PyInstaller 运行时目录
   ├── python3xx.dll      Python 解释器
   ├── cv2\               OpenCV（headless 版）

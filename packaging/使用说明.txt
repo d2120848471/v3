@@ -9,9 +9,10 @@
 ----------------------------------------------------------------
 
 1. 把整个文件夹解压出来（不要只复制 AliSlider.exe，运行时都在同级目录里）。
-2. 双击 AliSlider.exe。
-3. 窗口里会依次显示：运行环境自检 → 可复制的调用示例 → 接口地址。
-4. 在窗口里直接按 Enter，就会发起一次示例请求，结果实时打在窗口里。
+2. 双击 AliSlider.exe，在启动菜单里选择快速、标准、自定义或环境自检。
+   直接按 Enter 默认进入快速模式：5 并发，并在启动时准备 5 个设备会话。
+3. 服务模式会显示运行环境自检、可复制的调用示例和接口地址。
+4. 接口启动后，在窗口里直接按 Enter 会发起一次示例请求，结果实时打在窗口里。
    输入 q 回车退出，Ctrl+C 同样退出。
 
 目标机器不需要安装 Python、Node.js 或 OpenCV，全都在包里。
@@ -73,7 +74,7 @@ Python：
 
 在 cmd 或 PowerShell 里：
 
-  AliSlider.exe                  桌面窗口模式（双击就是这个）
+  AliSlider.exe                  启动模式选择菜单（双击就是这个）
   AliSlider.exe api              纯接口模式，不打印横幅，适合当后台服务
   AliSlider.exe solve            只做 Init/下载/识别，不发 Verify，不消耗挑战
   AliSlider.exe run              完整一轮，只发送一次 Verify
@@ -84,6 +85,8 @@ Python：
   --port 8010                    换监听端口
   --host 0.0.0.0                 允许局域网访问（默认只监听本机）
   --max-concurrency 4            限制同时进行的挑战数
+  --runtime-mode fast            快速模式：固定本进程画像并按并发容量预热
+  --runtime-mode standard        标准模式：逐轮画像，不做设备会话预热
   --show-token                   窗口里显示完整 securityToken
   --timeout 30                   单步网络/子进程超时秒数
 

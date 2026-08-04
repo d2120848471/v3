@@ -75,7 +75,7 @@ ali_slider_reverse/
 │   ├── session.py         一轮挑战的状态机与单次 Verify 边界
 │   ├── assets.py          四项公开资源的并发下载与 PNG 尺寸解析
 │   ├── transport.py       共享连接池与设备链空窗期的 TLS 预热
-│   ├── device_pool.py     可选的设备会话预热池（默认关闭）
+│   ├── device_pool.py     快速模式的有界设备会话池与并发补货
 │   ├── track.py           触摸轨迹的读取、缩放与逐轮扰动
 │   ├── business.py        可选的业务请求提交
 │   └── default_touch_track.json    脱敏触摸轨迹（运行必需资产）
@@ -380,6 +380,10 @@ powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
 手边没有 Windows 机器时，用 `.github/workflows/build-windows.yml` 在 GitHub 的
 Windows runner 上构建，跑完从 Artifacts 下载。
 
+无参数双击会先显示启动菜单：回车默认选择“快速模式”（5 并发、启动时准备 5 个设备
+会话），也可以选择逐轮画像的标准模式、自定义并发/端口，或只做环境自检。无需为了
+切换常用模式手写命令行参数。
+
 冻结分发下有两处行为自动切换，都不需要配置：Node 取随包携带的那一份而不是 PATH；
 图像识别在进程内跑而不是拉起第二个解释器（`--vision-python` 默认值变为哨兵
 `<in-process>`，预热改在后台线程完成）。跑不起来时先执行 `AliSlider.exe doctor`，
@@ -464,7 +468,8 @@ Node、视觉解释器和超时等运行环境由启动命令固定，逐轮变�
 ```bash
 PYTHONPATH="$PWD" python3 -m ali_slider_reverse.entrypoints.api \
   --vision-python /path/to/vision-python \
-  --host 127.0.0.1 --port 8000
+  --host 127.0.0.1 --port 8000 \
+  --runtime-mode fast --max-concurrency 5
 ```
 
 请求参数：
@@ -501,11 +506,11 @@ Init/Verify/日志   <prefix>.captcha-open.aliyuncs.com
 `proxy` 接受纯 `ip:port`（按 `http://` 处理）、完整 URL 和带认证的写法；`socks5://`
 需额外安装 `requests[socks]`。
 
-接口默认不限制并发，`--max-concurrency N` 才会把同时进行的挑战数限制为 N 并对超出
-部分返回 `429`。日志只记录方法、路径和状态码，`proxy` 凭据与 `securityToken` 不会
-写入 stderr。
+标准模式默认不限制并发，`--max-concurrency N` 会把同时进行的挑战数限制为 N 并对
+超出部分返回 `429`；快速模式未显式给出 N 时默认取 5。日志只记录方法、路径和状态码，
+`proxy` 凭据与 `securityToken` 不会写入 stderr。
 
-### 7.1 `--prewarm-device-session`：默认关闭的设备会话预热
+### 7.1 标准模式与快速模式
 
 一轮的第一段是设备链——准备 SDK、启动 Node、跑完 Log1 与 Log2，实测约 460ms，期间
 Python 只能阻塞等待。而 DeviceToken 是 `InitCaptchaV3` 的**入参**，先于 `CertifyId`
@@ -518,17 +523,24 @@ Python 只能阻塞等待。而 DeviceToken 是 `InitCaptchaV3` 的**入参**，
          ↑ 首轮无池可用      ↑ 命中预热会话
 ```
 
-**默认关闭是刻意的**：预热是投机的，备好的会话没人来领，那次 Log1/Log2 就是白发
-的请求。因此策略是需求驱动——只在刚服务完一轮之后为**同一配置**补一个，不做定时
-补货；备好的会话超龄就关掉丢弃，**不会自动再起一个**。流量随请求自然衰减到零，
-服务器空转时不会持续骚扰 FeiLin。
+`--runtime-mode standard` 保持逐轮生成设备画像，不创建投机设备会话；
+`--runtime-mode fast` 则固定本进程的一套自洽画像，并按并发上限在服务启动时准备同等
+数量的独立 Node/FeiLin 会话。请求从空闲池领取，不在关键路径启动 Node；同一批请求
+全部结束后再并行补齐，下一批若撞上正在补货的会话会等待并领取它们，不会额外冷建
+一批进程。旧参数 `--prewarm-device-session` 保留为快速模式的兼容别名。
+
+预热仍然是投机行为，因此快速模式不做定时刷新：只在启动和实际消费后补货；备好的
+会话超龄就关掉丢弃。服务器长时间没有流量时不会持续发送 Log1/Log2，长时间空闲后的
+首批请求可能重新承担一次设备链耗时。
 
 还有一条硬约束：`DeviceConfig` 携带 `ip` 字段，而 Log1/Log2 在**预热那一刻**就已经
 发出去了。拿直连预热出的会话去服务走代理的一轮，指纹里的 IP 会和 Init/Verify 的实际
-源 IP 对不上。所以租借前会比对完整配置签名（含 `proxy`），不匹配一律丢弃重建。
+源 IP 对不上。所以租借前会比对完整配置签名（含 `proxy` 和设备画像），不匹配请求
+直接走自己的冷会话，不会消费或扰动默认直连池。
 
-**默认配置下不要开这个开关**——设备画像逐轮重抽，每轮都是新桶，命中率为零；逐轮
-换 `proxy` 的部署同理。只有自己固定了画像与出口，它才有意义。
+逐轮更换 `proxy` 的部署几乎命中不了固定出口的池，应使用标准模式。快速模式通过固定
+本进程画像解决了旧开关在“逐轮画像”下命中率为零的问题，但代价是该进程生命周期内
+不轮换画像；需要逐轮画像隔离时应选择标准模式。
 
 
 串行实测（2026-08-01，全部直连同一出口 IP，95 轮）：
