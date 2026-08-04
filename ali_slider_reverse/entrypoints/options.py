@@ -221,6 +221,8 @@ class RuntimeSettings:
         prefix: str = config.DEFAULT_PREFIX,
         proxies: dict[str, str] | None = None,
         rpc_key_id: str | None = None,
+        adapter: object | None = None,
+        upload_executor: object | None = None,
     ) -> AliSliderClient:
         """装配协议客户端。"""
 
@@ -233,6 +235,8 @@ class RuntimeSettings:
             proxies=proxies,
             rpc_key_id=rpc_key_id,
             device_profile=device_profile,
+            adapter=adapter,
+            upload_executor=upload_executor,
         )
 
 

@@ -5,11 +5,17 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
 from ali_slider_reverse.challenge.device_pool import DeviceSessionPool
+from ali_slider_reverse.challenge.session import AliSliderClient
+from ali_slider_reverse.challenge.transport import (
+    SharedHttpAdapterPool,
+    warm_connections,
+)
 from ali_slider_reverse.entrypoints import desktop
 from ali_slider_reverse.entrypoints.api import SolveRequest, solve_once
 
@@ -201,6 +207,218 @@ class SolveOnceProfileTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(seen, [("http", profile), ("device", profile)])
+
+    def test_fast_transport_adapter_is_forwarded_by_route(self) -> None:
+        profile = object()
+        adapter = object()
+        proxies = {"https": "http://proxy.invalid:8080"}
+        seen: list[object] = []
+        verify = SimpleNamespace(
+            succeeded=True,
+            security_token="token",
+            verify_code="T001",
+            verify_result=True,
+            certify_id="certify-id",
+        )
+
+        class Client:
+            def prewarm_vision(self) -> None:
+                return None
+
+            def prewarm_connections(self) -> None:
+                return None
+
+            def run_captcha(self, runtime, *, minimum_confidence):
+                return SimpleNamespace(verify=verify)
+
+            def close(self) -> None:
+                return None
+
+        class Settings:
+            minimum_confidence = 0.45
+
+            @staticmethod
+            def build_client(*, device_profile, adapter, **kwargs):
+                seen.append(adapter)
+                return Client()
+
+            @staticmethod
+            def build_device_runtime(*, device_profile, **kwargs):
+                return object()
+
+        class TransportPool:
+            @staticmethod
+            def get(value):
+                self.assertEqual(value, proxies)
+                return adapter
+
+        request = SolveRequest(
+            scene_id="scene",
+            proxies=proxies,
+            rpc_key_id=None,
+            prefix="default",
+        )
+
+        result = solve_once(
+            request,
+            Settings(),
+            device_profile=profile,
+            transport_pool=TransportPool(),
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(seen, [adapter])
+
+
+class SharedTransportPoolTests(unittest.TestCase):
+    class _Adapter:
+        def __init__(self, *, pool_connections: int, pool_maxsize: int) -> None:
+            self.pool_connections = pool_connections
+            self.pool_maxsize = pool_maxsize
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    class _Requests:
+        adapters = SimpleNamespace(HTTPAdapter=None)
+
+    def setUp(self) -> None:
+        self._Requests.adapters.HTTPAdapter = self._Adapter
+
+    def test_same_route_reuses_adapter_and_proxy_routes_are_isolated(self) -> None:
+        pool = SharedHttpAdapterPool(
+            self._Requests,
+            pool_size=7,
+            max_proxy_routes=2,
+        )
+        direct = pool.get(None)
+        proxy_a = pool.get(
+            {"https": "http://one.invalid:8080", "http": "http://one.invalid:8080"}
+        )
+
+        self.assertIs(pool.get({}), direct)
+        self.assertIs(
+            pool.get(
+                {"http": "http://one.invalid:8080", "https": "http://one.invalid:8080"}
+            ),
+            proxy_a,
+        )
+        self.assertIsNot(
+            pool.get({"https": "http://two.invalid:8080"}),
+            proxy_a,
+        )
+        self.assertIsNone(pool.get({"https": "http://three.invalid:8080"}))
+        self.assertEqual(direct.pool_connections, 7)
+
+        adapters = tuple(pool._adapters.values())
+        pool.close()
+        pool.close()
+        self.assertTrue(all(item.closed == 1 for item in adapters))
+        with self.assertRaises(RuntimeError):
+            pool.get(None)
+
+    def test_client_close_detaches_borrowed_adapter(self) -> None:
+        borrowed = self._Adapter(pool_connections=8, pool_maxsize=8)
+        local = self._Adapter(pool_connections=1, pool_maxsize=1)
+
+        class Session:
+            def __init__(self) -> None:
+                self.adapters = {"https://": borrowed, "http://": local}
+
+            def close(self) -> None:
+                for adapter in set(self.adapters.values()):
+                    adapter.close()
+
+        client = object.__new__(AliSliderClient)
+        client.vision = SimpleNamespace(close=lambda: None)
+        client.session = Session()
+        client._adapter = borrowed
+        client._owns_adapter = False
+
+        client.close()
+
+        self.assertEqual(borrowed.closed, 0)
+        self.assertEqual(local.closed, 1)
+
+    def test_startup_warmup_fills_each_host_to_concurrency(self) -> None:
+        calls: list[tuple[object, str, float]] = []
+
+        def record(adapter: object, url: str, timeout: float) -> None:
+            calls.append((adapter, url, timeout))
+
+        adapter = object()
+        with mock.patch(
+            "ali_slider_reverse.challenge.transport._warm_one",
+            side_effect=record,
+        ):
+            warm_connections(
+                adapter,
+                ("https://one.invalid/", "https://one.invalid/", "https://two.invalid/"),
+                connections_per_url=3,
+                wait=True,
+            )
+
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(
+            sorted(url for _, url, _ in calls),
+            ["https://one.invalid/"] * 3 + ["https://two.invalid/"] * 3,
+        )
+
+    def test_service_upload_executor_does_not_block_response(self) -> None:
+        release_upload = threading.Event()
+        verify = SimpleNamespace(succeeded=True)
+        completed_device = SimpleNamespace(
+            getter_argument_count=1,
+            verify_token="verify-token",
+        )
+        build = SimpleNamespace(
+            device_getter_arguments=("arg",),
+            feilin_interaction_events=({"type": "mousemove"},),
+            post_interaction_delay_ms=0.0,
+        )
+
+        class DeviceSession:
+            init_token = "init-token"
+            initial_result = SimpleNamespace()
+            sdk_path = "sdk.js"
+            target_first_touch_age_ms = 700
+
+            @staticmethod
+            def complete_challenge(*args, **kwargs):
+                return completed_device
+
+        class Runtime:
+            @staticmethod
+            @contextmanager
+            def challenge_session():
+                yield DeviceSession()
+
+        client = object.__new__(AliSliderClient)
+        client.prewarm_connections = lambda: None
+        client.init_challenge = lambda token: SimpleNamespace(init_started_ms=1)
+        client.download_assets = lambda challenge, directory: SimpleNamespace()
+        client.upload_initialization_log = (
+            lambda challenge, assets: release_upload.wait(timeout=1.0)
+        )
+        client.solve_assets = lambda assets, x_pos_override=None: SimpleNamespace(
+            confidence=1.0
+        )
+        client.build_verify_data = lambda *args, **kwargs: build
+        client.verify_challenge = lambda *args, **kwargs: verify
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        client._upload_executor = executor
+        try:
+            started = time.monotonic()
+            outcome = AliSliderClient.run_captcha(client, Runtime())
+            elapsed = time.monotonic() - started
+        finally:
+            release_upload.set()
+            executor.shutdown(wait=True)
+
+        self.assertLess(elapsed, 0.5)
+        self.assertFalse(outcome.upload_log_succeeded)
 
 
 class StartupMenuTests(unittest.TestCase):

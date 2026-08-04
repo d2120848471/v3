@@ -30,16 +30,16 @@ Python 侧完全阻塞在读子进程输出上。本轮五个出网主机的 TLS
 （见 :mod:`.transport`），其中 Verify 主机原本要等到整条链路的最后一步才第一次
 握手。
 
-所有 worker 都在本轮返回前回收，不留后台悬挂任务。单轮之内不并发多个挑战。多轮
-可以同时进行，但每轮持有自己的客户端、FeiLin worker、临时目录与 ``CertifyId``，
-轮与轮之间没有共享可变状态。
+标准模式的 worker 都在本轮返回前回收。快速 HTTP 模式只有 best-effort UploadLog
+可以交给服务级执行器，服务停止时统一排空；单轮的客户端、FeiLin worker、临时目录
+与 ``CertifyId`` 仍然彼此隔离。
 """
 
 from __future__ import annotations
 
 import tempfile
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -246,6 +246,8 @@ class AliSliderClient:
         proxies: dict[str, str] | None = None,
         rpc_key_id: str | None = None,
         device_profile: DeviceProfile,
+        adapter: Any | None = None,
+        upload_executor: Executor | None = None,
     ) -> None:
         if not scene_id or not prefix:
             raise ValueError("scene_id 和 prefix 不能为空")
@@ -280,7 +282,11 @@ class AliSliderClient:
         self._requests = _requests_module()
         # 本轮共享的连接池：Session 仍按线程隔离，但热连接集中在这个 adapter 上，
         # 预热出来的 TLS 连接才能被 Init/Verify/UploadLog 和四项资源下载共同复用。
-        self._adapter = build_pool_adapter(self._requests)
+        self._owns_adapter = adapter is None
+        self._adapter = (
+            build_pool_adapter(self._requests) if adapter is None else adapter
+        )
+        self._upload_executor = upload_executor
         self._connections_warmed = False
         self.session = self._requests.Session()
         self.session.mount("https://", self._adapter)
@@ -354,13 +360,18 @@ class AliSliderClient:
 
         self.vision.close()
         try:
+            # 借来的服务级 adapter 必须先摘掉；Session.close() 会关闭所有仍挂载的
+            # adapter，否则第一轮请求结束就把后续请求要复用的热连接一起销毁。
+            if not self._owns_adapter:
+                self.session.adapters.pop("https://", None)
             self.session.close()
         except Exception:  # pragma: no cover - 关闭已失效会话的兜底。
             pass
-        try:
-            self._adapter.close()
-        except Exception:  # pragma: no cover - 关闭已失效连接池的兜底。
-            pass
+        if self._owns_adapter:
+            try:
+                self._adapter.close()
+            except Exception:  # pragma: no cover - 关闭已失效连接池的兜底。
+                pass
 
     def __del__(self) -> None:  # pragma: no cover - 异常退出时的兜底回收。
         try:
@@ -820,15 +831,19 @@ class AliSliderClient:
 
             assets = self.download_assets(challenge, directory)
 
-            # UploadLog 是 best-effort 遥测，不参与任何控制流，公开 SDK 也不 await
-            # 它；因此只需在本轮返回前回收，不能让 PE 站在这里干等一次完整的网络
-            # 往返。executor 注册在 ExitStack 上，任何路径退出都会 join，不留悬挂。
-            executor = stack.enter_context(
-                ThreadPoolExecutor(
-                    max_workers=1, thread_name_prefix="ali-upload-log"
+            # 标准/CLI 仍由本轮拥有 executor；快速 HTTP 则借用服务级 executor，
+            # 让公开 SDK 本就不 await 的 best-effort UploadLog 不再挡住响应。
+            background_upload = self._upload_executor is not None
+            if self._upload_executor is None:
+                upload_executor = stack.enter_context(
+                    ThreadPoolExecutor(
+                        max_workers=1,
+                        thread_name_prefix="ali-upload-log",
+                    )
                 )
-            )
-            upload_future = executor.submit(
+            else:
+                upload_executor = self._upload_executor
+            upload_future = upload_executor.submit(
                 self.upload_initialization_log, challenge, assets
             )
 
@@ -874,10 +889,12 @@ class AliSliderClient:
                 challenge, device.verify_token, build
             )
 
-            # 遥测 worker 注册在 ExitStack 上，本轮返回前无论如何都要 join，所以在
-            # Verify 之后取结果不增加任何等待——只是把同一段 join 提前几行，换来
-            # 精确的记录。上限与它自己的请求超时一致，异常情况下也不会挂死。
-            upload_log_succeeded = _settled_flag(upload_future, timeout=5.0)
+            # 服务级任务只做一次非阻塞观察；进程停止时由 API 入口统一 shutdown。
+            # 标准/CLI 的本轮 executor 仍会回收，因此继续保留精确结果。
+            upload_log_succeeded = _settled_flag(
+                upload_future,
+                timeout=0.0 if background_upload else 5.0,
+            )
 
         return ChallengeOutcome(
             device=device,

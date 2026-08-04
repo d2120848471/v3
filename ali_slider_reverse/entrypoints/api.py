@@ -26,8 +26,8 @@ PE），避免同一 ``CertifyId`` 的请求出现在多个源 IP 上。
 200  一次正常往返；验证码未通过时 ok=false，由 VerifyCode 说明原因
 ```
 
-每轮挑战使用独立的客户端、FeiLin worker、临时目录与 ``CertifyId``，不共享任何
-可变状态；单次 Verify 的边界仍然逐轮成立。
+每轮挑战使用独立的客户端、FeiLin worker、临时目录与 ``CertifyId``，只共享线程
+安全的底层连接池与 best-effort 执行器；单次 Verify 的边界仍然逐轮成立。
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import Executor, ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -47,6 +48,7 @@ from urllib.parse import parse_qs, urlsplit
 from .. import config
 from ..challenge.device_pool import DeviceSessionPool
 from ..challenge.session import normalize_proxies
+from ..challenge.transport import SharedHttpAdapterPool, warm_connections
 from ..device_profile import DeviceProfile, generate_device_profile
 from ..errors import AliSliderError, ApiRequestError
 from .options import (
@@ -138,6 +140,8 @@ def solve_once(
     pool: DeviceSessionPool | None = None,
     *,
     device_profile: DeviceProfile | None = None,
+    transport_pool: SharedHttpAdapterPool | None = None,
+    upload_executor: Executor | None = None,
 ) -> dict[str, Any]:
     """执行一轮完整挑战并返回响应体。
 
@@ -157,6 +161,12 @@ def solve_once(
         proxies=request.proxies,
         rpc_key_id=request.rpc_key_id,
         device_profile=device_profile,
+        adapter=(
+            transport_pool.get(request.proxies)
+            if transport_pool is not None
+            else None
+        ),
+        upload_executor=upload_executor,
     )
     device_runtime = settings.build_device_runtime(
         prefix=request.prefix,
@@ -213,6 +223,8 @@ class SliderApiHandler(BaseHTTPRequestHandler):
     settings: RuntimeSettings = RuntimeSettings()
     slots: Any = _Unlimited()
     device_pool: DeviceSessionPool | None = None
+    transport_pool: SharedHttpAdapterPool | None = None
+    upload_executor: Executor | None = None
     device_profile: DeviceProfile | None = None
 
     result_hook: Callable[[str, str, int, dict[str, Any]], None] | None = None
@@ -280,6 +292,8 @@ class SliderApiHandler(BaseHTTPRequestHandler):
                 self.settings,
                 self.device_pool,
                 device_profile=self.device_profile,
+                transport_pool=self.transport_pool,
+                upload_executor=self.upload_executor,
             )
         except (AliSliderError, ValueError) as exc:
             self._send_error(500, exc)
@@ -393,6 +407,24 @@ def main(argv: list[str] | None = None) -> int:
         else _Unlimited()
     )
     SliderApiHandler.device_profile = fixed_profile
+    transport_pool = (
+        SharedHttpAdapterPool(
+            pool_size=max(concurrency, 8),
+            max_proxy_routes=max(concurrency * 4, 8),
+        )
+        if fast_mode
+        else None
+    )
+    SliderApiHandler.transport_pool = transport_pool
+    upload_executor = (
+        ThreadPoolExecutor(
+            max_workers=max(concurrency, 1),
+            thread_name_prefix="ali-upload-log-service",
+        )
+        if fast_mode
+        else None
+    )
+    SliderApiHandler.upload_executor = upload_executor
     device_pool = (
         DeviceSessionPool(enabled=True, capacity=max(concurrency, 1))
         if fast_mode
@@ -411,6 +443,22 @@ def main(argv: list[str] | None = None) -> int:
                 proxies=None,
                 device_profile=fixed_profile,
             )
+        )
+    if transport_pool is not None:
+        # 设备池就绪后再按并发容量建立 TCP/TLS（不发 HTTP 字节），避免握手过早完成
+        # 后在漫长的 Node prime 期间闲置失效；等开始监听时首批请求也能直接复用。
+        warm_connections(
+            transport_pool.get(None),
+            (
+                config.init_url(),
+                config.verify_url(),
+                config.UPLOAD_URL,
+                config.IMAGE_BASE,
+                config.PE_BASE,
+            ),
+            timeout=settings.timeout,
+            connections_per_url=max(concurrency, 1),
+            wait=True,
         )
     limit_label = (
         f"并发上限 {concurrency}"
@@ -435,6 +483,10 @@ def main(argv: list[str] | None = None) -> int:
         server.server_close()
         if device_pool is not None:
             device_pool.close()
+        if upload_executor is not None:
+            upload_executor.shutdown(wait=True)
+        if transport_pool is not None:
+            transport_pool.close()
     return 0
 
 
