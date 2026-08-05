@@ -39,8 +39,9 @@ from __future__ import annotations
 
 import tempfile
 import time
+from collections.abc import Callable, Iterator
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -807,11 +808,40 @@ class AliSliderClient:
         fixture_path: str | Path | None = None,
         x_pos_override: int | None = None,
         minimum_confidence: float = config.DEFAULT_MIN_CONFIDENCE,
+        timing_hook: Callable[[str, int], None] | None = None,
+        cancel_check: Callable[[], None] | None = None,
     ) -> ChallengeOutcome:
-        """执行一轮挑战；每个 CertifyId 严格只发一次 Verify。"""
+        """执行一轮挑战；每个 CertifyId 严格只发一次 Verify。
+
+        ``timing_hook`` 在每个阶段结束时收到 ``(阶段名, 毫秒)``，用于 HTTP 服务
+        实时输出多线程进度。``cancel_check`` 只在阶段边界调用；客户端已断开时可
+        停止后续工作，但绝不强杀正在进行的网络请求或子进程调用。
+        """
 
         if not 0.0 <= minimum_confidence <= 1.0:
             raise ValueError("minimum_confidence 必须位于 0..1")
+
+        def check_cancelled() -> None:
+            if cancel_check is not None:
+                cancel_check()
+
+        @contextmanager
+        def timed_step(name: str) -> Iterator[None]:
+            started = time.monotonic()
+            try:
+                yield
+            finally:
+                elapsed_ms = max(
+                    0, int((time.monotonic() - started) * 1000)
+                )
+                if timing_hook is not None:
+                    try:
+                        timing_hook(name, elapsed_ms)
+                    except Exception:
+                        # 观测逻辑不得改变 Verify 控制流。
+                        pass
+
+        check_cancelled()
 
         # 设备链是本轮第一段长阻塞，且期间 Python 无事可做；五个出网主机的 TLS
         # 握手全部塞进这段空窗，其中 Verify 主机原本要等到最后一步才第一次握手。
@@ -819,10 +849,15 @@ class AliSliderClient:
 
         with ExitStack() as stack:
             # FeiLin VM 必须跨越整个 Init→PE→Verify 过程保持存活。
-            device_session = stack.enter_context(
-                device_runtime.challenge_session()
-            )
-            challenge = self.init_challenge(device_session.init_token)
+            with timed_step("deviceSession"):
+                device_session = stack.enter_context(
+                    device_runtime.challenge_session()
+                )
+            check_cancelled()
+
+            with timed_step("init"):
+                challenge = self.init_challenge(device_session.init_token)
+            check_cancelled()
             initial_device = device_session.initial_result
 
             directory: str | Path
@@ -833,7 +868,9 @@ class AliSliderClient:
             else:
                 directory = artifacts_dir
 
-            assets = self.download_assets(challenge, directory)
+            with timed_step("downloadAssets"):
+                assets = self.download_assets(challenge, directory)
+            check_cancelled()
 
             # UploadLog 是不参与 Verify 的遥测。默认关闭时不创建 worker、
             # 不发送网络包；下方启用分支与完整发送方法均保留以便对照。
@@ -854,58 +891,70 @@ class AliSliderClient:
                     self.upload_initialization_log, challenge, assets
                 )
 
-            vision = self.solve_assets(assets, x_pos_override=x_pos_override)
-            if vision.confidence < minimum_confidence:
-                raise AliSliderError(
-                    "缺口置信度不足，已停止且未发送 Verify："
-                    f"{vision.confidence:.3f} < {minimum_confidence:.3f}"
+            with timed_step("vision"):
+                vision = self.solve_assets(
+                    assets, x_pos_override=x_pos_override
                 )
+                if vision.confidence < minimum_confidence:
+                    raise AliSliderError(
+                        "缺口置信度不足，已停止且未发送 Verify："
+                        f"{vision.confidence:.3f} < {minimum_confidence:.3f}"
+                    )
+            check_cancelled()
 
             # 首触年龄的门控发生在 PE slider ready 之后、真正 dispatch 之前，
             # 因此 Node 启动与 SDK/PE 初始化的耗时不会叠加到目标年龄上。
-            build = self.build_verify_data(
-                challenge,
-                assets,
-                vision,
-                sdk_path=device_session.sdk_path,
-                device=initial_device,
-                init_begin_time=challenge.init_started_ms,
-                target_first_touch_age_ms=(
-                    device_session.target_first_touch_age_ms
-                ),
-                fixture_path=fixture_path,
-            )
-
-            device = device_session.complete_challenge(
-                build.device_getter_arguments,
-                build.feilin_interaction_events,
-                # PE 事件时间是非负毫秒；用与前端 Math.round 一致的 half-up，
-                # 而不是 Python 的银行家舍入。
-                post_interaction_delay_ms=int(
-                    build.post_interaction_delay_ms + 0.5
-                ),
-            )
-            if device.getter_argument_count != len(
-                build.device_getter_arguments
-            ):
-                raise AliSliderError(
-                    "Verify DeviceToken 未按动态 PE getter 参数刷新"
+            with timed_step("buildVerifyData"):
+                build = self.build_verify_data(
+                    challenge,
+                    assets,
+                    vision,
+                    sdk_path=device_session.sdk_path,
+                    device=initial_device,
+                    init_begin_time=challenge.init_started_ms,
+                    target_first_touch_age_ms=(
+                        device_session.target_first_touch_age_ms
+                    ),
+                    fixture_path=fixture_path,
                 )
+            check_cancelled()
 
-            verify = self.verify_challenge(
-                challenge, device.verify_token, build
-            )
+            with timed_step("completeDevice"):
+                device = device_session.complete_challenge(
+                    build.device_getter_arguments,
+                    build.feilin_interaction_events,
+                    # PE 事件时间是非负毫秒；用与前端 Math.round 一致的 half-up，
+                    # 而不是 Python 的银行家舍入。
+                    post_interaction_delay_ms=int(
+                        build.post_interaction_delay_ms + 0.5
+                    ),
+                )
+                if device.getter_argument_count != len(
+                    build.device_getter_arguments
+                ):
+                    raise AliSliderError(
+                        "Verify DeviceToken 未按动态 PE getter 参数刷新"
+                    )
+            check_cancelled()
+
+            with timed_step("verify"):
+                verify = self.verify_challenge(
+                    challenge, device.verify_token, build
+                )
+            check_cancelled()
 
             # 服务级任务只做一次非阻塞观察；默认关闭时直接记为
             # False，不让遥测状态影响验证码结果。
-            upload_log_succeeded = (
-                _settled_flag(
-                    upload_future,
-                    timeout=0.0 if background_upload else 5.0,
+            with timed_step("uploadLog"):
+                upload_log_succeeded = (
+                    _settled_flag(
+                        upload_future,
+                        timeout=0.0 if background_upload else 5.0,
+                    )
+                    if upload_future is not None
+                    else False
                 )
-                if upload_future is not None
-                else False
-            )
+            check_cancelled()
 
         return ChallengeOutcome(
             device=device,

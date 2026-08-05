@@ -15,8 +15,9 @@ DeviceToken 不是一段静态指纹字符串，也不能在 Init 与 Verify 阶
 ```
 
 只替换 UA、伪造字段数量，或者为 Verify 重新启动第二个 VM，都会破坏跨阶段的
-状态一致性。因此 :class:`DeviceRuntimeSession` 用一个长驻子进程承载整轮挑战，
-Python 侧只在两个阶段之间与它通信。
+状态一致性。因此 :class:`DeviceRuntimeSession` 始终独占一个 VM 承载整轮
+挑战，Python 侧只在两个阶段之间与它通信。标准路径一 VM 一 Node 进程；
+快速池可让多个隔离 VM 共享一个 Node host，但不共享任何挑战状态。
 
 ## 职责边界
 
@@ -63,6 +64,7 @@ _FIELD_TOKEN_TIME = 74
 
 _MAX_INTERACTION_EVENTS = 512
 _MAX_INTERACTION_SPAN_MS = 60_000
+_MAX_HOST_VM_COUNT = 8
 
 _SDK_MINIMUM_BYTES = 50_000
 """公开 SDK 的最小合理体积；低于此值一定不是那个脚本。"""
@@ -121,6 +123,18 @@ def _bridge_error(stderr: str) -> str:
         if isinstance(message, str) and message:
             return message[:800]
     return "未返回结构化错误"
+
+
+def _close_process_pipes(process: subprocess.Popen[str]) -> None:
+    """子进程退出后显式关闭 Popen 管道，避免常驻服务泄漏 fd。"""
+
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is None or stream.closed:
+            continue
+        try:
+            stream.close()
+        except OSError:
+            pass
 
 
 def _parse_device_config(value: Any) -> DeviceConfig:
@@ -654,6 +668,32 @@ class DeviceRuntimeClient:
             sdk_path = self._prepare_sdk(stack)
             yield stack.enter_context(DeviceRuntimeSession(self, sdk_path))
 
+    def open_challenge_sessions(
+        self, count: int
+    ) -> tuple["DeviceRuntimeSession", ...]:
+        """在一个 Node host 内打开 ``count`` 个隔离 VM 会话。
+
+        返回的每个 session 都有独立 ``sessionId`` 和 VM；最后一个
+        session 关闭时自动回收共享 Node 进程与 SDK 临时文件。单个 session
+        可原位重建 Worker/VM，不影响同 host 的其他 session。
+        """
+
+        if (
+            isinstance(count, bool)
+            or not isinstance(count, int)
+            or not 1 <= count <= _MAX_HOST_VM_COUNT
+        ):
+            raise ValueError(f"count 必须是 1..{_MAX_HOST_VM_COUNT} 的整数")
+
+        stack = ExitStack()
+        try:
+            sdk_path = self._prepare_sdk(stack)
+            host = _DeviceRuntimeHost(self, sdk_path, count, owner_stack=stack)
+            return host.start()
+        except Exception:
+            stack.close()
+            raise
+
     def _prepare_sdk(self, stack: ExitStack) -> Path:
         """定位本轮要用的公开 SDK 文件。
 
@@ -691,8 +731,260 @@ class DeviceRuntimeClient:
         return path
 
 
+class _DeviceRuntimeHost:
+    """一个 Node 进程中持有多个隔离 FeiLin VM 槽位。"""
+
+    def __init__(
+        self,
+        client: DeviceRuntimeClient,
+        sdk_path: Path,
+        count: int,
+        *,
+        owner_stack: ExitStack,
+    ) -> None:
+        self.client = client
+        self.sdk_path = sdk_path
+        self.count = count
+        self.process: subprocess.Popen[str] | None = None
+        self._queues: dict[
+            int, queue.Queue[tuple[float, dict[str, Any]] | None]
+        ] = {
+            session_id: queue.Queue() for session_id in range(count)
+        }
+        self._stage_received_at: dict[tuple[int, str], float] = {}
+        self._stdout_reader: threading.Thread | None = None
+        self._write_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._open_sessions = set(range(count))
+        self._closed = False
+        self._owner_stack = owner_stack
+
+    def start(self) -> tuple["DeviceRuntimeSession", ...]:
+        """启动 host，等待全部 VM 完成 Init 后返回逻辑会话。"""
+
+        if not self.client.bridge_script.is_file():
+            raise DeviceRuntimeError(
+                f"Node 设备桥不存在：{self.client.bridge_script}"
+            )
+        try:
+            self.process = subprocess.Popen(
+                [
+                    self.client.node_binary,
+                    str(self.client.bridge_script),
+                    "--mode",
+                    "challenge-host",
+                    "--sdk",
+                    str(self.sdk_path),
+                    "--prefix",
+                    self.client.prefix,
+                    "--region",
+                    self.client.region,
+                    "--timeout-ms",
+                    str(round(self.client.timeout * 1000)),
+                    "--device-profile",
+                    encode_device_profile(self.client.device_profile),
+                    "--vm-count",
+                    str(self.count),
+                    "--persistent-host",
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except FileNotFoundError as exc:
+            raise DeviceRuntimeError(
+                f"找不到 Node：{self.client.node_binary}"
+            ) from exc
+
+        try:
+            self._start_stdout_reader()
+            deadline = time.monotonic() + self.client.timeout + 5
+            payloads = tuple(
+                self._read_stage(session_id, "init", deadline=deadline)
+                for session_id in range(self.count)
+            )
+            return tuple(
+                DeviceRuntimeSession(
+                    self.client,
+                    self.sdk_path,
+                    host=self,
+                    session_id=session_id,
+                    initial_payload=payload,
+                    initialized_at=self._stage_received_at[(session_id, "init")],
+                )
+                for session_id, payload in enumerate(payloads)
+            )
+        except Exception:
+            self.close()
+            raise
+
+    def _start_stdout_reader(self) -> None:
+        process = self.process
+        if process is None or process.stdout is None:
+            raise DeviceRuntimeError("challenge-host 尚未启动")
+        reader = threading.Thread(
+            target=self._drain_stdout,
+            name="ali-device-host-stdout",
+            daemon=True,
+        )
+        self._stdout_reader = reader
+        reader.start()
+
+    def _drain_stdout(self) -> None:
+        """将 host 输出按 ``sessionId`` 分流到各逻辑会话。"""
+
+        process = self.process
+        stream = None if process is None else process.stdout
+        if stream is None:
+            for lines in self._queues.values():
+                lines.put(None)
+            return
+        try:
+            for line in stream:
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                session_id = payload.get("sessionId")
+                lines = self._queues.get(session_id)
+                if lines is not None:
+                    lines.put((time.monotonic(), payload))
+        finally:
+            for lines in self._queues.values():
+                lines.put(None)
+
+    def _read_stage(
+        self,
+        session_id: int,
+        expected: str,
+        *,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        process = self.process
+        lines = self._queues[session_id]
+        if process is None:
+            raise DeviceRuntimeError("challenge-host 尚未启动")
+        if deadline is None:
+            deadline = time.monotonic() + self.client.timeout + 5
+
+        while time.monotonic() < deadline:
+            try:
+                item = lines.get(timeout=max(0.0, deadline - time.monotonic()))
+            except queue.Empty:
+                break
+            if item is None:
+                break
+            received_at, payload = item
+            if payload.get("stage") == "error":
+                detail = payload.get("error")
+                if not isinstance(detail, str) or not detail:
+                    detail = "Node 设备桥执行失败"
+                raise DeviceRuntimeError(
+                    f"challenge-host 会话 {session_id} 失败：{detail[:800]}"
+                )
+            if (
+                payload.get("stage") == expected
+                and isinstance(payload.get("deviceToken"), str)
+            ):
+                self._stage_received_at[(session_id, expected)] = received_at
+                return payload
+
+        detail = "未返回结构化错误"
+        if process.stderr is not None and process.poll() is not None:
+            detail = _bridge_error(process.stderr.read())
+        raise DeviceRuntimeError(
+            f"challenge-host 会话 {session_id} 未返回 {expected} 阶段："
+            f"{detail}"
+        )
+
+    def send_completion(self, session_id: int, payload: dict[str, Any]) -> None:
+        with self._state_lock:
+            if self._closed or session_id not in self._open_sessions:
+                raise DeviceRuntimeError("challenge-host 会话已关闭")
+        self._write({"sessionId": session_id, **payload})
+
+    def reset_session(self, session_id: int) -> tuple[dict[str, Any], float]:
+        """原位重建一个已消费的 Worker/VM，并等待它重新完成 Init。"""
+
+        with self._state_lock:
+            if self._closed or session_id not in self._open_sessions:
+                raise DeviceRuntimeError("challenge-host 会话已关闭")
+        self._write({"sessionId": session_id, "reset": True})
+        payload = self._read_stage(session_id, "init")
+        return payload, self._stage_received_at[(session_id, "init")]
+
+    def _write(self, payload: dict[str, Any]) -> None:
+        process = self.process
+        if process is None or process.stdin is None or process.poll() is not None:
+            raise DeviceRuntimeError("challenge-host 已退出")
+        try:
+            with self._write_lock:
+                process.stdin.write(
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
+                process.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            raise DeviceRuntimeError("challenge-host 命令写入失败") from exc
+
+    def release(self, session_id: int, *, completed: bool) -> None:
+        """释放一个 VM 槽位；最后一个槽位负责回收 host。"""
+
+        with self._state_lock:
+            if self._closed or session_id not in self._open_sessions:
+                return
+            self._open_sessions.remove(session_id)
+            last = not self._open_sessions
+        if not completed:
+            try:
+                self._write({"sessionId": session_id, "cancel": True})
+            except DeviceRuntimeError:
+                pass
+        if last:
+            self.close()
+
+    def close(self) -> None:
+        """终止 host 并回收 SDK 所有者；可重复调用。"""
+
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._open_sessions.clear()
+        process = self.process
+        reader = self._stdout_reader
+        if process is not None:
+            if process.stdin is not None and not process.stdin.closed:
+                try:
+                    process.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(timeout=0.5)
+        if process is not None:
+            _close_process_pipes(process)
+        self._stdout_reader = None
+        self.process = None
+        self._owner_stack.close()
+
+
 class DeviceRuntimeSession:
-    """跨 Python Init 保持同一 FeiLin 会话的双阶段 Node worker。
+    """跨 Python Init 保持同一 FeiLin VM 的双阶段会话。
 
     两个阶段之间用行分隔的 JSON 通信：
 
@@ -701,19 +993,47 @@ class DeviceRuntimeSession:
     (Python 侧执行 Init、下载资源、识别、跑 PE)
     complete_challenge   写入 getter 参数与 mousemove 流 → 输出 stage="verify"
     ```
+
+    会话可独占 `challenge-worker` 进程，也可使用 `sessionId` 挂在
+    共享 `challenge-host` 上；两种路径对上层暴露同一接口。
     """
 
-    def __init__(self, client: DeviceRuntimeClient, sdk_path: Path) -> None:
+    def __init__(
+        self,
+        client: DeviceRuntimeClient,
+        sdk_path: Path,
+        *,
+        host: _DeviceRuntimeHost | None = None,
+        session_id: int | None = None,
+        initial_payload: dict[str, Any] | None = None,
+        initialized_at: float | None = None,
+    ) -> None:
         self.client = client
         self.sdk_path = sdk_path
-        self.process: subprocess.Popen[str] | None = None
+        self._host = host
+        self._session_id = session_id
+        self.process: subprocess.Popen[str] | None = (
+            None if host is None else host.process
+        )
         self._stdout_lines: queue.Queue[str | None] | None = None
         self._stdout_reader: threading.Thread | None = None
-        self._init_result: DeviceRuntimeResult | None = None
+        self._init_result: DeviceRuntimeResult | None = (
+            None
+            if initial_payload is None
+            else _build_result(
+                initial_payload,
+                gather_cost_range=self.client.gather_cost_range,
+            )
+        )
         self._completed = False
+        self.initialized_at = initialized_at
         self._target_first_touch_age_ms: int | None = None
 
     def __enter__(self) -> "DeviceRuntimeSession":
+        if self._host is not None:
+            if self._init_result is None or self._session_id is None:
+                raise DeviceRuntimeError("challenge-host 会话未完成 Init")
+            return self
         if not self.client.bridge_script.is_file():
             raise DeviceRuntimeError(
                 f"Node 设备桥不存在：{self.client.bridge_script}"
@@ -755,6 +1075,7 @@ class DeviceRuntimeSession:
                 self._read_stage("init"),
                 gather_cost_range=self.client.gather_cost_range,
             )
+            self.initialized_at = time.monotonic()
         except Exception:
             self.close()
             raise
@@ -801,6 +1122,8 @@ class DeviceRuntimeSession:
     def _read_stage(self, expected: str) -> dict[str, Any]:
         """阻塞读取指定阶段的 JSON 输出，超时或进程退出即失败。"""
 
+        if self._host is not None and self._session_id is not None:
+            return self._host._read_stage(self._session_id, expected)
         process = self.process
         lines = self._stdout_lines
         if process is None or process.stdout is None or lines is None:
@@ -869,6 +1192,32 @@ class DeviceRuntimeSession:
             )
         return self._target_first_touch_age_ms
 
+    @property
+    def recyclable(self) -> bool:
+        """此会话是否能在原 Node host 内换成一个全新的隔离 VM。"""
+
+        return self._host is not None and self._session_id is not None
+
+    def recycle(self) -> None:
+        """重建共享 host 中的当前槽位，供设备池滚动补回容量。"""
+
+        host = self._host
+        session_id = self._session_id
+        if host is None or session_id is None:
+            raise DeviceRuntimeError("独占 challenge-worker 不支持原位重建")
+
+        # reset 会终止旧 Worker；先清掉旧轮状态，确保后续任一步失败时 close()
+        # 会按未完成会话发送 cancel，不会把新 Worker 留在共享 host 里。
+        self._completed = False
+        self._init_result = None
+        self._target_first_touch_age_ms = None
+        payload, initialized_at = host.reset_session(session_id)
+        self._init_result = _build_result(
+            payload,
+            gather_cost_range=self.client.gather_cost_range,
+        )
+        self.initialized_at = initialized_at
+
     def complete_challenge(
         self,
         getter_arguments: tuple[str, ...],
@@ -906,41 +1255,51 @@ class DeviceRuntimeSession:
         process = self.process
         if process is None or process.stdin is None or process.poll() is not None:
             raise DeviceRuntimeError("challenge-worker 已退出")
+        completion_payload = {
+            "complete": True,
+            "getterArguments": list(getter_arguments),
+            "interactionEvents": list(normalized_events),
+            "postInteractionDelayMs": post_interaction_delay_ms,
+        }
         try:
-            process.stdin.write(
-                json.dumps(
-                    {
-                        "complete": True,
-                        "getterArguments": list(getter_arguments),
-                        "interactionEvents": list(normalized_events),
-                        "postInteractionDelayMs": post_interaction_delay_ms,
-                    },
-                    ensure_ascii=False,
-                    separators=(",", ":"),
+            if self._host is not None and self._session_id is not None:
+                self._host.send_completion(
+                    self._session_id,
+                    completion_payload,
                 )
-            )
-            process.stdin.close()
+            else:
+                process.stdin.write(
+                    json.dumps(
+                        completion_payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                )
+                process.stdin.close()
         except (BrokenPipeError, OSError) as exc:
             raise DeviceRuntimeError(
                 "无法把挑战完成信号交给 challenge-worker"
             ) from exc
 
         payload = self._read_stage("verify")
-        try:
-            return_code = process.wait(timeout=self.client.timeout + 5)
-        except subprocess.TimeoutExpired as exc:
-            raise DeviceRuntimeError("challenge-worker 完成后未正常退出") from exc
-        if return_code != 0:
-            detail = (
-                _bridge_error(process.stderr.read())
-                if process.stderr is not None
-                else "未返回结构化错误"
-            )
-            raise DeviceRuntimeError("challenge-worker 失败：" + detail)
-        if process.stderr is not None and process.stderr.read().strip():
-            raise DeviceRuntimeError(
-                "challenge-worker 存在未处理的 FeiLin 采集异常"
-            )
+        if self._host is None:
+            try:
+                return_code = process.wait(timeout=self.client.timeout + 5)
+            except subprocess.TimeoutExpired as exc:
+                raise DeviceRuntimeError(
+                    "challenge-worker 完成后未正常退出"
+                ) from exc
+            if return_code != 0:
+                detail = (
+                    _bridge_error(process.stderr.read())
+                    if process.stderr is not None
+                    else "未返回结构化错误"
+                )
+                raise DeviceRuntimeError("challenge-worker 失败：" + detail)
+            if process.stderr is not None and process.stderr.read().strip():
+                raise DeviceRuntimeError(
+                    "challenge-worker 存在未处理的 FeiLin 采集异常"
+                )
 
         self._completed = True
         result_payload = dict(payload)
@@ -956,12 +1315,24 @@ class DeviceRuntimeSession:
     def close(self) -> None:
         """终止 Node 进程；已退出时是空操作。"""
 
+        host = self._host
+        if host is not None:
+            session_id = self._session_id
+            self._host = None
+            self._session_id = None
+            self.process = None
+            if session_id is not None:
+                host.release(session_id, completed=self._completed)
+            return
         process = self.process
         if process is None:
             return
         reader = self._stdout_reader
         if process.stdin is not None and not process.stdin.closed:
-            process.stdin.close()
+            try:
+                process.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
         if process.poll() is None:
             process.terminate()
             try:
@@ -971,6 +1342,7 @@ class DeviceRuntimeSession:
                 process.wait(timeout=2)
         if reader is not None and reader is not threading.current_thread():
             reader.join(timeout=0.5)
+        _close_process_pipes(process)
         self._stdout_reader = None
         self._stdout_lines = None
         self.process = None

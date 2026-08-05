@@ -10,12 +10,21 @@
  * - `challenge-worker`：保持同一个 FeiLin VM；先输出 Init token，再从 stdin
  *   接收动态 PE 实际观测到的 getter 参数，在同一 VM 内回放动态 PE native mm，
  *   并生成 Verify token；
+ * - `challenge-host`：一个 Node 进程内启动多个隔离 Worker/VM，按
+ *   `sessionId` 对 JSONL 消息分流；池化模式可原位重建已完成的 VM 槽位。
  */
 
 import fs from "node:fs";
+import { createInterface } from "node:readline";
 import vm from "node:vm";
 import { webcrypto } from "node:crypto";
 import { pathToFileURL } from "node:url";
+import {
+  Worker,
+  isMainThread,
+  parentPort,
+  workerData,
+} from "node:worker_threads";
 
 
 const TARGET_ORIGIN = "http://localhost:38185";
@@ -24,8 +33,11 @@ const DEVICE_TOKEN_MODES = Object.freeze([
   "live-token",
   "profile-token",
   "challenge-worker",
+  "challenge-host",
 ]);
 const WORKER_COMPLETION_MAX_BYTES = 64 * 1024;
+const HOST_COMMAND_MAX_BYTES = WORKER_COMPLETION_MAX_BYTES + 1024;
+const HOST_MAX_VM_COUNT = 8;
 const BRIDGE_EVENT_STATE = Symbol("bridgeEventState");
 const DEVICE_PROFILE_MAX_BYTES = 8 * 1024;
 
@@ -138,7 +150,39 @@ function safeDeviceBridgeFailureMessage(_error) {
 }
 
 
+function multiplexSessionId() {
+  const sessionId = workerData?.challengeSessionId;
+  return (
+    !isMainThread
+    && parentPort !== null
+    && Number.isInteger(sessionId)
+    && sessionId >= 0
+  ) ? sessionId : null;
+}
+
+
+function writeBridgeOutput(payload) {
+  const sessionId = multiplexSessionId();
+  if (sessionId !== null) {
+    parentPort.postMessage({ sessionId, ...payload });
+    return;
+  }
+  fs.writeFileSync(1, `${JSON.stringify(payload)}\n`);
+}
+
+
 function writeFatalError(error) {
+  const sessionId = multiplexSessionId();
+  if (sessionId !== null) {
+    parentPort.postMessage({
+      sessionId,
+      stage: "error",
+      error: safeDeviceBridgeFailureMessage(error),
+    });
+    // 给 parentPort 一个 turn 送出固定错误，host 收到后会终止该槽位。
+    setTimeout(() => process.exit(1), 25);
+    return;
+  }
   fs.writeFileSync(
     2,
     `${JSON.stringify({
@@ -159,6 +203,8 @@ function parseArguments(argv) {
     timeoutMs: 15_000,
     networkEnabled: false,
     deviceProfile: null,
+    vmCount: 1,
+    persistentHost: false,
   };
   let encodedProfile = "";
   for (let index = 2; index < argv.length; index += 1) {
@@ -175,6 +221,10 @@ function parseArguments(argv) {
       options.timeoutMs = Number(argv[++index]);
     } else if (argument === "--device-profile") {
       encodedProfile = argv[++index] ?? "";
+    } else if (argument === "--vm-count") {
+      options.vmCount = Number(argv[++index]);
+    } else if (argument === "--persistent-host") {
+      options.persistentHost = true;
     } else {
       throw new Error(`未知参数：${argument}`);
     }
@@ -184,12 +234,13 @@ function parseArguments(argv) {
       "probe-log1",
       "live-token",
       "challenge-worker",
+      "challenge-host",
       "profile-token",
     ].includes(options.mode)
   ) {
     throw new Error(
-      "mode 必须是 probe-log1、live-token、profile-token "
-        + "或 challenge-worker，"
+      "mode 必须是 probe-log1、live-token、profile-token、"
+        + "challenge-worker 或 challenge-host，"
         + `实际为 ${options.mode}`,
     );
   }
@@ -198,6 +249,16 @@ function parseArguments(argv) {
   }
   if (!Number.isInteger(options.timeoutMs) || options.timeoutMs < 1_000) {
     throw new Error("--timeout-ms 必须是至少 1000 的整数");
+  }
+  if (
+    !Number.isInteger(options.vmCount)
+    || options.vmCount < 1
+    || options.vmCount > HOST_MAX_VM_COUNT
+  ) {
+    throw new Error(`--vm-count 必须是 1..${HOST_MAX_VM_COUNT} 的整数`);
+  }
+  if (options.persistentHost && options.mode !== "challenge-host") {
+    throw new Error("--persistent-host 只能用于 challenge-host");
   }
   options.networkEnabled = DEVICE_TOKEN_MODES.includes(options.mode);
   // 画像是必填的：没有它就没有"本轮这台设备"，也就无从与 Python 的 HTTP 头和
@@ -2107,6 +2168,17 @@ function parseWorkerCompletionPayload(payload) {
 
 
 async function readWorkerCompletionInput() {
+  if (multiplexSessionId() !== null) {
+    const payload = await new Promise((resolve, reject) => {
+      const fail = () => reject(
+        new Error("challenge-worker stdin 不是有效 JSON"),
+      );
+      parentPort.once("message", resolve);
+      parentPort.once("messageerror", fail);
+    });
+    return parseWorkerCompletionPayload(payload);
+  }
+
   const chunks = [];
   let length = 0;
   let source;
@@ -2154,6 +2226,230 @@ async function readWorkerCompletionInput() {
 }
 
 
+function writeHostOutput(payload) {
+  fs.writeFileSync(1, `${JSON.stringify(payload)}\n`);
+}
+
+
+async function runChallengeHost(options, source) {
+  if (!isMainThread) {
+    throw new Error("challenge-host 只能在 Node 主线程运行");
+  }
+
+  const input = createInterface({
+    input: process.stdin,
+    crlfDelay: Infinity,
+    terminal: false,
+  });
+  const states = new Map();
+  let remaining = options.vmCount;
+  let settled = false;
+  let resolveDone;
+  let rejectDone;
+  const done = new Promise((resolve, reject) => {
+    resolveDone = resolve;
+    rejectDone = reject;
+  });
+
+  const settleFailure = (error) => {
+    if (!settled) {
+      settled = true;
+      rejectDone(error);
+    }
+  };
+  const finishSlot = (state, worker) => {
+    if (state.worker !== worker || state.terminal) {
+      return;
+    }
+    state.worker = null;
+    state.terminal = true;
+    if (options.persistentHost) {
+      if (state.restartRequested && !settled) {
+        state.restartRequested = false;
+        startSlot(state);
+      }
+      return;
+    }
+    remaining -= 1;
+    if (remaining === 0 && !settled) {
+      settled = true;
+      input.close();
+      resolveDone();
+    }
+  };
+  const reportSlotError = (state, worker) => {
+    if (
+      state.worker !== worker
+      || state.errorReported
+      || state.cancelled
+      || state.completed
+    ) {
+      return;
+    }
+    state.errorReported = true;
+    writeHostOutput({
+      sessionId: state.sessionId,
+      stage: "error",
+      error: safeDeviceBridgeFailureMessage(),
+    });
+  };
+
+  function startSlot(state) {
+    const worker = new Worker(new URL(import.meta.url), {
+      workerData: {
+        challengeSessionId: state.sessionId,
+        options: {
+          ...options,
+          mode: "challenge-worker",
+          networkEnabled: true,
+          vmCount: 1,
+        },
+        source,
+      },
+    });
+    state.cancelled = false;
+    state.commandSent = false;
+    state.completed = false;
+    state.errorReported = false;
+    state.terminal = false;
+    state.worker = worker;
+
+    worker.on("message", (payload) => {
+      if (
+        state.worker !== worker
+        || payload === null
+        || typeof payload !== "object"
+        || Array.isArray(payload)
+        || payload.sessionId !== state.sessionId
+        || !["init", "verify", "error"].includes(payload.stage)
+      ) {
+        reportSlotError(state, worker);
+        void worker.terminate();
+        return;
+      }
+      writeHostOutput(payload);
+      if (payload.stage === "verify") {
+        state.completed = true;
+        void worker.terminate();
+      } else if (payload.stage === "error") {
+        state.errorReported = true;
+        void worker.terminate();
+      }
+    });
+    worker.once("error", () => {
+      reportSlotError(state, worker);
+    });
+    worker.once("exit", () => {
+      // 没有 verify/error/cancel 就退出，即使 exit code 为 0 也是槽位失败。
+      reportSlotError(state, worker);
+      finishSlot(state, worker);
+    });
+  }
+
+  for (let sessionId = 0; sessionId < options.vmCount; sessionId += 1) {
+    const state = {
+      cancelled: false,
+      commandSent: false,
+      completed: false,
+      errorReported: false,
+      restartRequested: false,
+      sessionId,
+      terminal: true,
+      worker: null,
+    };
+    states.set(sessionId, state);
+    startSlot(state);
+  }
+
+  input.on("line", (line) => {
+    try {
+      if (
+        !line
+        || Buffer.byteLength(line, "utf8") > HOST_COMMAND_MAX_BYTES
+      ) {
+        throw new Error("challenge-host 命令无效");
+      }
+      const command = JSON.parse(line);
+      if (
+        command === null
+        || typeof command !== "object"
+        || Array.isArray(command)
+        || !Number.isInteger(command.sessionId)
+      ) {
+        throw new Error("challenge-host 命令无效");
+      }
+      const state = states.get(command.sessionId);
+      if (!state) {
+        throw new Error("challenge-host 会话无效");
+      }
+      if (
+        command.reset === true
+        && Object.keys(command).length === 2
+      ) {
+        if (!options.persistentHost) {
+          throw new Error("challenge-host 不支持重建会话");
+        }
+        if (state.restartRequested) {
+          return;
+        }
+        if (state.terminal) {
+          startSlot(state);
+          return;
+        }
+        state.restartRequested = true;
+        state.commandSent = true;
+        state.cancelled = true;
+        void state.worker.terminate();
+        return;
+      }
+      if (
+        command.cancel === true
+        && Object.keys(command).length === 2
+      ) {
+        if (state.terminal || state.cancelled) {
+          return;
+        }
+        state.commandSent = true;
+        state.cancelled = true;
+        void state.worker?.terminate();
+        return;
+      }
+      if (state.terminal || state.commandSent) {
+        throw new Error("challenge-host 会话无效");
+      }
+      const { sessionId: _sessionId, ...completion } = command;
+      state.commandSent = true;
+      state.worker.postMessage(parseWorkerCompletionPayload(completion));
+    } catch (error) {
+      settleFailure(error);
+    }
+  });
+  input.once("close", () => {
+    if (options.persistentHost && !settled) {
+      settled = true;
+      resolveDone();
+      return;
+    }
+    if (remaining > 0) {
+      settleFailure(new Error("challenge-host stdin 提前关闭"));
+    }
+  });
+
+  try {
+    await done;
+  } finally {
+    input.close();
+    process.stdin.pause();
+    for (const state of states.values()) {
+      if (!state.terminal) {
+        state.cancelled = true;
+        void state.worker?.terminate();
+      }
+    }
+  }
+}
+
+
 async function replayFeiLinInteractionEvents(context, events) {
   let previousX = null;
   let previousY = null;
@@ -2193,8 +2489,16 @@ async function replayFeiLinInteractionEvents(context, events) {
 
 
 async function main() {
-  const options = parseArguments(process.argv);
-  const source = fs.readFileSync(options.sdkPath, "utf8");
+  const options = multiplexSessionId() === null
+    ? parseArguments(process.argv)
+    : workerData.options;
+  const source = multiplexSessionId() === null
+    ? fs.readFileSync(options.sdkPath, "utf8")
+    : workerData.source;
+  if (options.mode === "challenge-host") {
+    await runChallengeHost(options, source);
+    return;
+  }
   let captured = null;
   let log1DataPlaintext = null;
   let runtimeConfig = null;
@@ -2316,18 +2620,15 @@ async function main() {
       if (!getterOwner) {
         throw new Error("challenge-worker 等待 getToken 超时");
       }
-      fs.writeFileSync(
-        1,
-        `${JSON.stringify({
-          stage: "init",
-          deviceToken,
-          deviceConfig,
-          verifyArgProfile,
-          tokenSource,
-          requestCount: requests.length,
-          requests: summarizeRequests(),
-        })}\n`,
-      );
+      writeBridgeOutput({
+        stage: "init",
+        deviceToken,
+        deviceConfig,
+        verifyArgProfile,
+        tokenSource,
+        requestCount: requests.length,
+        requests: summarizeRequests(),
+      });
       const completion = await readWorkerCompletionInput();
       getterOwner = selectFeiLinGetterOwner(context);
       if (!getterOwner) {
@@ -2348,21 +2649,21 @@ async function main() {
         getterOwner,
         completion.getterArguments,
       );
-      fs.writeFileSync(
-        1,
-        `${JSON.stringify({
-          stage: "verify",
-          deviceToken,
-          verifyDeviceToken,
-          deviceConfig,
-          verifyArgProfile,
-          tokenSource: "pe-getToken",
-          getterArgumentCount: completion.getterArguments.length,
-          interactionEventCount: completion.interactionEvents.length,
-          requestCount: requests.length,
-          requests: summarizeRequests(),
-        })}\n`,
-      );
+      writeBridgeOutput({
+        stage: "verify",
+        deviceToken,
+        verifyDeviceToken,
+        deviceConfig,
+        verifyArgProfile,
+        tokenSource: "pe-getToken",
+        getterArgumentCount: completion.getterArguments.length,
+        interactionEventCount: completion.interactionEvents.length,
+        requestCount: requests.length,
+        requests: summarizeRequests(),
+      });
+      if (multiplexSessionId() !== null) {
+        return;
+      }
       process.exit(0);
     }
 
@@ -2453,8 +2754,11 @@ export {
 
 
 if (
-  process.argv[1]
-  && import.meta.url === pathToFileURL(process.argv[1]).href
+  multiplexSessionId() !== null
+  || (
+    process.argv[1]
+    && import.meta.url === pathToFileURL(process.argv[1]).href
+  )
 ) {
   process.on("uncaughtException", writeFatalError);
   process.on("unhandledRejection", writeFatalError);

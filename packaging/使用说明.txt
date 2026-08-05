@@ -10,7 +10,8 @@
 
 1. 把整个文件夹解压出来（不要只复制 AliSlider.exe，运行时都在同级目录里）。
 2. 双击 AliSlider.exe 将直接启动快速 HTTP API：5 并发、共享 HTTP 连接池，
-   启动时会准备 5 个常驻设备会话，不再显示启动菜单。
+   启动时会用 2 个 Node host 准备 5 个隔离 VM（3+2），不再显示启动菜单。
+   任一请求结束后只重建对应 VM；第 6 个请求按 429 退避后不用等前 5 个全结束。
 3. 服务就绪后会打印接口文档链接，并自动使用默认浏览器打开：
    http://127.0.0.1:8000/docs
 4. 在接口文档页填写参数并点击“发送请求”，页面和 EXE 窗口都会显示
@@ -41,7 +42,8 @@ Python：
 
   import requests
   r = requests.post("http://127.0.0.1:8000/api/slider",
-                    json={"SceneId": "1ug4aptr"})
+                    json={"SceneId": "1ug4aptr"},
+                    timeout=(10, 90))
   print(r.json())
 
 浏览器直接打开（GET 等价写法）：
@@ -67,8 +69,13 @@ Python：
   VerifyResult   服务端判定结果
   certifyId      本轮挑战 ID
   elapsedMs      本轮总耗时
+  traceId        多线程日志关联 ID
+  timingsMs      每个步骤的耗时：准备、等待预热会话、设备会话、Init、资源下载、
+                 图像识别、PE 数据、设备 Token、Verify、清理、总计
 
 状态码：400 入参不合法（不消耗挑战）、429 超出并发上限、500 协议或运行错误。
+429 会返回 retryAfterMs、recommendedClientTimeoutMs，并带 Retry-After 响应头。
+必须等待后再重试，不能在 15 秒超时后立即循环发包；慢机器建议读超时先设 90 秒。
 验证码没通过仍然是一次正常往返，返回 200 且 ok=false。
 
 
@@ -88,10 +95,13 @@ Python：
   --port 8010                    换监听端口
   --host 0.0.0.0                 允许局域网访问（默认只监听本机）
   --max-concurrency 4            限制同时进行的挑战数
+  --vms-per-node 3              快速模式每个 Node 的隔离 VM 数（1..8）
   --runtime-mode fast            快速模式：固定本进程画像并按并发容量预热
   --runtime-mode standard        标准模式：逐轮画像，不做设备会话预热
   --open-docs                    启动后在默认浏览器打开接口文档
   --timeout 30                   单步网络/子进程超时秒数
+
+注意：--timeout 不是调用端 HTTP 总超时。调用端总超时必须大于实际 elapsedMs。
 
 先跑 AliSlider.exe solve 是确认环境是否正常的最省事办法：它不发送 Verify，
 因此不消耗挑战。

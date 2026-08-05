@@ -34,20 +34,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import secrets
+import select
+import socket
 import sys
 import threading
 import time
 import webbrowser
+from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Executor, ThreadPoolExecutor
-from contextlib import closing
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from .. import __version__, config
-from ..challenge.device_pool import DeviceSessionPool
+from ..challenge.device_pool import DeviceSessionPool, MAX_VMS_PER_NODE
 from ..challenge.session import normalize_proxies
 from ..challenge.transport import SharedHttpAdapterPool, warm_connections
 from ..device_profile import DeviceProfile, generate_device_profile
@@ -66,6 +69,22 @@ _RPC_KEY_ID_MAX_LENGTH = 128
 _PREFIX_MAX_LENGTH = 32
 _DOCS_PATH = "/docs"
 _OPENAPI_PATH = "/openapi.json"
+_OUTPUT_LOCK = threading.Lock()
+
+_STEP_LABELS = {
+    "setup": "准备运行环境",
+    "devicePoolWait": "等待预热会话",
+    "deviceSession": "取得设备会话",
+    "init": "InitCaptchaV3",
+    "downloadAssets": "下载挑战资源",
+    "vision": "识别缺口",
+    "buildVerifyData": "生成 Verify 数据",
+    "completeDevice": "刷新设备 Token",
+    "verify": "VerifyCaptchaV3",
+    "uploadLog": "读取 UploadLog",
+    "clientCleanup": "回收本轮资源",
+    "total": "本轮总耗时",
+}
 
 
 _DOCS_HTML = """<!doctype html>
@@ -121,6 +140,7 @@ _DOCS_HTML = """<!doctype html>
       <button type="submit" class="wide">发送请求</button>
     </form>
     <h3>完整响应</h3>
+    <div class="muted">timingsMs 给出每个步骤耗时；慢机器调用端读超时建议至少 90 秒。</div>
     <pre id="response">点击“发送请求”后，这里会显示 HTTP 状态码和完整 JSON 返回。</pre>
   </div>
   <div class="card links">
@@ -196,9 +216,43 @@ def _openapi_document() -> dict[str, Any]:
                         },
                     },
                     "responses": {
-                        "200": {"description": "完整验证结果"},
+                        "200": {
+                            "description": "完整验证结果（含分步骤耗时）",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "elapsedMs": {
+                                                "type": "integer",
+                                                "minimum": 0,
+                                            },
+                                            "timingsMs": {
+                                                "type": "object",
+                                                "additionalProperties": {
+                                                    "type": "integer",
+                                                    "minimum": 0,
+                                                },
+                                            },
+                                            "traceId": {"type": "string"},
+                                        },
+                                    }
+                                }
+                            },
+                        },
                         "400": {"description": "请求参数无效"},
-                        "429": {"description": "超出并发上限"},
+                        "429": {
+                            "description": "超出并发上限；按返回值退避",
+                            "headers": {
+                                "Retry-After": {
+                                    "description": "建议等待秒数",
+                                    "schema": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                    },
+                                }
+                            },
+                        },
                         "500": {"description": "协议或运行错误"},
                     },
                 }
@@ -236,7 +290,23 @@ def _print_full_result(
         return
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     rendered = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
-    print(f"[{stamp}] {method} {path} {status}\n{rendered}", file=sys.stderr)
+    with _OUTPUT_LOCK:
+        print(
+            f"[{stamp}] {method} {path} {status}\n{rendered}",
+            file=sys.stderr,
+        )
+
+
+def _print_step_result(trace_id: str, name: str, elapsed_ms: int) -> None:
+    """按 traceId 原子打印阶段耗时，避免 5 线程日志互相串行。"""
+
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    label = _STEP_LABELS.get(name, name)
+    with _OUTPUT_LOCK:
+        print(
+            f"[{stamp}] [{trace_id}] {label}: {elapsed_ms} ms",
+            file=sys.stderr,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,6 +385,8 @@ def solve_once(
     device_profile: DeviceProfile | None = None,
     transport_pool: SharedHttpAdapterPool | None = None,
     upload_executor: Executor | None = None,
+    timing_hook: Callable[[str, int], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """执行一轮完整挑战并返回响应体。
 
@@ -325,43 +397,107 @@ def solve_once(
     会话、一个 ``CertifyId`` 的语义；未开启时行为与之前完全一致。
     """
 
-    # 标准模式逐轮生成；快速模式由服务入口传入本进程固定画像。无论哪种模式，
-    # 同一轮的 HTTP 头、FeiLin 指纹与动态 PE 环境始终共用同一个对象。
-    device_profile = device_profile or generate_device_profile()
-    client = settings.build_client(
-        scene_id=request.scene_id,
-        prefix=request.prefix,
-        proxies=request.proxies,
-        rpc_key_id=request.rpc_key_id,
-        device_profile=device_profile,
-        adapter=(
-            transport_pool.get(request.proxies)
-            if transport_pool is not None
-            else None
-        ),
-        upload_executor=upload_executor,
-    )
-    device_runtime = settings.build_device_runtime(
-        prefix=request.prefix,
-        proxies=request.proxies,
-        device_profile=device_profile,
-    )
-    with closing(client):
-        # 视觉解释器的冷导入与 DeviceToken、Init、资源下载重叠；五个出网主机的
-        # TLS 握手与设备链重叠。
-        client.prewarm_vision()
-        client.prewarm_connections()
-        started = time.monotonic()
+    timings_ms: dict[str, int] = {}
+    overall_started = time.monotonic()
+
+    def report_step(name: str, elapsed_ms: int) -> None:
+        timings_ms[name] = max(0, int(elapsed_ms))
+        if timing_hook is not None:
+            try:
+                timing_hook(name, timings_ms[name])
+            except Exception:
+                # 展示回调不参与协议控制流。
+                pass
+
+    client: Any | None = None
+    try:
+        if cancel_check is not None:
+            cancel_check()
+        setup_started = time.monotonic()
+        try:
+            # 标准模式逐轮生成；快速模式由服务入口传入本进程固定画像。无论哪种
+            # 模式，同一轮 HTTP 头、FeiLin 指纹与动态 PE 环境共用同一个对象。
+            device_profile = device_profile or generate_device_profile()
+            client = settings.build_client(
+                scene_id=request.scene_id,
+                prefix=request.prefix,
+                proxies=request.proxies,
+                rpc_key_id=request.rpc_key_id,
+                device_profile=device_profile,
+                adapter=(
+                    transport_pool.get(request.proxies)
+                    if transport_pool is not None
+                    else None
+                ),
+                upload_executor=upload_executor,
+            )
+            device_runtime = settings.build_device_runtime(
+                prefix=request.prefix,
+                proxies=request.proxies,
+                device_profile=device_profile,
+            )
+            # 视觉解释器的冷导入与 DeviceToken、Init、资源下载重叠；五个出网
+            # 主机的 TLS 握手与设备链重叠。
+            client.prewarm_vision()
+            client.prewarm_connections()
+        finally:
+            report_step(
+                "setup", int((time.monotonic() - setup_started) * 1000)
+            )
+
+        if cancel_check is not None:
+            cancel_check()
         if pool is None:
+            report_step("devicePoolWait", 0)
             outcome = client.run_captcha(
-                device_runtime, minimum_confidence=settings.minimum_confidence
+                device_runtime,
+                minimum_confidence=settings.minimum_confidence,
+                timing_hook=report_step,
+                cancel_check=cancel_check,
             )
         else:
-            with pool.lease(device_runtime) as leased:
-                outcome = client.run_captcha(
-                    leased, minimum_confidence=settings.minimum_confidence
-                )
-        elapsed_ms = int((time.monotonic() - started) * 1000)
+            pool_wait_started = time.monotonic()
+            pool_wait_reported = False
+            try:
+                with pool.lease(
+                    device_runtime, cancel_check=cancel_check
+                ) as leased:
+                    report_step(
+                        "devicePoolWait",
+                        int(
+                            (time.monotonic() - pool_wait_started) * 1000
+                        ),
+                    )
+                    pool_wait_reported = True
+                    if cancel_check is not None:
+                        cancel_check()
+                    outcome = client.run_captcha(
+                        leased,
+                        minimum_confidence=settings.minimum_confidence,
+                        timing_hook=report_step,
+                        cancel_check=cancel_check,
+                    )
+            finally:
+                if not pool_wait_reported:
+                    report_step(
+                        "devicePoolWait",
+                        int(
+                            (time.monotonic() - pool_wait_started) * 1000
+                        ),
+                    )
+    finally:
+        cleanup_started = time.monotonic()
+        try:
+            if client is not None:
+                client.close()
+        finally:
+            report_step(
+                "clientCleanup",
+                int((time.monotonic() - cleanup_started) * 1000),
+            )
+            report_step(
+                "total", int((time.monotonic() - overall_started) * 1000)
+            )
 
     verify = outcome.verify
     return {
@@ -372,18 +508,97 @@ def solve_once(
         "certifyId": verify.certify_id,
         "sceneId": request.scene_id,
         "proxied": request.proxies is not None,
-        "elapsedMs": elapsed_ms,
+        "elapsedMs": timings_ms["total"],
+        "timingsMs": timings_ms,
     }
 
 
-class _Unlimited:
-    """不限并发时的槽位占位，让处理逻辑无需分支判断。"""
+class _ChallengeSlots:
+    """有界并发闸门，并根据近期耗时给 429 生成可执行的退避信息。"""
+
+    def __init__(self, limit: int) -> None:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("并发上限必须是非负整数")
+        self.limit = limit
+        self._semaphore = (
+            threading.BoundedSemaphore(limit) if limit > 0 else None
+        )
+        self._lock = threading.Lock()
+        self._active_started: dict[int, float] = {}
+        self._durations_ms: deque[int] = deque(maxlen=32)
 
     def acquire(self, blocking: bool = True) -> bool:
+        if self._semaphore is not None and not self._semaphore.acquire(
+            blocking=blocking
+        ):
+            return False
+        with self._lock:
+            self._active_started[threading.get_ident()] = time.monotonic()
         return True
 
-    def release(self) -> None:
-        return None
+    def release(self, *, elapsed_ms: int | None = None) -> None:
+        with self._lock:
+            self._active_started.pop(threading.get_ident(), None)
+            if elapsed_ms is not None:
+                self._durations_ms.append(max(0, int(elapsed_ms)))
+        if self._semaphore is not None:
+            self._semaphore.release()
+
+    def overload_info(self, *, fallback_ms: int) -> dict[str, int]:
+        """返回活动数、下一次重试时间和调用端总超时建议。"""
+
+        now = time.monotonic()
+        fallback_ms = max(1_000, int(fallback_ms))
+        with self._lock:
+            active_started = tuple(self._active_started.values())
+            durations = sorted(self._durations_ms)
+
+        if durations:
+            # 样本少时最大值比虚假的精确分位数更稳；最多只保留最近 32 轮。
+            baseline_ms = durations[-1]
+        else:
+            baseline_ms = fallback_ms
+        remaining = [
+            max(1_000, baseline_ms - int((now - started) * 1000))
+            for started in active_started
+        ]
+        retry_after_ms = min(remaining, default=baseline_ms)
+        recommended_timeout_ms = max(
+            fallback_ms * 2,
+            int(baseline_ms * 1.5),
+            30_000,
+        )
+        return {
+            "activeChallenges": len(active_started),
+            "maxConcurrency": self.limit,
+            "retryAfterMs": retry_after_ms,
+            "recommendedClientTimeoutMs": recommended_timeout_ms,
+        }
+
+
+class _Unlimited(_ChallengeSlots):
+    """不限并发时仍记录活动请求，保持处理逻辑一致。"""
+
+    def __init__(self) -> None:
+        super().__init__(0)
+
+
+class _ClientDisconnected(Exception):
+    """HTTP 调用端已放弃等待；本轮在下一个安全阶段边界停止。"""
+
+
+def _connection_closed(connection: Any) -> bool:
+    """非阻塞检测明文 HTTP socket 是否收到 FIN/RST。"""
+
+    try:
+        readable, _, _ = select.select((connection,), (), (), 0)
+        if not readable:
+            return False
+        return connection.recv(1, socket.MSG_PEEK) == b""
+    except (BlockingIOError, InterruptedError):
+        return False
+    except OSError:
+        return True
 
 
 class SliderApiHandler(BaseHTTPRequestHandler):
@@ -409,6 +624,9 @@ class SliderApiHandler(BaseHTTPRequestHandler):
     赋值请用**可调用对象**或 ``staticmethod``：这是类属性，直接挂一个普通函数会
     被描述符协议当成方法绑定，第一个实参会变成 handler 自己。
     """
+
+    progress_hook: Callable[[str, str, int], None] | None = None
+    """可选阶段回调，参数为 ``(trace_id, 阶段名, 耗时毫秒)``。"""
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 约定。
         if urlsplit(self.path).path != config.API_SOLVE_PATH:
@@ -459,18 +677,59 @@ class SliderApiHandler(BaseHTTPRequestHandler):
             self._send_error(400, exc)
             return
 
-        # 按入口计算出的并发上限拒绝超额请求，避免排队让调用方一起超时。每轮
-        # 挑战仍是互相独立的 CertifyId，不共享会话或 worker。
+        trace_id = secrets.token_hex(6)
+
+        # 保留有界背压，避免调用端 15 秒超时后继续发包把慢机器压得更慢。429
+        # 附带动态退避时间；调用端必须等待，不能立即循环重发。
         if not self.slots.acquire(blocking=False):
+            fallback_ms = int(self.settings.timeout * 1000)
+            overload_info = (
+                self.slots.overload_info(fallback_ms=fallback_ms)
+                if hasattr(self.slots, "overload_info")
+                else {
+                    "activeChallenges": 0,
+                    "maxConcurrency": 0,
+                    "retryAfterMs": fallback_ms,
+                    "recommendedClientTimeoutMs": fallback_ms * 2,
+                }
+            )
+            retry_after_seconds = max(
+                1, (overload_info["retryAfterMs"] + 999) // 1000
+            )
             self._send_json(
                 429,
                 {
                     "ok": False,
                     "errorType": "TooManyChallenges",
-                    "error": "已达并发挑战上限，请稍后重试",
+                    "error": (
+                        "并发已满，旧请求仍在服务端运行；请按 retryAfterMs "
+                        "退避，不要在 15 秒超时后立即重发"
+                    ),
+                    "traceId": trace_id,
+                    **overload_info,
+                },
+                headers={
+                    "Retry-After": str(retry_after_seconds),
+                    "X-Trace-ID": trace_id,
                 },
             )
             return
+
+        request_started = time.monotonic()
+        timings_ms: dict[str, int] = {}
+
+        def report_step(name: str, elapsed_ms: int) -> None:
+            timings_ms[name] = elapsed_ms
+            hook = self.progress_hook
+            if hook is not None:
+                try:
+                    hook(trace_id, name, elapsed_ms)
+                except Exception:
+                    pass
+
+        def ensure_client_connected() -> None:
+            if _connection_closed(self.connection):
+                raise _ClientDisconnected
 
         try:
             body = solve_once(
@@ -480,9 +739,21 @@ class SliderApiHandler(BaseHTTPRequestHandler):
                 device_profile=self.device_profile,
                 transport_pool=self.transport_pool,
                 upload_executor=self.upload_executor,
+                timing_hook=report_step,
+                cancel_check=ensure_client_connected,
             )
+            body["traceId"] = trace_id
+        except _ClientDisconnected:
+            # 客户端已经放弃结果，不再发送错误响应；run_captcha 已在安全阶段边界
+            # 停止，finally 会立即释放并发槽。
+            return
         except (AliSliderError, ValueError) as exc:
-            self._send_error(500, exc)
+            self._send_error(
+                500,
+                exc,
+                extra={"traceId": trace_id, "timingsMs": timings_ms},
+                headers={"X-Trace-ID": trace_id},
+            )
             return
         except Exception:
             # 与 CLI 一致：不把未预期异常的内容回给调用方。
@@ -492,14 +763,23 @@ class SliderApiHandler(BaseHTTPRequestHandler):
                     "ok": False,
                     "errorType": "UnhandledProtocolError",
                     "error": "未处理的协议运行错误",
+                    "traceId": trace_id,
+                    "timingsMs": timings_ms,
                 },
+                headers={"X-Trace-ID": trace_id},
             )
             return
         finally:
-            self.slots.release()
+            elapsed_ms = int((time.monotonic() - request_started) * 1000)
+            try:
+                self.slots.release(elapsed_ms=elapsed_ms)
+            except TypeError:  # 兼容自定义的标准 Semaphore。
+                self.slots.release()
 
         # 验证码未通过也是一次完整、正常的协议往返，用 200 承载 ok=false。
-        self._send_json(200, body)
+        self._send_json(
+            200, body, headers={"X-Trace-ID": trace_id}
+        )
 
     def _read_json_body(self) -> dict[str, Any]:
         try:
@@ -521,7 +801,13 @@ class SliderApiHandler(BaseHTTPRequestHandler):
             raise ApiRequestError("请求体必须是 JSON object")
         return payload
 
-    def _send_json(self, status: int, body: dict[str, Any]) -> None:
+    def _send_json(
+        self,
+        status: int,
+        body: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         payload = json.dumps(
             body, ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")
@@ -529,6 +815,7 @@ class SliderApiHandler(BaseHTTPRequestHandler):
             status,
             payload,
             content_type="application/json; charset=utf-8",
+            headers=headers,
         )
 
         hook = self.result_hook
@@ -539,12 +826,19 @@ class SliderApiHandler(BaseHTTPRequestHandler):
                 pass
 
     def _send_bytes(
-        self, status: int, payload: bytes, *, content_type: str
+        self,
+        status: int,
+        payload: bytes,
+        *,
+        content_type: str,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(payload)
 
@@ -554,14 +848,23 @@ class SliderApiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def _send_error(self, status: int, exc: Exception) -> None:
+    def _send_error(
+        self,
+        status: int,
+        exc: Exception,
+        *,
+        extra: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self._send_json(
             status,
             {
                 "ok": False,
                 "errorType": type(exc).__name__,
                 "error": str(exc),
+                **(extra or {}),
             },
+            headers=headers,
         )
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -590,6 +893,10 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.max_concurrency < 0:
         raise SystemExit("--max-concurrency 必须 >= 0")
+    if not 1 <= args.vms_per_node <= MAX_VMS_PER_NODE:
+        raise SystemExit(
+            f"--vms-per-node 必须位于 1..{MAX_VMS_PER_NODE}"
+        )
     if not 0.0 <= args.min_confidence <= 1.0:
         raise SystemExit("--min-confidence 必须位于 0..1")
 
@@ -599,13 +906,10 @@ def main(argv: list[str] | None = None) -> int:
     fixed_profile = generate_device_profile() if fast_mode else None
 
     SliderApiHandler.settings = settings
-    SliderApiHandler.slots = (
-        threading.BoundedSemaphore(concurrency)
-        if concurrency > 0
-        else _Unlimited()
-    )
+    SliderApiHandler.slots = _ChallengeSlots(concurrency)
     SliderApiHandler.device_profile = fixed_profile
     SliderApiHandler.result_hook = staticmethod(_print_full_result)
+    SliderApiHandler.progress_hook = staticmethod(_print_step_result)
     transport_pool = (
         SharedHttpAdapterPool(
             pool_size=max(concurrency, 8),
@@ -625,7 +929,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     SliderApiHandler.upload_executor = upload_executor
     device_pool = (
-        DeviceSessionPool(enabled=True, capacity=max(concurrency, 1))
+        DeviceSessionPool(
+            enabled=True,
+            capacity=max(concurrency, 1),
+            vms_per_node=args.vms_per_node,
+        )
         if fast_mode
         else None
     )
@@ -658,8 +966,12 @@ def main(argv: list[str] | None = None) -> int:
         if concurrency > 0
         else "不限并发"
     )
+    node_hosts = (
+        max(concurrency, 1) + args.vms_per_node - 1
+    ) // args.vms_per_node
     mode_label = (
-        f"快速模式，预热 {prewarmed}/{max(concurrency, 1)}"
+        f"快速模式，预热 {prewarmed}/{max(concurrency, 1)} VM，"
+        f"{node_hosts} 个 Node host（每个最多 {args.vms_per_node} VM）"
         if fast_mode
         else "标准模式"
     )

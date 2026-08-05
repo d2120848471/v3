@@ -42,9 +42,9 @@ from http.server import ThreadingHTTPServer
 from typing import Any
 
 from .. import __version__, config
-from ..challenge.device_pool import DeviceSessionPool
+from ..challenge.device_pool import DeviceSessionPool, MAX_VMS_PER_NODE
 from ..device_profile import generate_device_profile
-from .api import SliderApiHandler, _Unlimited
+from .api import SliderApiHandler, _ChallengeSlots, _STEP_LABELS
 from .api import main as api_main
 from .cli import main as cli_main
 from .options import (
@@ -243,7 +243,8 @@ def _print_usage(base_url: str, palette: _Palette) -> None:
             "Python",
             [
                 "import requests",
-                f'r = requests.post("{solve_url}", json={{"SceneId": "{scene}"}})',
+                f'r = requests.post("{solve_url}", json={{"SceneId": "{scene}"}},',
+                "                  timeout=(10, 90))",
                 "print(r.json())",
             ],
         ),
@@ -265,6 +266,10 @@ def _print_usage(base_url: str, palette: _Palette) -> None:
     print(
         f"  {palette.dim}健康检查：{base_url}{config.API_HEALTH_PATH}"
         f"{palette.reset}"
+    )
+    print(
+        f"  {palette.dim}慢机器不要使用 15 秒读超时；429 请按响应里的 "
+        f"retryAfterMs 退避{palette.reset}"
     )
 
 
@@ -314,17 +319,49 @@ class _ConsoleReporter:
                 print(f"    {palette.dim}{label:<11}{palette.reset}{value}")
             sys.stdout.flush()
 
+    def report_step(self, trace_id: str, name: str, elapsed_ms: int) -> None:
+        """实时打印单步耗时；traceId 用来区分同时运行的 5 个请求。"""
+
+        palette = self.palette
+        stamp = time.strftime("%H:%M:%S")
+        label = _STEP_LABELS.get(name, name)
+        with self._lock:
+            print(
+                f"{palette.dim}[{stamp}] [{trace_id}]{palette.reset} "
+                f"{label}: {elapsed_ms} ms"
+            )
+            sys.stdout.flush()
+
     def _body_lines(
         self, status: int, body: dict[str, Any]
     ) -> list[tuple[str, str]]:
         palette = self.palette
         if not body.get("ok", False):
             if "error" in body:
-                return [
+                lines = [
                     ("结果", f"{palette.red}失败{palette.reset}"),
                     ("类型", str(body.get("errorType", "-"))),
                     ("说明", str(body.get("error", "-"))),
                 ]
+                if "activeChallenges" in body:
+                    lines.extend(
+                        [
+                            (
+                                "当前并发",
+                                f"{body['activeChallenges']}/"
+                                f"{body.get('maxConcurrency', '-')}",
+                            ),
+                            (
+                                "建议重试",
+                                f"{body.get('retryAfterMs', '-')} ms 后",
+                            ),
+                            (
+                                "客户端超时",
+                                f">= {body.get('recommendedClientTimeoutMs', '-')} ms",
+                            ),
+                        ]
+                    )
+                return lines
             # 协议往返正常但验证码没过：VerifyCode 才是原因。
             return [
                 ("结果", f"{palette.yellow}未通过{palette.reset}"),
@@ -449,6 +486,10 @@ def run_console(argv: list[str]) -> int:
     args = build_parser().parse_args(argv)
     if args.max_concurrency < 0:
         raise SystemExit("--max-concurrency 必须 >= 0")
+    if not 1 <= args.vms_per_node <= MAX_VMS_PER_NODE:
+        raise SystemExit(
+            f"--vms-per-node 必须位于 1..{MAX_VMS_PER_NODE}"
+        )
     if not 0.0 <= args.min_confidence <= 1.0:
         raise SystemExit("--min-confidence 必须位于 0..1")
 
@@ -480,17 +521,19 @@ def _serve(args: argparse.Namespace, palette: _Palette) -> int:
         return 1
 
     _ConsoleHandler.settings = settings
-    _ConsoleHandler.slots = (
-        threading.BoundedSemaphore(concurrency)
-        if concurrency > 0
-        else _Unlimited()
-    )
+    _ConsoleHandler.slots = _ChallengeSlots(concurrency)
     _ConsoleHandler.device_profile = fixed_profile
-    _ConsoleHandler.result_hook = _ConsoleReporter(
+    reporter = _ConsoleReporter(
         palette=palette, show_token=args.show_token
     )
+    _ConsoleHandler.result_hook = reporter
+    _ConsoleHandler.progress_hook = staticmethod(reporter.report_step)
     device_pool = (
-        DeviceSessionPool(enabled=True, capacity=max(concurrency, 1))
+        DeviceSessionPool(
+            enabled=True,
+            capacity=max(concurrency, 1),
+            vms_per_node=args.vms_per_node,
+        )
         if fast_mode
         else None
     )
@@ -512,9 +555,13 @@ def _serve(args: argparse.Namespace, palette: _Palette) -> int:
     base_url = f"http://{host}:{port}"
     prewarmed = 0
     if device_pool is not None and fixed_profile is not None:
+        node_hosts = (
+            max(concurrency, 1) + args.vms_per_node - 1
+        ) // args.vms_per_node
         print(
             f"\n{palette.bold}快速模式预热{palette.reset}  "
-            f"正在并行准备 {max(concurrency, 1)} 个设备会话……"
+            f"正在准备 {node_hosts} 个 Node host / "
+            f"{max(concurrency, 1)} 个隔离 VM……"
         )
         prewarmed = device_pool.prime(
             settings.build_device_runtime(
@@ -524,7 +571,7 @@ def _serve(args: argparse.Namespace, palette: _Palette) -> int:
             )
         )
         print(
-            f"  {palette.green}已就绪 {prewarmed}/{max(concurrency, 1)}"
+            f"  {palette.green}已就绪 {prewarmed}/{max(concurrency, 1)} VM"
             f"{palette.reset}；后续按使用量补回，不做定时请求"
         )
 
@@ -713,7 +760,7 @@ def _select_startup_arguments(
 
     print(
         "\n请选择启动模式：\n"
-        "  1. 快速模式（推荐）  5 并发 + 5 个预热会话，兼顾单包与吞吐\n"
+        "  1. 快速模式（推荐）  5 并发 + 2 Node / 5 VM，兼顾单包与吞吐\n"
         "  2. 标准模式          1 并发 + 逐轮设备画像，不做投机预热\n"
         "  3. 自定义模式        自己选择并发数、端口与是否预热\n"
         "  4. 环境自检\n"

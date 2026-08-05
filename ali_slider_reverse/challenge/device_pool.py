@@ -16,7 +16,7 @@
 
 * 标准模式默认关闭，由部署方显式选择快速模式后才开启；
 * 快速模式可以在服务启动时按并发容量一次性预热；其后仍然是**需求驱动**——只在
-  会话被领用后补回容量，不做定时补货；
+  会话被领用并结束后原位重建对应 VM，不做定时补货；
 * **过期不重建**——备好的会话超龄就关掉丢弃，不会自动再起一个。流量因此随请求
   自然衰减到零，服务器空转时不会持续骚扰 FeiLin。
 
@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import Any
@@ -58,6 +58,9 @@ MAX_AGE_SECONDS = 20.0
 实测 30 秒老化的 DeviceToken 仍能拿到 T001，这里留一半余量。超过 30 秒的边界
 没有实测过，调大之前请先自己验。
 """
+
+MAX_VMS_PER_NODE = 8
+"""单个 Node host 允许的最大隔离 VM 槽位数。"""
 
 
 def configuration_key(client: DeviceRuntimeClient) -> str:
@@ -112,14 +115,24 @@ class DeviceSessionPool:
         enabled: bool = False,
         max_age_seconds: float = MAX_AGE_SECONDS,
         capacity: int = 1,
+        vms_per_node: int = 1,
     ) -> None:
         if max_age_seconds <= 0:
             raise ValueError("max_age_seconds 必须为正数")
         if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
             raise ValueError("capacity 必须是正整数")
+        if (
+            isinstance(vms_per_node, bool)
+            or not isinstance(vms_per_node, int)
+            or not 1 <= vms_per_node <= MAX_VMS_PER_NODE
+        ):
+            raise ValueError(
+                f"vms_per_node 必须是 1..{MAX_VMS_PER_NODE} 的整数"
+            )
         self.enabled = bool(enabled)
         self.max_age_seconds = float(max_age_seconds)
         self.capacity = capacity
+        self.vms_per_node = vms_per_node
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
         self._entries: list[_Entry] = []
@@ -131,21 +144,29 @@ class DeviceSessionPool:
     # -- 租借 -------------------------------------------------------------
 
     @contextmanager
-    def lease(self, client: DeviceRuntimeClient) -> Iterator[Any]:
+    def lease(
+        self,
+        client: DeviceRuntimeClient,
+        *,
+        cancel_check: Callable[[], None] | None = None,
+    ) -> Iterator[Any]:
         """借出一轮挑战要用的设备运行时，未命中时原样退化为现建。"""
 
         key = configuration_key(client)
         tracked = self._begin_lease(key)
-        entry = self._take(key, wait_seconds=client.timeout + 5.0)
+        entry: _Entry | None = None
         try:
+            entry = self._take(
+                key,
+                wait_seconds=client.timeout + 5.0,
+                cancel_check=cancel_check,
+            )
             yield _LeasedRuntime(client, entry)
         finally:
-            if entry is not None:
-                entry.close()
-            self._finish_lease(client, key, tracked=tracked)
+            self._finish_lease(client, key, tracked=tracked, entry=entry)
 
     def _begin_lease(self, key: str) -> bool:
-        """登记一条匹配请求，供补货逻辑识别仍在执行的同批请求。"""
+        """登记一条匹配请求，供滚动补货做容量核算。"""
 
         if not self.enabled:
             return False
@@ -165,26 +186,59 @@ class DeviceSessionPool:
         key: str,
         *,
         tracked: bool,
+        entry: _Entry | None,
     ) -> None:
-        """最后一条同批请求结束后再补货，避免 Node 进程争抢在途请求资源。"""
+        """释放请求占用，并在容量内滚动重建刚消费的 VM 槽位。"""
 
         if not tracked:
+            if entry is not None:
+                entry.close()
             return
+        stale: _Entry | None = None
+        recycle_thread: threading.Thread | None = None
         threads: tuple[threading.Thread, ...] = ()
-        with self._lock:
+        with self._condition:
             self._leased -= 1
-            if self._leased == 0:
-                # 在同一把锁内预留补货名额，避免最后一条请求退出与下一批请求
-                # 进入之间的竞态让补货被静默跳过。
-                threads = self._reserve_fill_locked(client, key)
+            if (
+                entry is not None
+                and not self._closed
+                and self._key == key
+                and bool(getattr(entry.session, "recyclable", False))
+                and callable(getattr(entry.session, "recycle", None))
+            ):
+                # 先计入 filling，再启动后台重建，确保活跃请求 + 就绪 VM +
+                # 重建 VM 始终不超过 capacity。
+                self._filling += 1
+                recycle_thread = threading.Thread(
+                    target=self._recycle,
+                    args=(client, key, entry),
+                    name="ali-device-vm-recycle",
+                    daemon=True,
+                )
+            else:
+                stale = entry
+            threads = self._reserve_fill_locked(client, key)
+            self._condition.notify_all()
+        if stale is not None:
+            stale.close()
+        if recycle_thread is not None:
+            recycle_thread.start()
         for thread in threads:
             thread.start()
 
-    def _take(self, key: str, *, wait_seconds: float) -> _Entry | None:
+    def _take(
+        self,
+        key: str,
+        *,
+        wait_seconds: float,
+        cancel_check: Callable[[], None] | None = None,
+    ) -> _Entry | None:
         """取出新鲜会话；已有补货在途时等待它，避免再冷建一整批。"""
 
         deadline = time.monotonic() + max(0.0, wait_seconds)
         while True:
+            if cancel_check is not None:
+                cancel_check()
             with self._condition:
                 if key != self._key or self._closed:
                     return None
@@ -194,7 +248,15 @@ class DeviceSessionPool:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         return None
-                    self._condition.wait(timeout=remaining)
+                    # HTTP 调用端可能已在 15 秒处放弃；短轮询只为检查断连，
+                    # 不改变补货完成时由 Condition 立即唤醒的正常路径。
+                    self._condition.wait(
+                        timeout=(
+                            min(remaining, 0.25)
+                            if cancel_check is not None
+                            else remaining
+                        )
+                    )
                     continue
                 else:
                     return None
@@ -242,15 +304,33 @@ class DeviceSessionPool:
             self._key = key
         if key != self._key:
             return ()
-        # 同一批挑战还在执行时启动下一批 Node worker，会与 PE、视觉和网络
-        # 收尾争抢 CPU/连接，既拖慢尾部请求，也会放大冷启动失败。等最后一条
-        # lease 退出后由 _finish_lease 一次性补齐即可。
-        if self._leased > 0:
-            return ()
-        missing = self.capacity - len(self._entries) - self._filling
+        # leased 包含正在使用或等待预热槽位的匹配请求。把它也计入容量，滚动
+        # 补货不会在慢请求尚未结束时额外放大 VM/网络工作量。
+        missing = (
+            self.capacity
+            - len(self._entries)
+            - self._filling
+            - self._leased
+        )
         if missing <= 0:
             return ()
         self._filling += missing
+        if self.vms_per_node > 1:
+            groups: list[int] = []
+            remaining = missing
+            while remaining > 0:
+                size = min(self.vms_per_node, remaining)
+                groups.append(size)
+                remaining -= size
+            return tuple(
+                threading.Thread(
+                    target=self._fill_group,
+                    args=(client, key, size),
+                    name=f"ali-device-host-prewarm-{index + 1}",
+                    daemon=True,
+                )
+                for index, size in enumerate(groups)
+            )
         return tuple(
             threading.Thread(
                 target=self._fill,
@@ -260,6 +340,99 @@ class DeviceSessionPool:
             )
             for index in range(missing)
         )
+
+    def _recycle(
+        self,
+        client: DeviceRuntimeClient,
+        key: str,
+        entry: _Entry,
+    ) -> None:
+        """在原 Node host 内重建一个 VM；失败时只补回这个缺口。"""
+
+        try:
+            entry.session.recycle()
+            entry.created_at = entry.session.initialized_at or time.monotonic()
+        except Exception:
+            entry.close()
+            with self._condition:
+                self._filling -= 1
+                threads = self._reserve_fill_locked(client, key)
+                self._condition.notify_all()
+            for thread in threads:
+                thread.start()
+            return
+
+        with self._condition:
+            self._filling -= 1
+            if (
+                self._closed
+                or self._key != key
+                or len(self._entries) >= self.capacity
+            ):
+                stale: _Entry | None = entry
+            else:
+                self._entries.append(entry)
+                stale = None
+            self._condition.notify_all()
+        if stale is not None:
+            stale.close()
+
+    def _fill_group(
+        self,
+        client: DeviceRuntimeClient,
+        key: str,
+        count: int,
+    ) -> None:
+        """在一个 Node host 中建好 ``count`` 个隔离 VM 会话。"""
+
+        sessions: tuple[DeviceRuntimeSession, ...] = ()
+        entries: list[_Entry] = []
+        try:
+            sessions = client.open_challenge_sessions(count)
+            if len(sessions) != count:
+                raise RuntimeError("challenge-host 返回的会话数不匹配")
+            for session in sessions:
+                stack = ExitStack()
+                try:
+                    stack.enter_context(session)
+                except Exception:
+                    stack.close()
+                    raise
+                entries.append(
+                    _Entry(
+                        session=session,
+                        stack=stack,
+                        key=key,
+                        created_at=(
+                            session.initialized_at or time.monotonic()
+                        ),
+                    )
+                )
+        except Exception:
+            for entry in entries:
+                entry.close()
+            for session in sessions:
+                session.close()
+            with self._condition:
+                self._filling -= count
+                self._condition.notify_all()
+            return
+
+        stale: list[_Entry] = []
+        with self._condition:
+            self._filling -= count
+            for entry in entries:
+                if (
+                    self._closed
+                    or self._key != key
+                    or len(self._entries) >= self.capacity
+                ):
+                    stale.append(entry)
+                else:
+                    self._entries.append(entry)
+            self._condition.notify_all()
+        for entry in stale:
+            entry.close()
 
     def _fill(self, client: DeviceRuntimeClient, key: str) -> None:
         """在后台建好一枚会话；失败静默丢弃。"""
@@ -330,6 +503,7 @@ class _LeasedRuntime:
 
 __all__ = [
     "MAX_AGE_SECONDS",
+    "MAX_VMS_PER_NODE",
     "DeviceSessionPool",
     "configuration_key",
 ]

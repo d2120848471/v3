@@ -380,8 +380,9 @@ powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
 手边没有 Windows 机器时，用 `.github/workflows/build-windows.yml` 在 GitHub 的
 Windows runner 上构建，跑完从 Artifacts 下载。
 
-无参数双击会先显示启动菜单：回车默认选择“快速模式”（5 并发、启动时准备 5 个设备
-会话），也可以选择逐轮画像的标准模式、自定义并发/端口，或只做环境自检。无需为了
+无参数双击会先显示启动菜单：回车默认选择“快速模式”（5 并发、2 个 Node
+host 内准备 5 个隔离 VM，分组为 3+2），也可以选择逐轮画像的标准模式、自定义并发/端口，
+或只做环境自检。无需为了
 切换常用模式手写命令行参数。
 
 冻结分发下有两处行为自动切换，都不需要配置：Node 取随包携带的那一份而不是 PATH；
@@ -469,7 +470,7 @@ Node、视觉解释器和超时等运行环境由启动命令固定，逐轮变�
 PYTHONPATH="$PWD" python3 -m ali_slider_reverse.entrypoints.api \
   --vision-python /path/to/vision-python \
   --host 127.0.0.1 --port 8000 \
-  --runtime-mode fast --max-concurrency 5
+  --runtime-mode fast --max-concurrency 5 --vms-per-node 3
 ```
 
 请求参数：
@@ -488,7 +489,29 @@ curl -X POST http://127.0.0.1:8000/api/slider \
 ```
 
 `GET /api/slider?SceneId=...` 是等价的便捷写法，`GET /health` 用于健康检查。成功
-响应在 CLI 四字段之外附带 `sceneId`、`proxied`、`elapsedMs` 等本轮元信息。
+响应在 CLI 四字段之外附带 `sceneId`、`proxied`、`elapsedMs`、`traceId` 和
+`timingsMs` 等本轮元信息。`elapsedMs` 保持总耗时字段；`timingsMs` 给出服务器真实
+执行的阶段拆分：
+
+```json
+{
+  "setup": 8,
+  "devicePoolWait": 0,
+  "deviceSession": 412,
+  "init": 186,
+  "downloadAssets": 221,
+  "vision": 17,
+  "buildVerifyData": 143,
+  "completeDevice": 74,
+  "verify": 192,
+  "uploadLog": 0,
+  "clientCleanup": 3,
+  "total": 1261
+}
+```
+
+服务窗口会在每一步结束时立即输出 `[traceId] 阶段: N ms`，5 线程日志可按
+`traceId` 归并；最终 JSON 和失败响应也会携带已完成步骤的耗时。
 
 状态码语义：入参不合法 `400`（不消耗挑战）、超出并发上限 `429`、协议或运行错误
 `500`。验证码未通过仍是一次正常往返，返回 `200` 且 `ok=false`，由 `VerifyCode`
@@ -507,8 +530,25 @@ Init/Verify/日志   <prefix>.captcha-open.aliyuncs.com
 需额外安装 `requests[socks]`。
 
 标准模式默认不限制并发，`--max-concurrency N` 会把同时进行的挑战数限制为 N 并对
-超出部分返回 `429`；快速模式未显式给出 N 时默认取 5。日志只记录方法、路径和状态码，
-`proxy` 凭据与 `securityToken` 不会写入 stderr。
+超出部分返回 `429`；快速模式未显式给出 N 时默认取 5。429 同时返回
+`activeChallenges`、`maxConcurrency`、`retryAfterMs`、`recommendedClientTimeoutMs`
+并设置标准 `Retry-After` 响应头。调用端必须按它退避，不能零等待循环重发。
+
+调用端的 HTTP 读超时和服务端 `--timeout` 是两件事：后者只限制一个网络/子进程步骤，
+不会替调用端延长 15 秒等待。慢机器建议先用至少 90 秒读超时，再根据响应里的实际
+`elapsedMs` 调整。例如：
+
+```python
+r = requests.post(
+    "http://127.0.0.1:8000/api/slider",
+    json={"SceneId": "1ug4aptr"},
+    timeout=(10, 90),
+)
+```
+
+调用端超时并关闭 socket 后，服务会在当前网络/子进程步骤返回后的下一个安全阶段边界
+停止，不再继续 Init/资源/PE/Verify 的后续工作，并尽快释放并发槽。正在阻塞的单步调用
+不会被强杀，因此 429 仍需按 `retryAfterMs` 退避，不能靠提高并发上限掩盖拥塞。
 
 ### 7.1 标准模式与快速模式
 
@@ -525,9 +565,17 @@ Python 只能阻塞等待。而 DeviceToken 是 `InitCaptchaV3` 的**入参**，
 
 `--runtime-mode standard` 保持逐轮生成设备画像，不创建投机设备会话；
 `--runtime-mode fast` 则固定本进程的一套自洽画像，并按并发上限在服务启动时准备同等
-数量的独立 Node/FeiLin 会话。请求从空闲池领取，不在关键路径启动 Node；同一批请求
-全部结束后再并行补齐，下一批若撞上正在补货的会话会等待并领取它们，不会额外冷建
-一批进程。旧参数 `--prewarm-device-session` 保留为快速模式的兼容别名。
+数量的独立 FeiLin VM 会话。默认 `--vms-per-node 3`：5 并发会建立 2 个 Node host，
+分别承载 3 和 2 个 `worker_threads + vm.Context`。每轮仍独占一个 VM，DOM、
+DeviceConfig、getter 和鼠标事件互不共享；共享的只是 OS Node 进程宿主。
+
+请求从空闲池领取，不在关键路径启动 Node。某个请求结束后，只在原 Node host 内重建
+它刚用完的 Worker/VM；其他慢请求继续运行，不再等同批 5 个请求全部结束。第 6 个请求
+若在 5 槽全满时到达仍会收到 429；按退避信息重试、进入空出的并发槽后，只需等待最先
+释放的那个 VM 重新完成 Log1/Log2，不会触发整批 Node 冷启动。重建中的 VM 也计入
+并发容量，因此活跃、空闲、重建三者之和不会超过 `--max-concurrency`。
+如需对照旧的“一 Node 一 VM”模式，传 `--vms-per-node 1`；单 Node 上限为 8。旧参数
+`--prewarm-device-session` 保留为快速模式的兼容别名。
 
 预热仍然是投机行为，因此快速模式不做定时刷新：只在启动和实际消费后补货；备好的
 会话超龄就关掉丢弃。服务器长时间没有流量时不会持续发送 Log1/Log2，长时间空闲后的

@@ -14,6 +14,7 @@ import argparse
 from dataclasses import dataclass
 
 from .. import config
+from ..challenge.device_pool import MAX_VMS_PER_NODE
 from ..challenge.session import AliSliderClient
 from ..device_profile import DeviceProfile
 from ..runtime.node_device import DeviceRuntimeClient
@@ -21,6 +22,9 @@ from ..runtime.node_device import DeviceRuntimeClient
 
 FAST_MODE_DEFAULT_CONCURRENCY = 5
 """快速模式未显式指定并发数时的有界容量。"""
+
+FAST_MODE_DEFAULT_VMS_PER_NODE = 3
+"""快速模式一个 Node host 默认承载的隔离 VM 数。"""
 
 
 def add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
@@ -134,6 +138,15 @@ def add_server_arguments(parser: argparse.ArgumentParser) -> None:
             "容量预热 FeiLin 会话"
         ),
     )
+    parser.add_argument(
+        "--vms-per-node",
+        type=int,
+        default=FAST_MODE_DEFAULT_VMS_PER_NODE,
+        help=(
+            "快速模式每个 Node host 的隔离 VM 槽位数"
+            f"（1..{MAX_VMS_PER_NODE}，默认 {FAST_MODE_DEFAULT_VMS_PER_NODE}）"
+        ),
+    )
 
 
 def fast_mode_enabled(args: argparse.Namespace) -> bool:
@@ -242,6 +255,7 @@ class RuntimeSettings:
 
 __all__ = [
     "FAST_MODE_DEFAULT_CONCURRENCY",
+    "FAST_MODE_DEFAULT_VMS_PER_NODE",
     "RuntimeSettings",
     "add_confidence_argument",
     "add_runtime_arguments",
