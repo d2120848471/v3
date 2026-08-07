@@ -1,8 +1,7 @@
-"""本轮挑战公开资源的并发下载。
+"""本轮挑战两张公开图片的并发下载。
 
-Init 返回后需要拿四样东西：背景图、拼图图、本轮动态 PE、以及页面样式表。它们
-互不依赖，因此并发拉取；但 Init **之前**拿不到本轮的图片路径与 ``StaticPath``，
-所以无法安全预取——这也是这里只并发四项、不做更激进预取的原因。
+Init 返回后只下载背景图与拼图图。PE 和样式表都不参与纯 Python 协议计算，因而
+不会被下载或落盘。
 
 两条安全约束：
 
@@ -11,9 +10,7 @@ Init 返回后需要拿四样东西：背景图、拼图图、本轮动态 PE、
 * 每个并发 worker 用自己的短会话。``requests.Session`` 不承诺跨线程共享，而
   公开静态资源也不需要 Init/Verify 的 cookie。
 
-Session 逐 worker 隔离，但底层连接池由整轮共享（见 :mod:`.transport`）：四项
-资源只落在两个主机上，共享连接池才能复用设备链空窗期预热好的 TLS 连接，否则
-每个 worker 都要现场重新握手。
+Session 逐 worker 隔离，但底层连接池由整轮共享（见 :mod:`.transport`）。
 """
 
 from __future__ import annotations
@@ -32,28 +29,19 @@ from ..device_profile import DeviceProfile
 from ..errors import AliSliderError
 from .transport import pooled_session
 
-
 _ASSET_PATH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-
-_FETCH_DEST_BY_SUFFIX = {".css": "style", ".js": "script"}
 
 
 @dataclass(frozen=True, slots=True)
 class ChallengeAssets:
-    """一轮挑战下载到本地的四项资源。"""
+    """一轮挑战下载到本地的两张 PNG。"""
 
     background: Path
     shadow: Path
-    pe_script: Path
-    stylesheet: Path
 
     load_timings: dict[str, tuple[int, int]] = field(repr=False)
-    """``img``/``pImg``/``js`` 各自的 ``(开始, 结束)`` epoch 毫秒，用于遥测。"""
-
-    stylesheet_loaded: bool
-    """样式表是否下载成功；失败不阻断流程。"""
-
+    """``img``/``pImg`` 各自的 ``(开始, 结束)`` epoch 毫秒。"""
 
 def require_relative_asset_path(value: Any, *, label: str) -> str:
     """校验服务端返回的资源路径确实是安全的相对路径。
@@ -75,7 +63,7 @@ def require_relative_asset_path(value: Any, *, label: str) -> str:
 def png_dimensions(path: str | Path, *, label: str) -> tuple[int, int]:
     """只读 PNG 的 IHDR 取宽高。
 
-    动态 PE 需要真实的图片尺寸来布局，但主协议环境不一定装了 Pillow 或 OpenCV。
+    纯 Python PE 需要真实的图片尺寸来布局，但主协议环境不一定装 Pillow 或 OpenCV。
     IHDR 固定在文件头前 24 字节，直接解析比引入依赖划算得多。
     """
 
@@ -98,7 +86,7 @@ def png_dimensions(path: str | Path, *, label: str) -> tuple[int, int]:
 
 
 class AssetDownloader:
-    """按本轮挑战的路径并发拉取四项公开资源。"""
+    """按本轮挑战的路径并发拉取两张公开图片。"""
 
     def __init__(
         self,
@@ -109,7 +97,6 @@ class AssetDownloader:
         proxies: dict[str, str] | None = None,
         referer: str = config.REFERER,
         image_base: str = config.IMAGE_BASE,
-        pe_base: str = config.PE_BASE,
         adapter: Any | None = None,
     ) -> None:
         self._requests = requests_module
@@ -118,7 +105,6 @@ class AssetDownloader:
         self.proxies = proxies
         self.referer = referer
         self.image_base = image_base
-        self.pe_base = pe_base
         self._adapter = adapter
 
     def download(
@@ -126,31 +112,16 @@ class AssetDownloader:
         *,
         image_path: str,
         puzzle_image_path: str,
-        static_path: str,
         directory: str | Path,
     ) -> ChallengeAssets:
-        """下载四项资源并返回本地路径与计时。
-
-        图片、PE 三项任一失败都会抛错；样式表失败只标记 ``stylesheet_loaded``
-        为 ``False``——公开 SDK 的 CSS loader 独立于 JS/图片的 ready Promise，
-        它的失败只上报 networkError，不阻断 PE 初始化或后续 Verify。
-        """
+        """并发下载两张图片并返回本地路径与计时。"""
 
         target = Path(directory)
         target.mkdir(parents=True, exist_ok=True)
 
-        static_version = static_path.split("/", 1)[0]
-        if not static_version or not _ASSET_PATH_RE.fullmatch(static_version):
-            raise AliSliderError("StaticPath 版本段不合法")
-
         jobs = {
             "img": (self.image_base + image_path, target / "back.png"),
             "pImg": (self.image_base + puzzle_image_path, target / "shadow.png"),
-            "js": (self.pe_base + static_path + ".js", target / "pe.js"),
-            "css": (
-                self.pe_base + static_version + "/main.css",
-                target / "main.css",
-            ),
         }
 
         # 退出 executor 上下文时会等待全部 worker，成功和异常路径都不会留下
@@ -165,23 +136,12 @@ class AssetDownloader:
             }
 
         # 固定必需资源的异常观察顺序，避免调度完成顺序改变最终报出的错误。
-        timings = {
-            name: futures[name].result() for name in ("img", "pImg", "js")
-        }
-        try:
-            futures["css"].result()
-        except AliSliderError:
-            stylesheet_loaded = False
-        else:
-            stylesheet_loaded = True
+        timings = {name: futures[name].result() for name in ("img", "pImg")}
 
         return ChallengeAssets(
             background=jobs["img"][1],
             shadow=jobs["pImg"][1],
-            pe_script=jobs["js"][1],
-            stylesheet=jobs["css"][1],
             load_timings=timings,
-            stylesheet_loaded=stylesheet_loaded,
         )
 
     def _fetch(self, url: str, destination: Path) -> tuple[int, int]:
@@ -204,9 +164,7 @@ class AssetDownloader:
                     headers=config.browser_headers(
                         profile=self.device_profile,
                         referer=self.referer,
-                        destination=_FETCH_DEST_BY_SUFFIX.get(
-                            destination.suffix, "image"
-                        ),
+                        destination="image",
                         mode="no-cors",
                         include_origin=False,
                     ),

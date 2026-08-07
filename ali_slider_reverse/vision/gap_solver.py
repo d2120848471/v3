@@ -62,7 +62,6 @@ from typing import Any
 
 from ..errors import VisionError
 
-
 # --------------------------------------------------------------------------
 # 检测参数
 #

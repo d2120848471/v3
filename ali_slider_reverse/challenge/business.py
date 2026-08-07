@@ -27,7 +27,6 @@ from ..protocol.params import (
 )
 from ..protocol.signing import compact_json, uuid4_hex_nonce
 
-
 # 抓包里需要还原的请求头，映射到规范大小写。
 _CANONICAL_HEADER_NAMES = {
     "accept": "Accept",

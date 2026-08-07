@@ -9,12 +9,7 @@
 name: build-windows
 
 on:
-  workflow_dispatch:
-    inputs:
-      node_version:
-        description: 随包携带的 Node 版本
-        required: false
-        default: v24.14.1
+  workflow_dispatch: {}
   push:
     tags:
       - "v*"
@@ -36,10 +31,7 @@ jobs:
 
       - name: 构建分发包
         shell: pwsh
-        run: |
-          $nodeVersion = "${{ github.event.inputs.node_version }}"
-          if (-not $nodeVersion) { $nodeVersion = "v24.14.1" }
-          ./packaging/build_windows.ps1 -NodeVersion $nodeVersion
+        run: ./packaging/build_windows.ps1
 
       - uses: actions/upload-artifact@v4
         with:

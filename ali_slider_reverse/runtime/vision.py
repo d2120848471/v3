@@ -35,7 +35,6 @@ from .. import config
 from ..errors import VisionError
 from ..vision.geometry import pe_slide_pos_from_puzzle_x
 
-
 _WORKER_MODULE = "ali_slider_reverse.entrypoints.vision_worker"
 
 _SolveOutput = tuple[int, float, tuple[dict[str, Any], ...]]
@@ -67,8 +66,8 @@ class VisionResult:
 class _InProcessSolver:
     """在本进程内直接调用 OpenCV 求解。
 
-    预热放在后台线程里：冷导入是 CPU 密集的，但调用方此时正阻塞在网络与 Node
-    子进程上（两者都释放 GIL），因此这段时间足够把导入与算子初始化跑完。
+    预热放在后台线程里：冷导入是 CPU 密集的，但调用方此时正等待设备与验证码网络
+    I/O（会释放 GIL），因此这段时间足够把导入与算子初始化跑完。
     """
 
     def __init__(self, *, timeout: float) -> None:
@@ -169,7 +168,7 @@ class _SubprocessSolver:
                 env=self._environment(),
             )
         except FileNotFoundError as exc:
-            raise VisionError("OpenCV vision bridge 不可用") from exc
+            raise VisionError("OpenCV 视觉 worker 不可用") from exc
 
     def solve(self, background: Path, shadow: Path) -> _SolveOutput:
         """把图片路径交给子进程，取回识别结果。
@@ -223,7 +222,7 @@ class _SubprocessSolver:
                 )
                 completed.check_returncode()
         except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-            raise VisionError("OpenCV vision bridge 不可用") from exc
+            raise VisionError("OpenCV 视觉 worker 不可用") from exc
         except subprocess.CalledProcessError as exc:
             # 只回传 stderr 最后一行，避免把整段 traceback 或图片路径写进日志。
             detail = exc.stderr.strip().splitlines()[-1:]
@@ -240,7 +239,7 @@ class _SubprocessSolver:
                 tuple(output.get("candidates", [])),
             )
         except (IndexError, KeyError, TypeError, ValueError) as exc:
-            raise VisionError("vision bridge 输出无效") from exc
+            raise VisionError("视觉 worker 输出无效") from exc
 
     def close(self) -> None:
         """回收尚未被 :meth:`solve` 消费的预热进程。"""

@@ -1,4 +1,4 @@
-"""``CaptchaVerifyParam.data`` 的离线解包与 schema 校验。
+"""``CaptchaVerifyParam.data`` 的纯 Python 正向封装与离线解包。
 
 data 的封装层次（自内向外）：
 
@@ -10,14 +10,8 @@ data 的封装层次（自内向外）：
   → Base64
 ```
 
-**为什么只做解包方向**：最终 data 由本轮动态 PE 在 Node VM 中原生生成——每轮
-Init 返回新的 ``StaticPath``，把某个旧 ``pe.*.js`` 的字段、前缀或分片硬编码成
-长期协议是行不通的。Python 这一侧的职责是**独立复核**：把 PE 交回来的 data
-解开，验证 schema、字段顺序、坐标与时间，任何一项不符就在发送 Verify 前停止。
-
-关于那个 32 字节前缀：早期分析按参考资料称其为 "checksum"，但受控执行已经证明
-生成它的 VM 输出**含随机性**（固定 ``Math.random`` 后输出不随 JSON 改变）。
-它是版本相关的 32-hex 前缀，不是完整性校验值，所以这里只验证形状，不验证内容。
+31 个当前 PE 分片的受控差分已经证明：data key 一致，32-hex 前缀是 15 个随机
+字节的十六进制加固定 ``01``，与 JSON 内容无关。因此不再下载或执行动态 PE。
 """
 
 from __future__ import annotations
@@ -26,13 +20,13 @@ import base64
 import binascii
 import json
 import re
+import secrets
 import zlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from ..errors import DataCodecError
-
 
 PE091_DATA_KEY = "3e627e1b4c63f913"
 """当前分片 data 层 64-state 变换的密钥。"""
@@ -43,7 +37,7 @@ INITIAL_64_STATE: tuple[int, ...] = (
     18, 29, 27, 22,  1, 17, 39, 56, 41, 38, 55, 31, 15, 58, 52, 40,
      8, 57, 45, 35, 59, 36, 42, 54, 63,  3, 24, 28, 14,  9,  0, 21,
 )
-"""64-state VM 在进入 KSA 前压入的初始置换。
+"""64-state 变换在进入 KSA 前使用的初始置换。
 
 这是公开脚本中的固定常量，不包含会话标识、签名密钥或服务端秘密。
 """
@@ -56,7 +50,7 @@ DATA_PAYLOAD_FIELDS: tuple[str, ...] = (
     "slidePos",
     "arg",
 )
-"""data 明文顶层字段的固定顺序。顺序会影响前缀 VM 的输入，不可重排。"""
+"""data 明文顶层字段的固定顺序；序列化结果不可重排。"""
 
 TRACK_LIST_FIELDS: tuple[str, ...] = (
     "mc",
@@ -179,7 +173,7 @@ def transform64(
 def validate_checksum_prefix(value: str) -> str:
     """校验 32-hex 前缀的形状，返回其小写形式。
 
-    只验形状：生成该前缀的 VM 含随机性，重跑不会得到相同结果，因此没有可比对的
+    只验形状：该前缀含随机性，重跑不会得到相同结果，因此没有可比对的
     期望值。
     """
 
@@ -191,8 +185,8 @@ def validate_checksum_prefix(value: str) -> str:
 def validate_payload_schema(payload: Mapping[str, Any]) -> None:
     """校验 data 明文对象的字段集合与各字段类型。
 
-    只校验字段**集合**，不校验顺序：顺序由调用方按需单独断言（PE 桥的返回值
-    会在 :mod:`ali_slider_reverse.runtime.node_pe` 中做严格顺序比对）。
+    只校验字段**集合**，不校验顺序：顺序由调用方按需单独断言（纯 Python PE
+    会在 :mod:`ali_slider_reverse.runtime.pe` 中做严格顺序比对）。
     """
 
     if not isinstance(payload, Mapping):
@@ -225,6 +219,45 @@ def validate_payload_schema(payload: Mapping[str, Any]) -> None:
     for name in ("xPos", "slidePos", "arg"):
         if not isinstance(payload[name], str):
             raise DataCodecError(f"{name} 必须是字符串")
+
+
+def generate_data_prefix() -> str:
+    """生成当前 PE 使用的 32-hex 前缀：``15 random bytes + 0x01``。"""
+
+    return secrets.token_bytes(15).hex() + "01"
+
+
+def pack_data(
+    payload: Mapping[str, Any],
+    *,
+    key: str = PE091_DATA_KEY,
+    prefix: str | None = None,
+) -> str:
+    """按当前 PE 的字节顺序正向封装 ``CaptchaVerifyParam.data``。
+
+    ``payload`` 与 ``TrackList`` 的插入顺序均参与最终字节；调用方必须按模块常量
+    给出的顺序构造。这里同时验证集合和顺序，防止生成能解包但服务端语义错误的串。
+    """
+
+    validate_payload_schema(payload)
+    if tuple(payload) != DATA_PAYLOAD_FIELDS:
+        raise DataCodecError("data 明文字段顺序异常")
+    track_list = payload["TrackList"]
+    if tuple(track_list) != TRACK_LIST_FIELDS:
+        raise DataCodecError("TrackList 字段顺序异常")
+
+    checked_prefix = validate_checksum_prefix(
+        generate_data_prefix() if prefix is None else prefix
+    )
+    json_text = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    compressed = zlib.compress((checked_prefix + json_text).encode("utf-8"), 6)
+    compressed_base64 = base64.b64encode(compressed)
+    return base64.b64encode(transform64(compressed_base64, key)).decode("ascii")
 
 
 def unpack_data(data: str, *, key: str = PE091_DATA_KEY) -> DecodedData:
@@ -290,6 +323,8 @@ __all__ = [
     "TRACK_LIST_FIELDS",
     "DecodedData",
     "keyed_state64",
+    "generate_data_prefix",
+    "pack_data",
     "transform64",
     "unpack_data",
     "validate_checksum_prefix",

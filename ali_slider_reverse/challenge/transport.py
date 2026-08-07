@@ -2,13 +2,12 @@
 
 ## 为什么需要
 
-一轮挑战要依次访问五个不同主机——Init、Verify、UploadLog、图片 CDN、动态 PE
-CDN。它们各自独立握手，而 ``<prefix>-verify.captcha-open.aliyuncs.com`` 更是在
+一轮挑战会访问 Init、Verify、可选 UploadLog、图片 CDN 与设备 RPC 主机。它们各自
+独立握手，而 ``<prefix>-verify.captcha-open.aliyuncs.com`` 更是在
 整条链路的**最后一步**才第一次被访问，那时候已经没有任何工作可以和它重叠。
 
-与此同时，设备链（SDK 准备 → Node 启动 → Log1 → Log2）期间 Python 侧完全阻塞在
-读取子进程输出上，是一段几百毫秒的纯空窗。:func:`warm_connections` 就是把上述
-握手提前挪进这段空窗。
+设备链执行 Log1 并等待 DeviceConfig、构造首枚 token 的期间还有一小段空窗；
+:func:`warm_connections` 把上述握手提前并行到这段时间。
 
 预热只建立 TCP + TLS 连接并放回 urllib3 的连接池，**不发送任何 HTTP 字节**，因此
 不产生任何协议侧副作用，也不会被服务端计入请求。
@@ -35,7 +34,6 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
-
 
 WARM_CONNECT_TIMEOUT_SECONDS = 5.0
 """单次预热握手的上限。

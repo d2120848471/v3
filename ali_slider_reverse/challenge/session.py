@@ -6,8 +6,8 @@
 
 ```text
 图片共识通过
-  AND PE 的 schema / 坐标 / 时间通过
-  AND FeiLin getter 与 session 通过
+  AND 纯 Python PE 的 schema / 坐标 / 时间通过
+  AND 设备 getter 与 session 通过
     → 发送一次 VerifyCaptchaV3
 ```
 
@@ -17,26 +17,24 @@
 
 ## 并发的边界
 
-Init 之前拿不到本轮图片与 ``StaticPath``，无法安全预取。Init 之后能并行的只有
-两类互相独立的工作：四项公开资源的下载，以及"只尝试一次的 UploadLog"与本地
+Init 之前拿不到本轮图片，无法安全预取。Init 之后能并行的只有
+两类互相独立的工作：两张公开图片的下载，以及"只尝试一次的 UploadLog"与本地
 OpenCV 识别。
 
 UploadLog 是 best-effort 遥测，**不参与任何控制流**，公开 SDK 也不 await 它，
 因此它只需要在本轮结束前被回收，不必挡住 PE。真正会挡住 PE 的只有图像置信度
 这道闸。
 
-还有一段容易被忽略的空窗：设备链（SDK 准备 → Node 启动 → Log1 → Log2）期间
-Python 侧完全阻塞在读子进程输出上。本轮五个出网主机的 TLS 握手就在这里提前做掉
-（见 :mod:`.transport`），其中 Verify 主机原本要等到整条链路的最后一步才第一次
-握手。
+设备链只执行 Python RPC；验证码、图片与设备日志三个主机仍可提前建立连接。
 
 标准模式的 worker 都在本轮返回前回收。快速 HTTP 模式只有 best-effort UploadLog
-可以交给服务级执行器，服务停止时统一排空；单轮的客户端、FeiLin worker、临时目录
+可以交给服务级执行器，服务停止时统一排空；单轮的客户端、设备会话、临时目录
 与 ``CertifyId`` 仍然彼此隔离。
 """
 
 from __future__ import annotations
 
+import math
 import tempfile
 import time
 from collections.abc import Callable, Iterator
@@ -59,8 +57,8 @@ from ..protocol.signing import (
     utc_timestamp,
     uuid4_nonce,
 )
-from ..runtime.node_device import DeviceRuntimeClient, DeviceRuntimeResult
-from ..runtime.node_pe import PeRuntimeClient
+from ..runtime.device import DeviceRuntimeClient, DeviceRuntimeResult
+from ..runtime.pe import PeRuntimeClient
 from ..runtime.vision import VisionResult, VisionWorker
 from .assets import (
     AssetDownloader,
@@ -103,7 +101,7 @@ class CaptchaChallenge:
 
 @dataclass(frozen=True, slots=True)
 class VerifyBuild:
-    """动态 PE 原生生成、并已通过全部校验的 Verify 载荷。"""
+    """纯 Python PE 生成并通过正反向校验的 Verify 载荷。"""
 
     data: str = field(repr=False)
     x_pos: int = field(repr=False)
@@ -112,8 +110,8 @@ class VerifyBuild:
     verify_time: int = field(repr=False)
 
     track_event_count: int
-    native_mousemove_event_count: int
-    post_getter_mousemove_event_count: int
+    data_mousemove_event_count: int
+    post_getter_data_event_count: int
 
     target_first_touch_age_ms: int = field(repr=False)
     first_touch_age_ms: float = field(repr=False)
@@ -122,7 +120,7 @@ class VerifyBuild:
     post_interaction_delay_ms: float = field(repr=False)
 
     device_getter_arguments: tuple[str, ...] = field(repr=False)
-    feilin_interaction_events: tuple[dict[str, float | bool | str], ...] = field(
+    device_interaction_events: tuple[dict[str, float | bool | str], ...] = field(
         repr=False
     )
 
@@ -158,7 +156,7 @@ class ChallengeOutcome:
     upload_log_succeeded: bool
     """best-effort 遥测是否送达。
 
-    放在这一层而不是 :class:`VerifyBuild` 里：它与 PE 原生生成的 Verify 载荷毫无
+    放在这一层而不是 :class:`VerifyBuild` 里：它与纯 Python PE 生成的 Verify 载荷毫无
     关系，只是本轮的一项记录，因此也不需要在 PE 开始前就有结果。
     """
 
@@ -171,7 +169,7 @@ class ChallengeOutcome:
 def normalize_proxies(proxy: str | None) -> dict[str, str] | None:
     """把单个代理串规范化为 requests 的 ``proxies`` 映射。
 
-    整轮挑战的 Init/Verify/UploadLog、公开资源下载与 SDK 下载共用同一出口地址，
+    整轮挑战的 Init/Verify/UploadLog、公开资源下载与设备 RPC 共用同一出口地址，
     避免同一 ``CertifyId`` 的请求出现在多个源 IP 上。``None`` 或空串表示直连。
 
     接受省略 scheme 的 ``host:port`` 写法，按 requests 的默认语义补 ``http://``。
@@ -239,7 +237,6 @@ class AliSliderClient:
         init_url: str | None = None,
         verify_url: str | None = None,
         upload_url: str = config.UPLOAD_URL,
-        node_binary: str = config.DEFAULT_NODE_BINARY,
         vision_python: str | None = None,
         timeout: float = config.DEFAULT_TIMEOUT,
         referer: str = config.REFERER,
@@ -253,7 +250,12 @@ class AliSliderClient:
             raise ValueError("scene_id 和 prefix 不能为空")
         if not isinstance(device_profile, DeviceProfile):
             raise ValueError("device_profile 必须是本轮生成的 DeviceProfile")
-        if timeout <= 0:
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(float(timeout))
+            or timeout <= 0
+        ):
             raise ValueError("timeout 必须为正数")
         if proxies is not None and not isinstance(proxies, dict):
             raise ValueError("proxies 必须是 requests 的映射或 None")
@@ -276,12 +278,12 @@ class AliSliderClient:
             (referer_url.scheme, referer_url.netloc, "", "", "")
         )
         self.proxies = dict(proxies) if proxies else None
-        # 本轮的设备画像：HTTP 头、FeiLin 环境与动态 PE 环境共用同一套。
+        # 本轮的设备画像：HTTP 头、设备指纹与 PE 计算共用同一套。
         self.device_profile = device_profile
 
         self._requests = _requests_module()
         # 本轮共享的连接池：Session 仍按线程隔离，但热连接集中在这个 adapter 上，
-        # 预热出来的 TLS 连接才能被 Init/Verify/UploadLog 和四项资源下载共同复用。
+        # 预热出来的 TLS 连接才能被 Init/Verify/UploadLog 和两图下载共同复用。
         self._owns_adapter = adapter is None
         self._adapter = (
             build_pool_adapter(self._requests) if adapter is None else adapter
@@ -307,7 +309,6 @@ class AliSliderClient:
             adapter=self._adapter,
         )
         self.pe_runtime = PeRuntimeClient(
-            node_binary=node_binary,
             prefix=prefix,
             region=config.DEFAULT_REGION,
             timeout=self.timeout,
@@ -330,10 +331,9 @@ class AliSliderClient:
         self.vision.prewarm()
 
     def prewarm_connections(self) -> None:
-        """提前建立本轮五个出网主机的 TLS 连接。
+        """提前建立本轮验证码与图片主机的 TLS 连接。
 
-        建议在设备链开始前调用：那段时间 Python 只是阻塞在读 Node 输出上，正好
-        用来把握手做掉。只建连接、不发 HTTP 字节，因此没有任何协议侧副作用。
+        只建连接、不发 HTTP 字节，因此没有任何协议侧副作用。
 
         重复调用是安全的，每个客户端只预热一次；走代理时整体跳过（原因见
         :mod:`.transport`）。
@@ -349,7 +349,6 @@ class AliSliderClient:
                 self.verify_url,
                 self.upload_url,
                 config.IMAGE_BASE,
-                config.PE_BASE,
             ),
             proxies=self.proxies,
             timeout=self.timeout,
@@ -499,12 +498,11 @@ class AliSliderClient:
         challenge: CaptchaChallenge,
         directory: str | Path,
     ) -> ChallengeAssets:
-        """并发下载本轮的图片、动态 PE 与样式表。"""
+        """并发下载本轮的背景图与拼图图。"""
 
         return self.assets.download(
             image_path=challenge.image_path,
             puzzle_image_path=challenge.puzzle_image_path,
-            static_path=challenge.static_path,
             directory=directory,
         )
 
@@ -554,10 +552,9 @@ class AliSliderClient:
     ) -> bool:
         """按公开 SDK 的一次性 best-effort 语义发送 ``UploadLog``。
 
-        真实浏览器在动态 PE 的图片 ready 回调里记录 ``img``/``pImg``，再由
+        公开前端在图片 ready 回调里记录 ``img``/``pImg``，再由
         ``config.log("rt", ...)`` 触发上传。纯协议端没有 DOM 图片解码阶段，因此
-        在同批资源下载完成后构造等价的 ready 日志。CSS 会下载但不进 logInfo，
-        与公开 SDK 一致。
+        在两图下载完成后构造等价的 ready 日志。
 
         **任何失败都只返回 ``False``**：公开 SDK 不 await 这次上传，无论同步异常
         与否都立刻标记 logUploaded。遥测的构造、落盘或网络失败都不能改变本轮的
@@ -574,7 +571,7 @@ class AliSliderClient:
 
         try:
             timings = assets.load_timings
-            if set(timings) != {"img", "pImg", "js"}:
+            if set(timings) != {"img", "pImg"}:
                 raise AliSliderError("资源加载计时字段不完整")
 
             ready_ms = max(timing[1] for timing in timings.values())
@@ -595,9 +592,6 @@ class AliSliderClient:
                 ),
                 "hst": sdk_host,
                 "cId": challenge.certify_id,
-                "js": self._load_log_entry(
-                    timings["js"], message="DYNAMICJS_LOADED"
-                ),
                 "pImg": self._load_log_entry(
                     timings["pImg"], message="IMAGE_LOADED"
                 ),
@@ -628,15 +622,13 @@ class AliSliderClient:
         assets: ChallengeAssets,
         vision: VisionResult,
         *,
-        sdk_path: str | Path,
-        device: DeviceRuntimeResult,
         init_begin_time: int,
         target_first_touch_age_ms: int,
         fixture_path: str | Path | None = None,
     ) -> VerifyBuild:
-        """在隔离 Node VM 中让动态 PE 原生生成 data，并复核 getter 合同。
+        """用纯 Python 生成 data，并复核 getter 合同。
 
-        除了 PE 桥自身的层层校验，这里额外确认两件事：PE 算出的 ``slidePos`` 与
+        除了纯 Python PE 自身的层层校验，这里额外确认两件事：算出的 ``slidePos`` 与
         目标轨迹一致，以及 getter 恰好被调用一次、恰好收到一个非空字符串实参——
         后者是刷新 Verify DeviceToken 的唯一依据。
         """
@@ -652,20 +644,10 @@ class AliSliderClient:
             assets.shadow, label="shadow.png"
         )
 
-        native = self.pe_runtime.build(
-            sdk_path=sdk_path,
-            pe_path=assets.pe_script,
+        calculated = self.pe_runtime.build(
             scene_id=self.scene_id,
             certify_id=challenge.certify_id,
-            device_token=device.init_token,
-            captcha_type=challenge.captcha_type or "PUZZLE",
-            image=challenge.image_path,
-            puzzle_image=challenge.puzzle_image_path,
-            verify_arg_profile={
-                "accessSec": device.verify_arg_key,
-                "sessionIdSalt": device.verify_arg_plaintext,
-            },
-            device_config=device.device_config.as_dict(),
+            static_path=challenge.static_path,
             dimensions={
                 "imageWidth": image_width,
                 "imageHeight": image_height,
@@ -680,51 +662,49 @@ class AliSliderClient:
             first_touch_age_ms=target_first_touch_age_ms,
         )
 
-        if native.slide_pos != vision.slide_pos:
+        if calculated.slide_pos != vision.slide_pos:
             raise AliSliderError(
-                "动态 PE slidePos 与目标轨迹不一致："
-                f"{native.slide_pos} != {vision.slide_pos}"
+                "纯 Python PE slidePos 与目标轨迹不一致："
+                f"{calculated.slide_pos} != {vision.slide_pos}"
             )
-        getter_argument = self._require_single_getter_argument(native)
+        getter_argument = self._derive_single_getter_argument(calculated)
 
         return VerifyBuild(
-            data=native.data,
-            x_pos=native.x_pos,
-            slide_pos=native.slide_pos,
-            track_start_time=native.track_start_time,
-            verify_time=native.verify_time,
-            track_event_count=native.track_event_count,
-            native_mousemove_event_count=native.native_mousemove_event_count,
-            post_getter_mousemove_event_count=(
-                native.post_getter_mousemove_event_count
-            ),
-            target_first_touch_age_ms=native.target_first_touch_age_ms,
-            first_touch_age_ms=native.first_touch_age_ms,
-            touch_duration_ms=native.touch_duration_ms,
-            last_touch_to_verify_ms=native.last_touch_to_verify_ms,
-            post_interaction_delay_ms=native.post_interaction_delay_ms,
+            data=calculated.data,
+            x_pos=calculated.x_pos,
+            slide_pos=calculated.slide_pos,
+            track_start_time=calculated.track_start_time,
+            verify_time=calculated.verify_time,
+            track_event_count=calculated.track_event_count,
+            data_mousemove_event_count=calculated.data_mousemove_event_count,
+            post_getter_data_event_count=calculated.post_getter_data_event_count,
+            target_first_touch_age_ms=calculated.target_first_touch_age_ms,
+            first_touch_age_ms=calculated.first_touch_age_ms,
+            touch_duration_ms=calculated.touch_duration_ms,
+            last_touch_to_verify_ms=calculated.last_touch_to_verify_ms,
+            post_interaction_delay_ms=calculated.post_interaction_delay_ms,
             device_getter_arguments=(getter_argument,),
-            feilin_interaction_events=native.mousemove_events,
+            device_interaction_events=calculated.mousemove_events,
         )
 
     @staticmethod
-    def _require_single_getter_argument(native: Any) -> str:
-        """确认 PE 恰好调用一次 getter 且恰好传入一个非空字符串。"""
+    def _derive_single_getter_argument(calculated: Any) -> str:
+        """确认 PE 公式只导出一次 token 刷新及一个非空字符串实参。"""
 
-        if len(native.device_getter_calls) != 1:
-            raise AliSliderError("动态 PE 的 FeiLin getter 调用次数异常")
-        call = native.device_getter_calls[0]
-        if call.argument_count != 1 or len(call.arguments) != 1:
-            raise AliSliderError("动态 PE 的 FeiLin getter 参数数量异常")
+        if len(calculated.device_getter_plans) != 1:
+            raise AliSliderError("PE 的设备 getter 计划次数异常")
+        plan = calculated.device_getter_plans[0]
+        if plan.argument_count != 1 or len(plan.arguments) != 1:
+            raise AliSliderError("PE 的设备 getter 参数数量异常")
 
-        argument = call.arguments[0]
+        argument = plan.arguments[0]
         if (
             argument.value_type != "string"
             or not isinstance(argument.value, str)
             or not argument.value
             or argument.length != len(argument.value)
         ):
-            raise AliSliderError("动态 PE 的 FeiLin getter 参数形状异常")
+            raise AliSliderError("PE 的设备 getter 参数形状异常")
         return argument.value
 
     def verify_challenge(
@@ -735,7 +715,7 @@ class AliSliderClient:
     ) -> CaptchaVerifyResult:
         """发送本轮唯一的一次 ``VerifyCaptchaV3``。
 
-        发送前最后一道闸：虚拟时钟快速回放可能生成"未来的 VerifyTime"，超出容差
+        发送前最后一道闸：逻辑时钟快速构造可能生成"未来的 VerifyTime"，超出容差
         就停止，不消耗这次挑战。
         """
 
@@ -815,7 +795,7 @@ class AliSliderClient:
 
         ``timing_hook`` 在每个阶段结束时收到 ``(阶段名, 毫秒)``，用于 HTTP 服务
         实时输出多线程进度。``cancel_check`` 只在阶段边界调用；客户端已断开时可
-        停止后续工作，但绝不强杀正在进行的网络请求或子进程调用。
+        停止后续工作，但绝不强杀正在进行的网络请求或视觉 worker 调用。
         """
 
         if not 0.0 <= minimum_confidence <= 1.0:
@@ -843,12 +823,12 @@ class AliSliderClient:
 
         check_cancelled()
 
-        # 设备链是本轮第一段长阻塞，且期间 Python 无事可做；五个出网主机的 TLS
-        # 握手全部塞进这段空窗，其中 Verify 主机原本要等到最后一步才第一次握手。
+        # 设备链是本轮第一段网络等待；把验证码与图片主机的 TLS 握手塞进这段空窗，
+        # 其中 Verify 主机原本要等到最后一步才第一次握手。
         self.prewarm_connections()
 
         with ExitStack() as stack:
-            # FeiLin VM 必须跨越整个 Init→PE→Verify 过程保持存活。
+            # 同一纯 Python 设备会话必须跨越整个 Init→PE→Verify 过程保持存活。
             with timed_step("deviceSession"):
                 device_session = stack.enter_context(
                     device_runtime.challenge_session()
@@ -858,7 +838,6 @@ class AliSliderClient:
             with timed_step("init"):
                 challenge = self.init_challenge(device_session.init_token)
             check_cancelled()
-            initial_device = device_session.initial_result
 
             directory: str | Path
             if artifacts_dir is None:
@@ -902,15 +881,12 @@ class AliSliderClient:
                     )
             check_cancelled()
 
-            # 首触年龄的门控发生在 PE slider ready 之后、真正 dispatch 之前，
-            # 因此 Node 启动与 SDK/PE 初始化的耗时不会叠加到目标年龄上。
+            # 首触年龄只存在于逻辑时钟，不真实 sleep。
             with timed_step("buildVerifyData"):
                 build = self.build_verify_data(
                     challenge,
                     assets,
                     vision,
-                    sdk_path=device_session.sdk_path,
-                    device=initial_device,
                     init_begin_time=challenge.init_started_ms,
                     target_first_touch_age_ms=(
                         device_session.target_first_touch_age_ms
@@ -922,7 +898,7 @@ class AliSliderClient:
             with timed_step("completeDevice"):
                 device = device_session.complete_challenge(
                     build.device_getter_arguments,
-                    build.feilin_interaction_events,
+                    build.device_interaction_events,
                     # PE 事件时间是非负毫秒；用与前端 Math.round 一致的 half-up，
                     # 而不是 Python 的银行家舍入。
                     post_interaction_delay_ms=int(
@@ -933,7 +909,7 @@ class AliSliderClient:
                     build.device_getter_arguments
                 ):
                     raise AliSliderError(
-                        "Verify DeviceToken 未按动态 PE getter 参数刷新"
+                        "Verify DeviceToken 未按 PE getter 参数刷新"
                     )
             check_cancelled()
 

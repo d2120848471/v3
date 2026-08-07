@@ -1,24 +1,22 @@
-"""运行时桥接层：把重环境依赖隔离到独立进程。
+"""纯 Python 设备/PE 计算与可选视觉 worker。
 
 ```text
-node_device.py  FeiLin 设备链，跨 Init 保持同一个 Node VM
-node_pe.py      本轮动态 PE 的隔离 VM，原生生成 Verify data
+device.py       兼容设备链，跨 Init 保持同一个 Python 状态对象
+pe.py           TrackList、arg 与 Verify data 的纯 Python 计算
 vision.py       OpenCV 缺口求解子进程
-bridges/*.mjs   Node 侧脚本
 ```
 
-三个桥的共同约定：**子进程不发网络请求**。所有出网动作都由 Python 完成，桥只做
-本地计算，这样代理设置、单次 Verify 边界等控制流才能在一个地方审计。
+设备 RPC 与验证码 RPC 的所有出网动作均由 Python 完成；视觉 worker 只读本地图片。
 """
 
 from __future__ import annotations
 
-from .node_device import (
+from .device import (
     DeviceRuntimeClient,
     DeviceRuntimeResult,
     DeviceRuntimeSession,
 )
-from .node_pe import PeRuntimeClient, PeRuntimeResult
+from .pe import PeRuntimeClient, PeRuntimeResult
 from .vision import VisionResult, VisionWorker
 
 __all__ = [

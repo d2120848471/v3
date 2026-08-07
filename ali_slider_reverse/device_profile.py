@@ -28,20 +28,17 @@ family = android-adreno
 
 ## 一轮只有一套画像
 
-同一轮里，Python 发出的 HTTP 头、FeiLin 采集所见的环境、动态 PE 所见的环境必须
-是同一套。任何一处不同步都会让服务端同时看到两台设备。因此画像由入口层生成一次，
-再显式传给协议客户端与两个 Node 桥。
+同一轮里，Python 发出的 HTTP 头、设备指纹与 PE 计算所见的环境必须是同一套。
+任何一处不同步都会让服务端同时看到两台设备。因此画像由入口层生成一次，再显式传给
+协议客户端与两个纯 Python runtime。
 """
 
 from __future__ import annotations
 
-import base64
-import json
 import secrets
 from dataclasses import dataclass, field
 from random import Random
 from typing import Any
-
 
 # ==========================================================================
 # 家族定义
@@ -49,9 +46,8 @@ from typing import Any
 # 每个家族是一组**已知彼此相容**的取值域。新增家族时，务必把 UA、platform、
 # 屏幕、触点、插件、GPU 一并核对过再加进来，不要只补一个 UA 模板。
 #
-# ⚠️ 为什么只有移动家族：动态 PE 的轨迹回放走的是 touch 事件。桌面画像
-# （maxTouchPoints 0、非 Mobile UA）会让 PE 注册鼠标处理器，回放的 touch 事件
-# 无人接收，整轮直接失败。想引入桌面家族，得先给 PE 桥补一条 mouse 回放路径。
+# ⚠️ 为什么只有移动家族：当前 PE 计算合同复现的是 touch 事件。桌面画像
+# （maxTouchPoints 0、非 Mobile UA）应走 mouse 路径，不能与现有触摸轨迹混用。
 # ==========================================================================
 
 
@@ -264,7 +260,7 @@ class DeviceProfile:
     device_memory: int = field(repr=False)
     max_touch_points: int = field(repr=False)
     canvas_seed: str = field(repr=False)
-    """Node 桥据此确定性地派生 Canvas 读回值与字体度量。"""
+    """设备 runtime 据此确定性地派生 Canvas 读回值与字体度量。"""
 
     text_metric_scale: float = field(repr=False)
 
@@ -294,50 +290,6 @@ class DeviceProfile:
             quality -= 1
             parts.append(f"{language};q=0.{quality}")
         return ",".join(parts)
-
-    # -- 传给 Node 桥 ------------------------------------------------------
-
-    def as_bridge_dict(self) -> dict[str, Any]:
-        """序列化成两个 Node 桥共同消费的 JSON。"""
-
-        return {
-            "profileId": self.profile_id,
-            "family": self.family,
-            "userAgent": self.user_agent,
-            "appVersion": self.app_version,
-            "platform": self.platform,
-            "vendor": self.vendor,
-            "mobile": self.mobile,
-            "pdfViewer": self.pdf_viewer,
-            "secChUa": self.sec_ch_ua,
-            "secChUaMobile": self.sec_ch_ua_mobile,
-            "secChUaPlatform": self.sec_ch_ua_platform,
-            "acceptLanguage": self.accept_language,
-            "brands": [
-                {"brand": brand, "version": version}
-                for brand, version in self.ua_brands
-            ],
-            "fullVersionList": [
-                {"brand": brand, "version": version}
-                for brand, version in self.ua_full_versions
-            ],
-            "uaPlatform": self.ua_platform,
-            "uaPlatformVersion": self.ua_platform_version,
-            "uaModel": self.ua_model,
-            "uaFullVersion": self.ua_full_version,
-            "uaArchitecture": self.ua_architecture,
-            "uaBitness": self.ua_bitness,
-            "language": self.language,
-            "languages": list(self.languages),
-            "screen": self.screen.as_dict(),
-            "gpu": self.gpu.as_dict(),
-            "hardwareConcurrency": self.hardware_concurrency,
-            "deviceMemory": self.device_memory,
-            "maxTouchPoints": self.max_touch_points,
-            "canvasSeed": self.canvas_seed,
-            "textMetricScale": self.text_metric_scale,
-        }
-
 
 # ==========================================================================
 # 生成
@@ -456,25 +408,9 @@ def generate_device_profile(rng: Random | None = None) -> DeviceProfile:
     )
 
 
-def encode_device_profile(profile: DeviceProfile) -> str:
-    """把画像编码成 Node 桥 ``--device-profile`` 的实参。
-
-    走 base64 是为了让 argv 里不出现引号、空格与非 ASCII——机型名与 UA 里两者都
-    有，直接拼进命令行迟早会踩到某个平台的转义差异。
-    """
-
-    payload = json.dumps(
-        profile.as_bridge_dict(),
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    return base64.b64encode(payload.encode("utf-8")).decode("ascii")
-
-
 __all__ = [
     "DeviceProfile",
     "GpuProfile",
     "ScreenProfile",
-    "encode_device_profile",
     "generate_device_profile",
 ]

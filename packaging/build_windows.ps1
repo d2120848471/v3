@@ -4,19 +4,13 @@
 
 .DESCRIPTION
     产出 dist\AliSlider\ 目录（含 AliSlider.exe）与同名 zip。目标机器不需要
-    Python、Node 或 OpenCV——三样都在包里。
+    Python 或 OpenCV——两者都在包里。
 
     PyInstaller 不能跨平台交叉编译，所以这个脚本必须在 Windows 上跑。
 
-.PARAMETER NodeVersion
-    随包携带的 Node 版本，默认与项目已验证环境一致。
-
-.PARAMETER NodeExe
-    直接指定本地 node.exe，跳过下载（离线构建时用）。
-
 .PARAMETER OneFile
-    打成单个 exe。每次启动都要解压整包（含 80MB node.exe），冷启动十几秒，
-    除非确实需要单文件分发，否则别用。
+    打成单个 exe。每次启动都要解压完整运行目录，冷启动更慢；除非确实需要
+    单文件分发，否则别用。
 
 .PARAMETER SkipZip
     只产出目录，不压缩。
@@ -26,23 +20,17 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$NodeVersion = "v24.14.1",
-    [string]$NodeExe = "",
     [switch]$OneFile,
     [switch]$SkipZip
 )
 
 $ErrorActionPreference = "Stop"
-$ProgressPreference = "SilentlyContinue"
-# 老配置的 PowerShell 默认还在 TLS 1.0，而 nodejs.org 只收 1.2 以上。
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $PackagingDir = $PSScriptRoot
 $ProjectRoot = Split-Path -Parent $PackagingDir
 $BuildDir = Join-Path $ProjectRoot "build"
 $DistDir = Join-Path $ProjectRoot "dist"
 $VenvDir = Join-Path $BuildDir "venv"
-$NodeDir = Join-Path $BuildDir "node"
 
 function Write-Step([string]$Message) {
     Write-Host ""
@@ -193,47 +181,12 @@ Write-Done "requests / cryptography / opencv-headless / numpy / pyinstaller"
 
 
 # --------------------------------------------------------------------------
-# 3. 随包携带的 node.exe
-# --------------------------------------------------------------------------
-
-Write-Step "准备随包 Node 运行时"
-New-Item -ItemType Directory -Force -Path $NodeDir | Out-Null
-$NodeTarget = Join-Path $NodeDir "node.exe"
-
-if ($NodeExe) {
-    if (-not (Test-Path $NodeExe)) { throw "指定的 node.exe 不存在：$NodeExe" }
-    Copy-Item -Force $NodeExe $NodeTarget
-    Write-Done "使用本地副本 $NodeExe"
-} elseif (Test-Path $NodeTarget) {
-    Write-Done "复用已下载的 $NodeTarget"
-} else {
-    $url = "https://nodejs.org/dist/$NodeVersion/win-x64/node.exe"
-    Write-Done "下载 $url"
-    try {
-        Invoke-WebRequest -Uri $url -OutFile $NodeTarget -UseBasicParsing
-    } catch {
-        if (Test-Path $NodeTarget) { Remove-Item -Force $NodeTarget }
-        throw @"
-下载 Node 失败：$($_.Exception.Message)
-换个版本重试：-NodeVersion v22.14.0
-或离线指定本地文件：-NodeExe C:\path\to\node.exe
-"@
-    }
-}
-
-$nodeReported = Get-NativeOutput -Exe $NodeTarget -Arguments @("--version")
-if (-not $nodeReported) { throw "随包 node.exe 无法运行：$NodeTarget" }
-Write-Done "node $nodeReported"
-
-
-# --------------------------------------------------------------------------
-# 4. 打包
+# 3. 打包
 # --------------------------------------------------------------------------
 
 Write-Step "执行 PyInstaller"
 if (Test-Path $DistDir) { Remove-Item -Recurse -Force $DistDir }
 
-$env:ALI_SLIDER_NODE = $NodeTarget
 if ($OneFile) { $env:ALI_SLIDER_ONEFILE = "1" }
 else { Remove-Item Env:ALI_SLIDER_ONEFILE -ErrorAction SilentlyContinue }
 
@@ -247,7 +200,7 @@ Invoke-Native -Exe $VenvPython -Arguments @(
 
 
 # --------------------------------------------------------------------------
-# 5. 补齐说明文档并自检
+# 4. 补齐说明文档并自检
 # --------------------------------------------------------------------------
 
 if ($OneFile) {
@@ -263,14 +216,14 @@ $ReadmePath = Join-Path $PayloadDir "使用说明.txt"
 Copy-Item -Force (Join-Path $PackagingDir "使用说明.txt") $ReadmePath
 
 Write-Step "自检产物"
-# doctor 会逐项确认桥脚本、轨迹资产、随包 Node 与 OpenCV 是否都在包里。
+# doctor 会逐项确认轨迹资产与 Python 运行依赖是否都在包里。
 Invoke-Native -Exe $ExePath -Arguments @("doctor") `
     -FailureMessage "产出的 exe 自检未通过，分发包不完整"
 Write-Done "AliSlider.exe 自检通过"
 
 
 # --------------------------------------------------------------------------
-# 6. 压缩
+# 5. 压缩
 # --------------------------------------------------------------------------
 
 $sizeMb = [math]::Round(

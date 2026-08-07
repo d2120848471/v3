@@ -30,7 +30,6 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
-import subprocess
 import sys
 import threading
 import time
@@ -42,9 +41,9 @@ from http.server import ThreadingHTTPServer
 from typing import Any
 
 from .. import __version__, config
-from ..challenge.device_pool import DeviceSessionPool, MAX_VMS_PER_NODE
+from ..challenge.device_pool import DeviceSessionPool
 from ..device_profile import generate_device_profile
-from .api import SliderApiHandler, _ChallengeSlots, _STEP_LABELS
+from .api import _STEP_LABELS, SliderApiHandler, _ChallengeSlots
 from .api import main as api_main
 from .cli import main as cli_main
 from .options import (
@@ -144,22 +143,6 @@ def _pause(palette: _Palette) -> None:
 # ==========================================================================
 
 
-def _node_version(binary: str, *, timeout: float = 8.0) -> str | None:
-    """返回 Node 版本号；不可用时返回 ``None``。"""
-
-    try:
-        completed = subprocess.run(
-            [binary, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    version = completed.stdout.strip()
-    return version if completed.returncode == 0 and version else None
-
-
 def _opencv_version() -> str | None:
     """返回 OpenCV 版本号；未安装时返回 ``None``。"""
 
@@ -176,18 +159,12 @@ def _print_environment(settings: RuntimeSettings, palette: _Palette) -> bool:
     ok_mark = f"{palette.green}✅{palette.reset}"
     bad_mark = f"{palette.red}❌{palette.reset}"
 
-    node = _node_version(settings.node_binary)
-    if node is None:
-        print(f"  {bad_mark} Node        找不到可用的 Node")
-        print(f"     {palette.dim}{settings.node_binary}{palette.reset}")
-    else:
-        origin = (
-            "系统 PATH" if settings.node_binary == "node" else settings.node_binary
-        )
-        print(
-            f"  {ok_mark} Node        {node}  "
-            f"{palette.dim}{origin}{palette.reset}"
-        )
+    protocol_ready = True
+    for label, module in (("HTTP", "requests"), ("密码算法", "cryptography")):
+        version = _module_version(module)
+        protocol_ready = protocol_ready and version is not None
+        mark = ok_mark if version is not None else bad_mark
+        print(f"  {mark} {label:<10}{version or '缺失'}")
 
     in_process = settings.vision_python == config.VISION_IN_PROCESS
     opencv = _opencv_version() if in_process else None
@@ -208,7 +185,7 @@ def _print_environment(settings: RuntimeSettings, palette: _Palette) -> bool:
         f"  {ok_mark} 运行参数    超时 {settings.timeout:g}s，"
         f"置信度下限 {settings.minimum_confidence}"
     )
-    return node is not None and (not in_process or opencv is not None)
+    return protocol_ready and (not in_process or opencv is not None)
 
 
 # ==========================================================================
@@ -486,10 +463,6 @@ def run_console(argv: list[str]) -> int:
     args = build_parser().parse_args(argv)
     if args.max_concurrency < 0:
         raise SystemExit("--max-concurrency 必须 >= 0")
-    if not 1 <= args.vms_per_node <= MAX_VMS_PER_NODE:
-        raise SystemExit(
-            f"--vms-per-node 必须位于 1..{MAX_VMS_PER_NODE}"
-        )
     if not 0.0 <= args.min_confidence <= 1.0:
         raise SystemExit("--min-confidence 必须位于 0..1")
 
@@ -506,7 +479,10 @@ def run_console(argv: list[str]) -> int:
 
 
 def _serve(args: argparse.Namespace, palette: _Palette) -> int:
-    settings = RuntimeSettings.from_args(args)
+    try:
+        settings = RuntimeSettings.from_args(args)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     fast_mode = fast_mode_enabled(args)
     concurrency = effective_server_concurrency(args)
     fixed_profile = generate_device_profile() if fast_mode else None
@@ -532,7 +508,6 @@ def _serve(args: argparse.Namespace, palette: _Palette) -> int:
         DeviceSessionPool(
             enabled=True,
             capacity=max(concurrency, 1),
-            vms_per_node=args.vms_per_node,
         )
         if fast_mode
         else None
@@ -555,13 +530,9 @@ def _serve(args: argparse.Namespace, palette: _Palette) -> int:
     base_url = f"http://{host}:{port}"
     prewarmed = 0
     if device_pool is not None and fixed_profile is not None:
-        node_hosts = (
-            max(concurrency, 1) + args.vms_per_node - 1
-        ) // args.vms_per_node
         print(
             f"\n{palette.bold}快速模式预热{palette.reset}  "
-            f"正在准备 {node_hosts} 个 Node host / "
-            f"{max(concurrency, 1)} 个隔离 VM……"
+            f"正在准备 {max(concurrency, 1)} 个独立设备会话……"
         )
         prewarmed = device_pool.prime(
             settings.build_device_runtime(
@@ -571,7 +542,7 @@ def _serve(args: argparse.Namespace, palette: _Palette) -> int:
             )
         )
         print(
-            f"  {palette.green}已就绪 {prewarmed}/{max(concurrency, 1)} VM"
+            f"  {palette.green}已就绪 {prewarmed}/{max(concurrency, 1)} 个会话"
             f"{palette.reset}；后续按使用量补回，不做定时请求"
         )
 
@@ -660,7 +631,7 @@ def run_doctor() -> int:
     """逐项打印运行形态与关键资源的解析结果，返回 0 表示全部就绪。
 
     分发包在别人机器上跑不起来时，这是第一手排障信息：它回答"文件到底在不在、
-    Node 能不能起、OpenCV 有没有打进来"，而不是只丢一句"运行失败"。
+    纯 Python 依赖与 OpenCV 有没有打进来"，而不是只丢一句"运行失败"。
     """
 
     palette = _prepare_console("AliSlider doctor")
@@ -686,22 +657,13 @@ def run_doctor() -> int:
         print(f"     {_pad(label, 14)}{detail}")
 
     print(f"\n{palette.bold}随包资源{palette.reset}")
-    for label, path in (
-        ("PE 桥", config.PE_DATA_BRIDGE),
-        ("设备桥", config.SDK_DEVICE_BRIDGE),
-        ("默认轨迹", config.DEFAULT_TOUCH_TRACK),
-    ):
+    for label, path in (("默认轨迹", config.DEFAULT_TOUCH_TRACK),):
         exists = path.is_file()
         healthy = healthy and exists
         detail = f"{path.stat().st_size:>9,} 字节" if exists else "缺失"
         report(exists, label, detail, str(path))
 
     print(f"\n{palette.bold}运行时{palette.reset}")
-    node_binary = config.DEFAULT_NODE_BINARY
-    node = _node_version(node_binary)
-    healthy = healthy and node is not None
-    report(node is not None, "Node", node or "无法运行", node_binary)
-
     # OpenCV/NumPy 在源码运行下本来就可以装在另一个解释器里，不算故障；
     # 冻结分发里它们必须在包内，缺了就是包不完整。
     for label, module in (("OpenCV", "cv2"), ("NumPy", "numpy")):
@@ -760,7 +722,7 @@ def _select_startup_arguments(
 
     print(
         "\n请选择启动模式：\n"
-        "  1. 快速模式（推荐）  5 并发 + 2 Node / 5 VM，兼顾单包与吞吐\n"
+        "  1. 快速模式（推荐）  5 并发 + 5 个预热会话，兼顾单包与吞吐\n"
         "  2. 标准模式          1 并发 + 逐轮设备画像，不做投机预热\n"
         "  3. 自定义模式        自己选择并发数、端口与是否预热\n"
         "  4. 环境自检\n"

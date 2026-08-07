@@ -1,7 +1,7 @@
 # 打包为 Windows 免安装分发包
 
-产出一个解压即用的文件夹：目标机器不装 Python、不装 Node.js、不装 OpenCV，
-双击 `AliSlider.exe` 就能跑。
+产出一个解压即用的文件夹：目标机器不装 Python、不装 OpenCV，双击
+`AliSlider.exe` 就能跑。
 
 ```text
 packaging/
@@ -37,8 +37,8 @@ powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
 
 或者直接双击 `packaging\build_windows.bat`。
 
-脚本会依次完成：建独立构建虚拟环境 → 装依赖 → 下载 `node.exe` →
-调用 PyInstaller → 把使用说明拷进产物 → 自检可执行文件 → 压缩。
+脚本会依次完成：建独立构建虚拟环境、安装依赖、调用 PyInstaller、把使用说明
+拷进产物、自检可执行文件、压缩。
 
 产物：
 
@@ -50,12 +50,6 @@ dist\AliSlider-win64.zip         发给别人的压缩包
 常用开关：
 
 ```powershell
-# 换 Node 版本
--NodeVersion v22.14.0
-
-# 离线构建：用本地已有的 node.exe
--NodeExe C:\tools\node\node.exe
-
 # 打成单个 exe（不推荐，见下文）
 -OneFile
 
@@ -80,23 +74,16 @@ _internal\               PyInstaller 运行时目录
   ├── python3xx.dll      Python 解释器
   ├── cv2\               OpenCV（headless 版）
   ├── numpy\             NumPy
-  ├── cryptography\      AES/HMAC
-  ├── node\node.exe      两个 .mjs 桥的宿主
-  └── ali_slider_reverse\runtime\bridges\*.mjs
+  └── cryptography\      AES/HMAC
 使用说明.txt
 ```
 
-体积大致：解压后 200~260 MB，压缩包 90~120 MB。大头是 `node.exe`（约 80 MB）
-和 OpenCV（约 60 MB），两个都不能省——前者是设备链与 PE 的宿主，后者是缺口识别。
+体积以实际构建产物为准，主要来自 OpenCV、NumPy 和 Python 运行时。
 
 
-## 5. 冻结分发下的两处行为差异
+## 5. 冻结分发下的行为差异
 
-打包后有两件事和源码运行不一样，都是自动生效的，无需配置：
-
-**Node 用随包携带的那一份。** `config.DEFAULT_NODE_BINARY` 在冻结分发下解析成
-`node\node.exe`，找不到才回落到 PATH。想换版本可以直接替换这个文件，或用
-`--node` 指定。
+打包后图像识别行为与源码运行不同，自动生效，无需配置：
 
 **图像识别在进程内跑。** 源码运行时 OpenCV 在独立解释器里（主环境不必装
 OpenCV）；打包后 OpenCV 已经在同一个可执行文件里，再去 spawn 一个「装了
@@ -109,8 +96,8 @@ OpenCV 的 Python」既找不到也没必要，因此 `--vision-python` 默认�
 
 ## 6. 为什么默认不是单文件
 
-单文件模式每次启动都要把整包（含 80 MB 的 `node.exe`）解压到临时目录，冷启动
-十几秒，退出后还可能残留目录。onedir 解压一次就是文件夹本体，双击即启动。
+单文件模式每次启动都要把完整 Python、OpenCV 与 NumPy 运行目录解压到临时目录，
+冷启动更慢，退出后还可能残留目录。onedir 解压一次就是文件夹本体，双击即启动。
 
 确实需要单文件分发时加 `-OneFile`，代价自负。
 

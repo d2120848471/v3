@@ -5,7 +5,7 @@
 
 ## 参数边界
 
-Node、视觉解释器、超时等运行环境由**启动命令**固定；逐轮变化的只有四个请求参数：
+视觉解释器、超时等运行环境由**启动命令**固定；逐轮变化的只有四个请求参数：
 
 ```text
 SceneId     可选，验证码场景 ID
@@ -14,8 +14,8 @@ AaduaneId   可选，覆盖 RPC key id
 prefix      可选，验证码实例域名前缀，同时决定 Init/Verify 域名
 ```
 
-``proxy`` 覆盖本轮**全部三个网络出口**（SDK 下载、Init/Verify/日志、图片与动态
-PE），避免同一 ``CertifyId`` 的请求出现在多个源 IP 上。
+``proxy`` 覆盖本轮**全部三个网络出口**（设备日志、Init/Verify、图片），避免同一
+``CertifyId`` 的请求出现在多个源 IP 上。
 
 ## 状态码语义
 
@@ -26,7 +26,7 @@ PE），避免同一 ``CertifyId`` 的请求出现在多个源 IP 上。
 200  一次正常往返；验证码未通过时 ok=false，由 VerifyCode 说明原因
 ```
 
-每轮挑战使用独立的客户端、FeiLin worker、临时目录与 ``CertifyId``，只共享线程
+每轮挑战使用独立的客户端、设备 session、临时目录与 ``CertifyId``，只共享线程
 安全的底层连接池与 best-effort 执行器；单次 Verify 的边界仍然逐轮成立。
 """
 
@@ -50,7 +50,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from .. import __version__, config
-from ..challenge.device_pool import DeviceSessionPool, MAX_VMS_PER_NODE
+from ..challenge.device_pool import DeviceSessionPool
 from ..challenge.session import normalize_proxies
 from ..challenge.transport import SharedHttpAdapterPool, warm_connections
 from ..device_profile import DeviceProfile, generate_device_profile
@@ -140,7 +140,8 @@ _DOCS_HTML = """<!doctype html>
       <button type="submit" class="wide">发送请求</button>
     </form>
     <h3>完整响应</h3>
-    <div class="muted">timingsMs 给出每个步骤耗时；慢机器调用端读超时建议至少 90 秒。</div>
+    <div class="muted">timingsMs 给出每个步骤耗时；
+      慢机器调用端读超时建议至少 90 秒。</div>
     <pre id="response">点击“发送请求”后，这里会显示 HTTP 状态码和完整 JSON 返回。</pre>
   </div>
   <div class="card links">
@@ -274,7 +275,6 @@ def _startup_warm_urls() -> tuple[str, ...]:
         config.init_url(),
         config.verify_url(),
         config.IMAGE_BASE,
-        config.PE_BASE,
     ]
     if config.UPLOAD_LOG_ENABLED:
         urls.append(config.UPLOAD_URL)
@@ -391,9 +391,9 @@ def solve_once(
     """执行一轮完整挑战并返回响应体。
 
     每次调用都新建客户端与设备运行时：``proxy``、``SceneId`` 与 ``AaduaneId``
-    逐轮不同，而 FeiLin worker 本身就绑定单轮 session，不适合跨请求复用。
+    逐轮不同，而设备运行态本身就绑定单轮 session，不适合跨请求复用。
 
-    ``pool`` 只改变 FeiLin 会话是"现建"还是"请求前已备好"，不改变本轮只用一个
+    ``pool`` 只改变设备会话是"现建"还是"请求前已备好"，不改变本轮只用一个
     会话、一个 ``CertifyId`` 的语义；未开启时行为与之前完全一致。
     """
 
@@ -416,7 +416,7 @@ def solve_once(
         setup_started = time.monotonic()
         try:
             # 标准模式逐轮生成；快速模式由服务入口传入本进程固定画像。无论哪种
-            # 模式，同一轮 HTTP 头、FeiLin 指纹与动态 PE 环境共用同一个对象。
+            # 模式，同一轮 HTTP 头、设备指纹与 PE 参数共用同一个对象。
             device_profile = device_profile or generate_device_profile()
             client = settings.build_client(
                 scene_id=request.scene_id,
@@ -893,14 +893,13 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.max_concurrency < 0:
         raise SystemExit("--max-concurrency 必须 >= 0")
-    if not 1 <= args.vms_per_node <= MAX_VMS_PER_NODE:
-        raise SystemExit(
-            f"--vms-per-node 必须位于 1..{MAX_VMS_PER_NODE}"
-        )
     if not 0.0 <= args.min_confidence <= 1.0:
         raise SystemExit("--min-confidence 必须位于 0..1")
 
-    settings = RuntimeSettings.from_args(args)
+    try:
+        settings = RuntimeSettings.from_args(args)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     fast_mode = fast_mode_enabled(args)
     concurrency = effective_server_concurrency(args)
     fixed_profile = generate_device_profile() if fast_mode else None
@@ -932,7 +931,6 @@ def main(argv: list[str] | None = None) -> int:
         DeviceSessionPool(
             enabled=True,
             capacity=max(concurrency, 1),
-            vms_per_node=args.vms_per_node,
         )
         if fast_mode
         else None
@@ -953,7 +951,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     if transport_pool is not None:
         # 设备池就绪后再按并发容量建立 TCP/TLS（不发 HTTP 字节），避免握手过早完成
-        # 后在漫长的 Node prime 期间闲置失效；等开始监听时首批请求也能直接复用。
+        # 后在设备池 prime 期间闲置失效；等开始监听时首批请求也能直接复用。
         warm_connections(
             transport_pool.get(None),
             _startup_warm_urls(),
@@ -966,12 +964,8 @@ def main(argv: list[str] | None = None) -> int:
         if concurrency > 0
         else "不限并发"
     )
-    node_hosts = (
-        max(concurrency, 1) + args.vms_per_node - 1
-    ) // args.vms_per_node
     mode_label = (
-        f"快速模式，预热 {prewarmed}/{max(concurrency, 1)} VM，"
-        f"{node_hosts} 个 Node host（每个最多 {args.vms_per_node} VM）"
+        f"快速模式，预热 {prewarmed}/{max(concurrency, 1)} 个设备会话"
         if fast_mode
         else "标准模式"
     )

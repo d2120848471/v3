@@ -39,7 +39,7 @@ from ..challenge.session import (
 )
 from ..device_profile import DeviceProfile, generate_device_profile
 from ..errors import AliSliderError
-from ..runtime.node_device import DeviceRuntimeResult
+from ..runtime.device import DeviceRuntimeResult
 from ..runtime.vision import VisionResult
 from .options import (
     RuntimeSettings,
@@ -116,13 +116,13 @@ def _vision_summary(vision: VisionResult) -> dict[str, Any]:
 
 
 def _track_summary(build: VerifyBuild) -> dict[str, Any]:
-    """只输出原生轨迹结构，不输出本轮绝对时间或事件派生值。"""
+    """只输出 data 轨迹结构，不输出本轮绝对时间或事件派生值。"""
 
     return {
         "eventCount": build.track_event_count,
-        "dataMousemoveEventCount": build.native_mousemove_event_count,
-        "replayedBeforeGetterCount": len(build.feilin_interaction_events),
-        "postGetterDataEventCount": build.post_getter_mousemove_event_count,
+        "dataMousemoveEventCount": build.data_mousemove_event_count,
+        "validatedBeforeGetterCount": len(build.device_interaction_events),
+        "postGetterDataEventCount": build.post_getter_data_event_count,
         "timingValidated": True,
     }
 
@@ -199,7 +199,7 @@ def _solve_command(args: argparse.Namespace) -> int:
             challenge, assets
         )
         vision = client.solve_assets(assets, x_pos_override=args.x_pos)
-        # solve 不执行动态 PE 轨迹，因此也不猜测最终 getter 参数；
+        # solve 不执行 PE 轨迹，因此也不计算最终 getter 参数；
         # 这里只报告已完成容器与 session 校验的 Init 运行态。
         device = device_session.initial_result
 
@@ -216,7 +216,6 @@ def _solve_command(args: argparse.Namespace) -> int:
             "initializationLog": {
                 "attempted": True,
                 "succeeded": upload_log_succeeded,
-                "cssLoaded": assets.stylesheet_loaded,
             },
             "artifactsDir": artifacts_value,
         }
@@ -306,7 +305,7 @@ def _add_shared_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--artifacts-dir",
-        help="可选：保存本轮 back.png、shadow.png 与 pe.js 的目录",
+        help="可选：保存本轮 back.png 与 shadow.png 的目录",
     )
 
 

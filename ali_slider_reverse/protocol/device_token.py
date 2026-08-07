@@ -3,15 +3,12 @@
 只实现已由前端运行时确认的两种容器：
 
 ```text
-DeviceConfig  Base64 → AES-128-CBC → PKCS7 → 九段 '#' 文本
+DeviceConfig  Base64 → AES-128-CBC → PKCS7 → 九段以上 '#' 文本
 DeviceToken   Base64( "WEB#session#fingerprintCipher#GatherCost#md5" )
 ```
 
-**职责边界**：本模块负责容器的拆装与校验，不负责生成指纹。真实的
-fingerprint cipher 由公开 FeiLin 在 Node VM 中原生产生（见
-:mod:`ali_slider_reverse.runtime.node_device`）；这里只做四件事——解开
-容器、验证 MD5、在 GatherCost 需要正常化时重建容器、解密指纹密文以读取
-FeiLin 时钟字段。
+**职责边界**：本模块只负责标准 AES 与 DeviceToken 容器；111 段指纹的字段语义
+由 :mod:`ali_slider_reverse.runtime.device` 负责。
 
 AES key 与 deviceToken salt 均必须由调用方显式传入，模块不内置任何动态脚本
 版本常量或真实挑战数据。
@@ -26,14 +23,13 @@ import hmac
 from dataclasses import dataclass, field
 from typing import Any
 
-
 DEFAULT_DEVICE_CONFIG_IV = b"0123456789ABCDEF"
 """前端固定的 AES-CBC 初始向量。"""
 
 
 @dataclass(frozen=True, slots=True)
 class DeviceConfig:
-    """Init 阶段由 Log1 下发、经 Node VM 解密后的九段设备配置。
+    """Init 阶段由 Log1 下发、经纯 Python 解密后的九段以上设备配置。
 
     ``key`` 是本轮 session 的指纹加密密钥，``session_id`` 把 DeviceConfig 与
     两枚 DeviceToken 绑定在同一次 FeiLin 采集上。除 ``switch``/``version``
@@ -52,7 +48,7 @@ class DeviceConfig:
     extra_segments: tuple[str, ...] = field(default=(), repr=False)
 
     def as_dict(self) -> dict[str, str | int | list[str]]:
-        """以前端字段名返回普通字典，供 Node PE 桥消费。"""
+        """以前端字段名返回普通字典，供诊断与结构化输出使用。"""
 
         result: dict[str, str | int | list[str]] = {
             "key": self.key,
@@ -151,6 +147,36 @@ def aes_cbc_decrypt_base64(
         raise ValueError("AES 解密失败或 PKCS7 padding 无效") from exc
 
 
+def aes_cbc_encrypt_base64(
+    plaintext: str | bytes,
+    *,
+    key: str | bytes,
+    iv: str | bytes = DEFAULT_DEVICE_CONFIG_IV,
+) -> str:
+    """UTF-8/原始字节 → PKCS7 → AES-128-CBC → 标准 Base64。
+
+    CryptoJS 在当前公开前端中的 ``AES.encrypt(...).ciphertext.toString(Base64)``
+    正好对应这条路径：不带 OpenSSL salt 头，也不派生 key。
+    """
+
+    key_bytes = _as_bytes(key, label="AES key")
+    iv_bytes = _as_bytes(iv, label="AES IV")
+    plain_bytes = _as_bytes(plaintext, label="AES plaintext")
+    if len(key_bytes) != 16:
+        raise ValueError("AES-128 key 必须恰好为 16 字节")
+    if len(iv_bytes) != 16:
+        raise ValueError("CBC IV 必须恰好为 16 字节")
+
+    padding, Cipher, algorithms, modes = _load_cryptography()
+    padder = padding.PKCS7(128).padder()
+    padded = padder.update(plain_bytes) + padder.finalize()
+    encryptor = Cipher(
+        algorithms.AES(key_bytes), modes.CBC(iv_bytes)
+    ).encryptor()
+    ciphertext = encryptor.update(padded) + encryptor.finalize()
+    return base64.b64encode(ciphertext).decode("ascii")
+
+
 def _validate_token_part(value: str, *, label: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{label} 必须是 str")
@@ -247,7 +273,7 @@ def parse_device_token(
     if not salt_bytes:
         raise ValueError("deviceToken salt 不能为空")
     expected = hashlib.md5(
-        f"WEB#{session}#{cipher}#{cost}#".encode("utf-8") + salt_bytes
+        f"WEB#{session}#{cipher}#{cost}#".encode() + salt_bytes
     ).hexdigest()
     if not hmac.compare_digest(checksum, expected):
         raise ValueError("deviceToken MD5 校验失败")
@@ -266,6 +292,7 @@ __all__ = [
     "DeviceConfig",
     "DeviceToken",
     "aes_cbc_decrypt_base64",
+    "aes_cbc_encrypt_base64",
     "build_device_token",
     "parse_device_token",
 ]

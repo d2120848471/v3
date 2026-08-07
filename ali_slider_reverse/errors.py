@@ -12,9 +12,9 @@
 AliSliderError                  协议闭环失败的根类型
 ├── ProtocolError               纯算法层：编解码、schema、签名
 │   └── DataCodecError          data 层的格式/schema 不符
-├── RuntimeBridgeError          子进程/VM 桥的根类型
-│   ├── DeviceRuntimeError      FeiLin 设备桥无法安全产生 token
-│   ├── PeRuntimeError          动态 PE 桥无法生成或校验 data
+├── RuntimeBridgeError          运行时计算层根类型（保留类名兼容旧调用方）
+│   ├── DeviceRuntimeError      设备协议无法安全产生 token
+│   ├── PeRuntimeError          纯 Python PE 无法生成或校验 data
 │   └── VisionError             OpenCV 缺口求解不可用或失败
 └── ApiRequestError             HTTP 接口入参不合法（不消耗挑战）
 ```
@@ -42,15 +42,15 @@ class DataCodecError(ProtocolError):
 
 
 class RuntimeBridgeError(AliSliderError):
-    """Node/Python 子进程桥无法给出可信结果。"""
+    """运行时计算无法给出可信结果；类名为兼容旧调用方而保留。"""
 
 
 class DeviceRuntimeError(RuntimeBridgeError):
-    """设备运行桥无法安全、完整地产生 DeviceToken。"""
+    """设备协议无法安全、完整地产生 DeviceToken。"""
 
 
 class PeRuntimeError(RuntimeBridgeError):
-    """动态 PE 桥无法生成或验证当前分片的 data。"""
+    """纯 Python PE 无法生成或验证当前 data。"""
 
 
 class VisionError(RuntimeBridgeError):

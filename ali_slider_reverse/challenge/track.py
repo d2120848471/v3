@@ -38,7 +38,6 @@ from typing import Any
 from .. import config
 from ..errors import AliSliderError
 
-
 SPEED_RANGE = (0.80, 1.28)
 """整条轨迹的时间缩放区间。"""
 
@@ -197,7 +196,7 @@ def _humanize(
         if index == 0:
             x = 0
         elif index >= last_index - 1 or round(sample["x"]) >= target_x:
-            # 尾段——手柄已经到位。动态 PE 的 slidePos 取自**最后一个
+            # 尾段——手柄已经到位。PE 的 slidePos 取自**最后一个
             # touchmove**，这里抖一个像素或把它抽稀掉，slidePos 就会与识别结果
             # 差 1px，整轮作废。真实轨迹的收尾本来也是 touchmove 与 touchend
             # 停在同一个 x 上。
@@ -237,7 +236,7 @@ def load_scaled_touch_track(
     返回的每项形如
     ``{"x": int, "y": int, "dt": int, "type": str, "force": float,
     "radiusX": float, "radiusY": float}``，可直接交给
-    :class:`~ali_slider_reverse.runtime.node_pe.PeRuntimeClient` 回放。
+    :class:`~ali_slider_reverse.runtime.pe.PeRuntimeClient` 计算。
 
     传入固定种子的 :class:`Random` 可以复现同一条轨迹，用于测试与问题复盘。
     """

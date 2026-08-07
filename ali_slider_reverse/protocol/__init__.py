@@ -17,12 +17,14 @@ from .data_codec import (
     DATA_PAYLOAD_FIELDS,
     TRACK_LIST_FIELDS,
     DecodedData,
+    pack_data,
     unpack_data,
 )
 from .device_token import (
     DeviceConfig,
     DeviceToken,
     aes_cbc_decrypt_base64,
+    aes_cbc_encrypt_base64,
     build_device_token,
     parse_device_token,
 )
@@ -49,6 +51,7 @@ __all__ = [
     "DeviceToken",
     "FrontendSecrets",
     "aes_cbc_decrypt_base64",
+    "aes_cbc_encrypt_base64",
     "build_business_captcha_verify_param",
     "build_business_signed_query",
     "build_device_token",
@@ -56,6 +59,7 @@ __all__ = [
     "compact_json",
     "js_form_urlencode",
     "parse_device_token",
+    "pack_data",
     "resolve_frontend_secrets",
     "rpc_v1_signature",
     "unpack_data",

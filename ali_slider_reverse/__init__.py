@@ -9,7 +9,7 @@
 config / errors      集中式常量与统一异常层级
 protocol/            纯算法：签名、参数封装、token 容器、data 解包、密文恢复
 vision/              坐标运动式与 OpenCV 缺口定位
-runtime/             Node 与 OpenCV 子进程桥，重环境依赖都隔离在这一层
+runtime/             纯 Python 设备/PE 计算与可选 OpenCV worker
 challenge/           编排：Init → 资源 → 识别 → PE → Verify，持有全部网络出口
 entrypoints/         CLI、HTTP 接口与视觉 worker
 ```
@@ -67,14 +67,14 @@ from .errors import (
     RuntimeBridgeError,
     VisionError,
 )
-from .runtime.node_device import (
+from .runtime.device import (
     DeviceRuntimeClient,
     DeviceRuntimeResult,
     DeviceRuntimeSession,
 )
 from .runtime.vision import VisionResult
 
-__version__ = "2.0.0"
+__version__ = "3.0.0"
 
 __all__ = [
     # 编排入口

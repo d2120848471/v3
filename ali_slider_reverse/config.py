@@ -1,6 +1,6 @@
 """集中式运行常量。
 
-重构前同一个默认值会同时硬编码在 ``client.py``、``cli.py``、``api.py`` 和两个
+重构前同一个默认值会同时硬编码在 ``client.py``、``cli.py``、``api.py`` 和多个
 runtime 模块里（超时、GatherCost 区间、首触年龄、vision 解释器路径……），改一处
 就要记得改另外三处。这里作为唯一事实来源：
 
@@ -21,8 +21,8 @@ from .device_profile import DeviceProfile
 # ==========================================================================
 # 冻结分发（PyInstaller）
 #
-# 打包后的可执行文件里没有 pip、没有 PATH 上的 node，也没有第二个装了 OpenCV 的
-# 解释器。所以运行时要能自己回答两个问题：Node 在哪、图像识别怎么跑。
+# 打包后的可执行文件里没有 pip，也没有第二个装了 OpenCV 的解释器，因此图像识别
+# 需要支持直接在冻结进程内运行。
 # ==========================================================================
 
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -39,44 +39,15 @@ Python"既找不到、也没必要。
 """
 
 
-def _bundled_node_binary() -> str | None:
-    """定位随包携带的 Node 可执行文件。
-
-    先看可执行文件旁边（允许分发后自行替换版本），再看打包资源目录。两处都没有
-    时返回 ``None``，由调用方回落到 PATH 上的 ``node``。
-    """
-
-    if not FROZEN:
-        return None
-    name = "node.exe" if sys.platform == "win32" else "node"
-    roots = [Path(sys.executable).resolve().parent]
-    if BUNDLE_ROOT is not None:
-        roots.append(BUNDLE_ROOT)
-    for root in roots:
-        candidate = root / "node" / name
-        if candidate.is_file():
-            return str(candidate)
-    return None
-
-
 # ==========================================================================
 # 包内资源路径
 # ==========================================================================
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
-"""包根目录；Node 桥脚本与默认轨迹资产都相对它定位。
+"""包根目录；默认轨迹资产相对它定位。
 
 冻结分发下 ``__file__`` 指向解包目录内的同名路径，因此这里无需特判。
 """
-
-BRIDGES_DIR = PACKAGE_ROOT / "runtime" / "bridges"
-"""Node 侧桥脚本目录。"""
-
-SDK_DEVICE_BRIDGE = BRIDGES_DIR / "sdk_device_bridge.mjs"
-"""公开 SDK/FeiLin 的持久 VM 脚本。"""
-
-PE_DATA_BRIDGE = BRIDGES_DIR / "pe_data_bridge.mjs"
-"""本轮动态 PE 的隔离 VM 脚本。"""
 
 DEFAULT_TOUCH_TRACK = PACKAGE_ROOT / "challenge" / "default_touch_track.json"
 """默认运行必需的脱敏触摸轨迹；不含 token、Cookie、CertifyId 或签名密钥。"""
@@ -112,21 +83,13 @@ Verify 控制流的 best-effort 遥测。发送实现仍保留，需要对照公
 IMAGE_BASE = "https://static-captcha.aliyuncs.com/"
 """back.png / shadow.png 的公开 CDN 前缀。"""
 
-PE_BASE = "https://g.alicdn.com/captcha-frontend/dynamicJS/"
-"""动态 PE 与 main.css 的公开 CDN 前缀。"""
-
-SDK_URL = (
-    "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js"
+DEVICE_ENDPOINT = (
+    "https://cloudauth-device-dualstack.cn-shanghai.aliyuncs.com"
 )
-"""公开 AliyunCaptcha.js 下载地址。"""
+"""公开 FeiLin 设备日志 RPC；Log1/Log2/Log3 均发往此处。"""
 
-ALLOWED_SDK_HOSTS = frozenset({"o.alicdn.com", "g.alicdn.com"})
-"""允许下载公开 SDK 的主机白名单。"""
-
-ALLOWED_ASSET_HOSTS = frozenset(
-    {"static-captcha.aliyuncs.com", "g.alicdn.com"}
-)
-"""允许下载图片与动态 PE 的主机白名单。"""
+ALLOWED_ASSET_HOSTS = frozenset({"static-captcha.aliyuncs.com"})
+"""允许下载验证码图片的主机白名单。"""
 
 BUSINESS_SALT_SHA256 = (
     "f97a59184f21e111608dac2e6397f2cf07866638e5df657937e98f36279615d6"
@@ -183,8 +146,8 @@ def browser_headers(
     ``image|script|style`` 配 ``no-cors`` 且不带 ``Origin``。这些值浏览器会自动
     填，服务端也可能据此判断请求来源，因此按实际场景传参而不是写死一套。
 
-    ``profile`` 必须与本轮两个 Node 桥用的是同一套，否则服务端会同时看到 HTTP
-    层与指纹层两台不同的设备。
+    ``profile`` 必须与本轮纯 Python 指纹和 PE 计算用的是同一套，否则服务端会
+    同时看到 HTTP 层与指纹层两台不同的设备。
     """
 
     headers = {
@@ -220,12 +183,6 @@ SLIDER_HANDLE_WIDTH = 40
 # 运行默认值：入口层可通过命令行覆盖
 # ==========================================================================
 
-DEFAULT_NODE_BINARY = _bundled_node_binary() or "node"
-"""Node 可执行文件。
-
-冻结分发优先用随包携带的那一份，保证目标机器没装 Node 也能跑；否则取 PATH。
-"""
-
 DEFAULT_VISION_PYTHON = (
     VISION_IN_PROCESS
     if FROZEN
@@ -241,7 +198,7 @@ Homebrew 环境，其他平台默认取当前解释器，都可用 ``--vision-py
 """
 
 DEFAULT_TIMEOUT = 25.0
-"""单步网络请求或子进程调用的超时秒数。"""
+"""单步网络请求或视觉 worker 调用的超时秒数。"""
 
 DEFAULT_MIN_CONFIDENCE = 0.45
 """低于此图像置信度就停止，且不发送 Verify、不消耗挑战。
@@ -252,10 +209,7 @@ DEFAULT_MIN_CONFIDENCE = 0.45
 """
 
 DEFAULT_GATHER_COST_RANGE = (180, 260)
-"""Node 补环境过快导致 GatherCost 落到 0ms 时的正常化区间（毫秒）。
-
-真实页面采集约 226ms，同一公开脚本在轻量 Node DOM 中会瞬间完成。
-"""
+"""指纹采集 GatherCost 的正常浏览器区间（毫秒）。"""
 
 DEFAULT_FIRST_TOUCH_AGE_RANGE = (650, 850)
 """首个 touch 相对 TrackStartTime 的逻辑年龄区间（毫秒）。
@@ -267,19 +221,8 @@ DEFAULT_FIRST_TOUCH_AGE_RANGE = (650, 850)
 VERIFY_FUTURE_SKEW_LIMIT_MS = 2_000
 """VerifyTime 允许超前当前墙钟的上限（毫秒）。
 
-虚拟时钟快速回放后可能生成"未来的 VerifyTime"，发请求前独立拒绝掉。
+逻辑时钟快速构造后可能生成"未来的 VerifyTime"，发请求前独立拒绝掉。
 """
-
-SDK_CACHE_TTL_SECONDS = 900.0
-"""公开 ``AliyunCaptcha.js`` 本地缓存的有效期（秒）。
-
-这是个 225KB 的公开静态文件，每轮重新下载要付一次 CDN 往返（实测约 120ms），
-而它的更新频率是天/周级。15 分钟意味着每天仍会重新拉取近百次，足够跟上前端热
-更新，同时把绝大多数轮次的这次下载降到零。
-
-设为 0 或负数则每轮都重新下载；``--sdk-js`` 指定本地副本时缓存完全不参与。
-"""
-
 
 # ==========================================================================
 # HTTP 接口默认值
@@ -296,36 +239,29 @@ API_MAX_BODY_BYTES = 64 * 1024
 
 __all__ = [
     "ALLOWED_ASSET_HOSTS",
-    "ALLOWED_SDK_HOSTS",
     "API_HEALTH_PATH",
     "API_HOST",
     "API_MAX_BODY_BYTES",
     "API_PORT",
     "API_SOLVE_PATH",
-    "BRIDGES_DIR",
     "BUNDLE_ROOT",
     "BUSINESS_SALT_SHA256",
     "CAPTCHA_API_VERSION",
     "DEFAULT_FIRST_TOUCH_AGE_RANGE",
     "DEFAULT_GATHER_COST_RANGE",
     "DEFAULT_MIN_CONFIDENCE",
-    "DEFAULT_NODE_BINARY",
     "DEFAULT_PREFIX",
     "DEFAULT_REGION",
     "DEFAULT_SCENE_ID",
     "DEFAULT_TIMEOUT",
     "DEFAULT_TOUCH_TRACK",
     "DEFAULT_VISION_PYTHON",
+    "DEVICE_ENDPOINT",
     "FROZEN",
     "IMAGE_BASE",
     "ORIGIN",
     "PACKAGE_ROOT",
-    "PE_BASE",
-    "PE_DATA_BRIDGE",
     "REFERER",
-    "SDK_CACHE_TTL_SECONDS",
-    "SDK_DEVICE_BRIDGE",
-    "SDK_URL",
     "SLIDER_HANDLE_WIDTH",
     "SLIDER_RENDERED_WIDTH",
     "UPLOAD_URL",
