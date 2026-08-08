@@ -4,12 +4,15 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/d2120848471/v3/ali-slider-go/internal/config"
+	"github.com/d2120848471/v3/ali-slider-go/internal/server"
 )
 
 func TestClientOptionsMapsServiceConfiguration(t *testing.T) {
@@ -63,5 +66,26 @@ func TestRunReportsOccupiedListenerWithoutExternalRequests(t *testing.T) {
 	}, func(string) string { return "" }, logger)
 	if err == nil || !strings.Contains(err.Error(), "HTTP 服务退出") {
 		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestHeaderBudgetAcceptsMaximumLegacyQuery(t *testing.T) {
+	testServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := int64(len(r.URL.RawQuery)); got != server.MaxRequestBytes {
+			t.Errorf("raw query bytes = %d, want %d", got, server.MaxRequestBytes)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	testServer.Config.MaxHeaderBytes = maxHeaderBytes
+	testServer.Start()
+	t.Cleanup(testServer.Close)
+
+	response, err := testServer.Client().Get(testServer.URL + "/api/slider?" + strings.Repeat("x", int(server.MaxRequestBytes)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusNoContent)
 	}
 }

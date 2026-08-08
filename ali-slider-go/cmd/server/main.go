@@ -23,6 +23,8 @@ const (
 	readHeaderTimeout = 5 * time.Second
 	idleTimeout       = 90 * time.Second
 	purgeInterval     = time.Hour
+	// 在 64 KiB legacy query 之外保留原有的 32 KiB request-line/header 预算。
+	maxHeaderBytes = int(server.MaxRequestBytes) + (32 << 10)
 )
 
 func main() {
@@ -86,7 +88,7 @@ func run(args []string, getenv func(string) string, logger *log.Logger) error {
 		ReadTimeout:       cfg.Timeout + readHeaderTimeout,
 		WriteTimeout:      cfg.Timeout + readHeaderTimeout,
 		IdleTimeout:       idleTimeout,
-		MaxHeaderBytes:    32 << 10,
+		MaxHeaderBytes:    maxHeaderBytes,
 	}
 	rootContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()

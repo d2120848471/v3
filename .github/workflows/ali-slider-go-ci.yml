@@ -396,27 +396,64 @@ jobs:
             if (-not $openapiDocument["paths"].ContainsKey("/")) {
               throw "Packaged OpenAPI document is missing the API test page path"
             }
-            $solveResponses = $openapiDocument["paths"]["/api/slider"]["post"]["responses"]
-            if (-not $solveResponses.ContainsKey("403") -or $solveResponses.ContainsKey("429")) {
-              throw "Packaged OpenAPI solve responses do not match the 403/no-429 contract"
+            $solvePath = $openapiDocument["paths"]["/api/slider"]
+            if (-not $solvePath.ContainsKey("get") -or
+                -not $solvePath.ContainsKey("post") -or
+                $solvePath["get"]["deprecated"] -ne $true) {
+              throw "Packaged OpenAPI is missing the deprecated legacy GET query operation"
+            }
+            foreach ($method in @("get", "post")) {
+              $solveResponses = $solvePath[$method]["responses"]
+              if (-not $solveResponses.ContainsKey("403") -or $solveResponses.ContainsKey("429")) {
+                throw "Packaged OpenAPI $method solve responses do not match the 403/no-429 contract"
+              }
             }
 
-            $crossOrigin = Invoke-WebRequest `
-              -Method Post `
-              -Uri "http://127.0.0.1:18080/api/slider" `
-              -Headers @{ "Origin" = "https://attacker.example"; "Sec-Fetch-Site" = "cross-site" } `
-              -Body "" `
+            $legacyInvalid = Invoke-WebRequest `
+              -Method Get `
+              -Uri "http://127.0.0.1:18080/api/slider?SceneId=legacy&prefix=bad-prefix" `
               -SkipHttpErrorCheck `
               -TimeoutSec 2
-            $crossOriginBody = $crossOrigin.Content |
+            $legacyInvalidBody = $legacyInvalid.Content |
               ConvertFrom-Json -AsHashtable
-            $crossOriginTraceHeader = [string]$crossOrigin.Headers["X-Trace-ID"]
-            $crossOriginTraceBody = [string]$crossOriginBody["traceId"]
-            if ($crossOrigin.StatusCode -ne 403 -or
-                [string]$crossOriginBody["errorType"] -ne "ApiOriginError" -or
-                [string]::IsNullOrWhiteSpace($crossOriginTraceHeader) -or
-                $crossOriginTraceHeader -ne $crossOriginTraceBody) {
-              throw "Cross-origin browser boundary smoke failed"
+            $legacyInvalidTraceHeader = [string]$legacyInvalid.Headers["X-Trace-ID"]
+            $legacyInvalidTraceBody = [string]$legacyInvalidBody["traceId"]
+            if ($legacyInvalid.StatusCode -ne 400 -or
+                [string]$legacyInvalidBody["errorType"] -ne "ApiRequestError" -or
+                [string]::IsNullOrWhiteSpace($legacyInvalidTraceHeader) -or
+                $legacyInvalidTraceHeader -ne $legacyInvalidTraceBody) {
+              throw "Legacy GET query routing and validation smoke failed"
+            }
+
+            $crossOriginHeaders = @{
+              "Origin" = "https://attacker.example"
+              "Sec-Fetch-Site" = "cross-site"
+            }
+            $crossOriginGET = Invoke-WebRequest `
+              -Method Get `
+              -Uri "http://127.0.0.1:18080/api/slider?prefix=bad-prefix" `
+              -Headers $crossOriginHeaders `
+              -SkipHttpErrorCheck `
+              -TimeoutSec 2
+            $crossOriginPOST = Invoke-WebRequest `
+              -Method Post `
+              -Uri "http://127.0.0.1:18080/api/slider" `
+              -Headers $crossOriginHeaders `
+              -ContentType "application/json" `
+              -Body "[]" `
+              -SkipHttpErrorCheck `
+              -TimeoutSec 2
+            foreach ($crossOrigin in @($crossOriginGET, $crossOriginPOST)) {
+              $crossOriginBody = $crossOrigin.Content |
+                ConvertFrom-Json -AsHashtable
+              $crossOriginTraceHeader = [string]$crossOrigin.Headers["X-Trace-ID"]
+              $crossOriginTraceBody = [string]$crossOriginBody["traceId"]
+              if ($crossOrigin.StatusCode -ne 403 -or
+                  [string]$crossOriginBody["errorType"] -ne "ApiOriginError" -or
+                  [string]::IsNullOrWhiteSpace($crossOriginTraceHeader) -or
+                  $crossOriginTraceHeader -ne $crossOriginTraceBody) {
+                throw "Cross-origin browser boundary smoke failed"
+              }
             }
 
             $invalid = Invoke-WebRequest `

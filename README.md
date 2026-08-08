@@ -12,6 +12,19 @@ CGO_ENABLED=0 GOPROXY=off go test -count=1 ./...
 go run ./cmd/server
 ```
 
+## HTTP 调用
+
+服务只开放四个路径：`/`、`/api/slider`、`/health` 和 `/openapi.json`。新接入应使用 `POST /api/slider` + JSON；为兼容 Git 历史提交 `0509bfd` 中的旧 Python 客户端，同一 Solve 路径也保留已废弃的 `GET /api/slider?...` query 调用。两种方式都会发起真实求解。
+
+```bash
+curl --fail-with-body \
+  --header 'Content-Type: application/json' \
+  --data '{"SceneId":"1ug4aptr","prefix":"fsgtmi"}' \
+  http://127.0.0.1:8000/api/slider
+```
+
+只识别 `SceneId/sceneId`、`prefix/Prefix`、`AaduaneId/aaduaneId`、`proxy/Proxy` 这 8 个精确名称。GET 只读 query，POST 只读 JSON body，两个来源不合并，也不支持 form body。旧 GET 有真实副作用且 URL 可能进入历史或访问日志；不要把 `AaduaneId` 或带凭据的代理放入 query。完整字段、空值、重复键、64 KiB 和跨源合同见 [HTTP API](./ali-slider-go/docs/api.md)。
+
 ## Windows 免环境压缩包
 
 GitHub Actions 会在全部质量门禁通过后生成 `ali-slider-go-windows-amd64.zip`。包内是独立 EXE、双击启动脚本、中文说明、构建信息和 SHA-256；适用于 Windows 10 / Windows Server 2016 或更高版本的 AMD64/x64 机器，接收者无需安装 Go、Python、Node.js 或 VC++ Runtime。

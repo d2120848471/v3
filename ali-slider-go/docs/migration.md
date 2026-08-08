@@ -6,11 +6,11 @@
 
 - 单一纯 Go 进程完成一轮挑战，不依赖 Python、Node.js、浏览器、OpenCV、GoCV、CGo、动态库或子进程。
 - reusable Go library 与 HTTP 服务共用同一完整编排。
-- HTTP 请求先通过浏览器跨源边界和 JSON 输入边界，再直接进入 `Solve`；无浏览器来源头的旧 API 客户端保持兼容。应用内不设置在途请求闸门，也不因活动数返回 429。
+- HTTP Solve 请求先通过浏览器跨源边界和方法对应的 JSON/query 输入边界，再直接进入 `Solve`；无浏览器来源头的旧 curl/程序客户端保持兼容。应用内不设置在途请求闸门，也不因活动数返回 429。
 - 每轮状态隔离；每个 `CertifyId` 最多尝试一次 Verify，网络结果未知也不重试。
 - 普通 CI 完全使用 Mock/静态 fixture，不运行真实在线挑战。
 
-明确排除：Python 交互式 CLI、桌面 UI、PyInstaller、vision worker、业务提交/重放、`GET /api/slider` 和 Swagger UI。Go 服务新增的 `GET /` 是第一方内嵌 API 测试页，无额外 Web 运行时或 CDN 依赖，只手工调用现有 POST；它不是桌面 UI、Swagger 或新的解题协议入口。
+明确排除：Python 交互式 CLI、桌面 UI、PyInstaller、vision worker、业务提交/重放和 Swagger UI。已废弃的 `GET /api/slider?...` 只是旧 Python query 的传输兼容层，不是新的求解链；`GET /` 第一方内嵌页仍只手工调用推荐的 POST JSON，它不是桌面 UI 或 Swagger。
 
 ## 源码映射
 
@@ -63,14 +63,18 @@ HTTP / library Request
 | 行为 | Go 合同 |
 |---|---|
 | 浏览器测试入口 | `GET /`；只自动检查 health，手工提交现有 POST，不自动重试 |
-| 解题入口 | `POST /api/slider` |
-| Scene | `SceneId`，兼容 `sceneId`；规范字段优先 |
+| 推荐解题入口 | `POST /api/slider` + JSON object |
+| 旧 Python 兼容入口 | `GET /api/slider?...`；OpenAPI 标记 `deprecated`，但仍会发起真实求解 |
+| 参数源 | GET 只读 query，POST 只读 JSON body，两者不合并；不支持 form body |
+| Scene | `SceneId`，兼容 `sceneId`；规范字段优先，即使它为空值 |
 | prefix | `prefix`，兼容 `Prefix`；1–32 ASCII 字母数字 |
 | RPC key | `AaduaneId`，兼容 `aaduaneId` |
 | proxy | `proxy`，兼容 `Proxy`；无 scheme 时补 `http://` |
-| 未知 JSON 字段 | 忽略，保持前向兼容 |
-| 浏览器跨源 POST | Go 标准库 `http.CrossOriginProtection` 返回 `403 ApiOriginError`，不调用 Solver |
-| GET solve | 有意移除，返回 404 |
+| 重复/空 query | 同名键取最后一个值；规范名压过别名；空 `SceneId/prefix` 使用默认值 |
+| 输入大小 | JSON body 和 raw query 分别最大 65,536 字节 |
+| 未知字段 | JSON 或 query 中的未知键都忽略，保持前向兼容 |
+| 非法 query encoding | 返回 `400 ApiRequestError`，不调用 Solver |
+| 浏览器跨源 GET/POST | 返回 `403 ApiOriginError`，不调用 Solver；无浏览器来源头客户端允许 |
 
 ### 响应
 
@@ -90,7 +94,7 @@ HTTP / library Request
 | 差异 | 原因 | 调用方影响 |
 |---|---|---|
 | 默认 `127.0.0.1:8000` | 应用内无鉴权，缩小暴露面 | 外部访问必须经受控网络/反向代理 |
-| 无 GET solve；增加第一方内嵌测试页 | 解题仍只允许 POST；`GET /` 仅提供同源手工测试，不是 Swagger UI | 旧 GET solve 调用方仍必须迁移；本机用户可从浏览器手工测试 |
+| 恢复已废弃的 GET query；增加第一方内嵌测试页 | 保留旧 Python 传输兼容；测试页仍只使用 POST，不是 Swagger UI | 旧 GET 调用方可继续工作，新接入应使用 POST JSON |
 | 纯 Go 标准库 | 消除 Python/OpenCV/浏览器 worker | 不再安装 wheels、Node 或动态库 |
 | 图片默认在内存 | 降低临时文件竞争和泄漏 | 仅失败/低置信由 artifact 策略落盘 |
 | 更严格的 PNG/重定向/大小边界 | 防 SSRF、压缩炸弹和资源耗尽 | 异常旧输入更早失败 |
@@ -102,6 +106,8 @@ HTTP / library Request
 | 无本地并发接纳闸门 | 合法请求必须直达 `Solve`，`MaxConcurrency` 仅保留为 Client 资源预算 | 外层必须落实鉴权以及按身份/IP 的频率、并发和总量限制 |
 
 应用内既不实现鉴权，也不提供活动请求数保护；这是冻结范围内的已接受风险，不代表公网无鉴权部署安全。
+
+旧 GET 的副作用和 URL 泄露面是为兼容而保留的风险：不要把 `AaduaneId` 或含 username/password 的代理放入 query，也不要将该 GET 当作可预取、可重试或无副作用的读取。
 
 ## Oracle 与回归数据
 
@@ -202,7 +208,7 @@ Mac ARM64 纯计算 200 样本 `P50=50.577458ms`、`P95=55.711708ms`、`P99=57.0
 | `internal/challenge/solver_test.go` · `TestSolverOfflineCompleteSuccess` / `TestSolverLowConfidenceStopsBeforeVerify` / `TestSolverVerifyNetworkErrorIsSingleAttemptAndSanitized` | 完整 Mock 链证明成功一次 Verify、低置信零 Verify、网络错误一次尝试。 | fixture transport → state gates → counted Verify |
 | `internal/challenge/device_pool.go:22`、`:134`、`:190`、`:299` | 预热池按完整 key 隔离，并提供有界 Prime/Lease/冷建/过期/补货。 | Prime → key match → lease or cold open |
 | `cmd/server/main.go:36`、`:49`、`:55`、`:60`、`:93`、`:111`、`:147` | 启动器已接线配置、预热、启动/定时清理和优雅关闭。 | config → Client → HTTP → lifecycle cleanup |
-| `internal/server/server.go` · `browserOriginProtection` / `handleSolve`；`internal/server/server_test.go` · `TestBrowserOriginBoundaryPreservesLegacyClients` / `TestConcurrentRequestsAlwaysEnterSolver` | 通过跨源和解码校验的请求直接调用 Solver；Handler 没有本地活动数闸门、429 或退避响应。 | POST → origin/body gate → timeout context → Solve exactly once |
+| `internal/server/server.go` · `checkSolveOrigin` / `decodeRequest` / `decodeQueryRequest` / `requestFromPayload` / `handleSolve`；`internal/server/server_test.go` · `TestLegacyGETQueryCompatibility` / `TestLegacyGETQueryValidationNeverCallsSolver` / `TestSolveParameterSourcesStaySeparated` / `TestBrowserOriginBoundaryPreservesLegacyClients` / `TestConcurrentRequestsAlwaysEnterSolver` | 旧 GET query 的字段、重复键、默认值、64 KiB、非法 encoding 和跨源边界均有回归；通过校验的 GET/POST 直接调用 Solver，没有本地 429。 | method → origin + JSON/query gate → timeout context → Solve exactly once |
 | `go.mod:3`；`Makefile` · `build-linux`；`Dockerfile:3`、`:19` | Go `1.26.5`、静态二进制和 scratch 镜像均已有生产构建路径。 | source → binary/image → deployment candidate |
 | `.github/workflows/ali-slider-go-ci.yml` · `quality` / `race` / `windows-package` | Linux quality、Darwin race 和 Windows package job 都在 `CGO_ENABLED=0` 下建立纯 Go 质量与发布门禁。 | change → split-platform CI evidence → release gate |
 | `internal/vision/solver_test.go:17`；`internal/pe/builder_test.go:96` | Python oracle 仅作为静态迁移证据，Go 测试/runtime 不依赖 Python。 | fixture → Go assertion → pure Go runtime |

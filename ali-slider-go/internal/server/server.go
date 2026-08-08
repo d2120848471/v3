@@ -23,11 +23,12 @@ import (
 )
 
 const (
-	TestPagePath    = "/"
-	SolvePath       = "/api/slider"
-	HealthPath      = "/health"
-	OpenAPIPath     = "/openapi.json"
-	maxRequestBytes = int64(64 * 1024)
+	TestPagePath = "/"
+	SolvePath    = "/api/slider"
+	HealthPath   = "/health"
+	OpenAPIPath  = "/openapi.json"
+	// MaxRequestBytes 是 POST body 与 legacy GET raw query 的共享上限。
+	MaxRequestBytes = int64(64 * 1024)
 )
 
 var browserOriginProtection = http.NewCrossOriginProtection()
@@ -87,14 +88,14 @@ func New(options Options) (*Handler, error) {
 	}, nil
 }
 
-// ServeHTTP 仅暴露冻结合同中的四个入口；GET 解题明确返回 404。
+// ServeHTTP 仅暴露冻结合同中的四个路径；Solve 同时兼容旧 GET query 和当前 POST JSON。
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == TestPagePath:
 		status := writeTestPage(w)
 		h.logResult("", status, started)
-	case r.Method == http.MethodPost && r.URL.Path == SolvePath:
+	case (r.Method == http.MethodGet || r.Method == http.MethodPost) && r.URL.Path == SolvePath:
 		h.handleSolve(w, r, started)
 	case r.Method == http.MethodGet && r.URL.Path == HealthPath:
 		h.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": "ready"}, nil)
@@ -111,7 +112,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleSolve(w http.ResponseWriter, r *http.Request, started time.Time) {
 	traceID := newTraceID()
 	headers := map[string]string{"X-Trace-ID": traceID}
-	if browserOriginProtection.Check(r) != nil {
+	if checkSolveOrigin(r) != nil {
 		h.writeJSON(w, http.StatusForbidden, errorBody("ApiOriginError", "不接受跨源浏览器请求", traceID), headers)
 		h.logResult(traceID, http.StatusForbidden, started)
 		return
@@ -141,6 +142,18 @@ func (h *Handler) handleSolve(w http.ResponseWriter, r *http.Request, started ti
 	}
 	h.writeJSON(w, http.StatusOK, result, headers)
 	h.logResult(traceID, http.StatusOK, started)
+}
+
+func checkSolveOrigin(r *http.Request) error {
+	if r.Method != http.MethodGet {
+		return browserOriginProtection.Check(r)
+	}
+	// 旧 GET 会发起真实上游求解，不是安全读操作。仅在同源检查副本中将它
+	// 视为 POST，从而复用 Go 标准库边界；原请求的路由和 query 语义不变。
+	originProbe := new(http.Request)
+	*originProbe = *r
+	originProbe.Method = http.MethodPost
+	return browserOriginProtection.Check(originProbe)
 }
 
 func callSolver(ctx context.Context, solver slider.Solver, request slider.Request) (result slider.Result, err error) {
@@ -178,10 +191,13 @@ func errorBody(errorType, message, traceID string) map[string]any {
 }
 
 func (h *Handler) decodeRequest(w http.ResponseWriter, r *http.Request) (slider.Request, error) {
-	if r.ContentLength > maxRequestBytes {
-		return slider.Request{}, fmt.Errorf("请求体必须位于 0..%d 字节", maxRequestBytes)
+	if r.Method == http.MethodGet {
+		return h.decodeQueryRequest(r)
 	}
-	limited := http.MaxBytesReader(w, r.Body, maxRequestBytes)
+	if r.ContentLength > MaxRequestBytes {
+		return slider.Request{}, fmt.Errorf("请求体必须位于 0..%d 字节", MaxRequestBytes)
+	}
+	limited := http.MaxBytesReader(w, r.Body, MaxRequestBytes)
 	defer limited.Close()
 
 	var payload map[string]json.RawMessage
@@ -192,7 +208,7 @@ func (h *Handler) decodeRequest(w http.ResponseWriter, r *http.Request) (slider.
 	} else if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			return slider.Request{}, fmt.Errorf("请求体必须位于 0..%d 字节", maxRequestBytes)
+			return slider.Request{}, fmt.Errorf("请求体必须位于 0..%d 字节", MaxRequestBytes)
 		}
 		return slider.Request{}, errors.New("请求体不是合法 JSON")
 	}
@@ -203,6 +219,32 @@ func (h *Handler) decodeRequest(w http.ResponseWriter, r *http.Request) (slider.
 		return slider.Request{}, err
 	}
 
+	return h.requestFromPayload(payload)
+}
+
+func (h *Handler) decodeQueryRequest(r *http.Request) (slider.Request, error) {
+	if int64(len(r.URL.RawQuery)) > MaxRequestBytes {
+		return slider.Request{}, fmt.Errorf("查询参数必须位于 0..%d 字节", MaxRequestBytes)
+	}
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return slider.Request{}, errors.New("查询参数不是合法 URL encoding")
+	}
+	payload := make(map[string]json.RawMessage, len(query))
+	for key, values := range query {
+		if len(values) == 0 {
+			continue
+		}
+		encoded, err := json.Marshal(values[len(values)-1])
+		if err != nil {
+			return slider.Request{}, errors.New("查询参数编码失败")
+		}
+		payload[key] = encoded
+	}
+	return h.requestFromPayload(payload)
+}
+
+func (h *Handler) requestFromPayload(payload map[string]json.RawMessage) (slider.Request, error) {
 	sceneID, err := optionalAliasedText(payload, "SceneId", "sceneId", 64)
 	if err != nil {
 		return slider.Request{}, fmt.Errorf("SceneId %w", err)

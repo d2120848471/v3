@@ -15,6 +15,7 @@ Ali Slider Go Windows AMD64 便携版
 4. 默认启动会预热 32 个设备会话并访问外部 Device RPC。真实求解还需要访问 Captcha RPC 和图片 CDN。
 5. 失败或低置信样本可能写入 var\artifacts。请解压到当前用户的私有可写目录，不要放在 Web root、公共共享盘、多人共享目录或公开同步目录。
 6. Windows 文件权限继承解压目录的 NTFS ACL。不要把 var\artifacts、日志、token、certifyId、代理密码或完整响应发送给无关人员。
+7. 旧 GET query 会立即执行真实求解，不是 health 或只读页面。禁止在 URL 放入 AaduaneId 或含账号密码的 proxy。
 
 首次运行
 --------
@@ -39,7 +40,7 @@ Ali Slider Go Windows AMD64 便携版
 4. 页面打开只检查 health，不自动求解；执行期间防双击，也不会自动重试。
 5. RPC key、代理、securityToken 和 certifyId 默认遮罩。不要把完整请求/响应截图、复制到公开日志、工单或聊天。
 6. 页面不保存历史、Cookie 或浏览器存储；刷新或点击“清空”即清除当前结果。
-7. 页面固定同源调用。其他网站的跨源请求不会成功：需要预检的浏览器 fetch 可能先被浏览器拦截；若明确跨源的 POST 实际到达服务，则返回 403 ApiOriginError 且不进入 Solver。不要放宽 CORS 绕过保护。
+7. 页面固定同源 POST JSON 调用，不使用旧 GET。其他网站的跨源请求不会成功：需要预检的浏览器 fetch 可能先被浏览器拦截；若明确跨源的 POST 或旧 GET 实际到达服务，则返回 403 ApiOriginError 且不进入 Solver。地址栏直接打开和无浏览器头的旧 API 客户端仍可用；这不是鉴权。不要放宽 CORS 绕过保护。
 
 PowerShell 调用示例
 -------------------
@@ -56,6 +57,21 @@ Invoke-RestMethod `
   -Body $body
 
 这会访问真实上游。HTTP 200 仍需同时检查 ok、VerifyCode 和 VerifyResult；不要把完整响应写入公开日志。
+
+旧 GET query 兼容
+------------------
+
+新调用请继续使用上面的 POST JSON。仅当旧客户端尚未迁移时，可使用：
+
+Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://127.0.0.1:8000/api/slider?SceneId=1ug4aptr"
+
+该 GET 会立即创建真实挑战，不要用作书签、链接、预取、健康检查或监控地址。URL 可能进入浏览器历史和代理/网关 access log；禁止在 URL 放入 AaduaneId 或含 userinfo 的 proxy。
+
+GET raw query 上限 64 KiB；支持 SceneId/sceneId、prefix/Prefix、AaduaneId/aaduaneId 和 proxy/Proxy。同名参数取最后值；标准字段只要出现就压过别名，标准字段为空时使用默认值，不使用别名。GET 只读 query，POST 只读 JSON body，两者不合并。不支持 URL-encoded 或 multipart form body。
+
+POST 和旧 GET 的应用响应只有 HTTP 200/400/403/500，不会因本地在途请求数返回 429。
 
 可选参数
 --------

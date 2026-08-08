@@ -23,7 +23,7 @@ GitHub Actions 在 Linux quality 与 Darwin race 门禁全部通过后，使用 
 |---|---|
 | API 测试页 | `http://127.0.0.1:8000/` |
 | 健康检查 | `http://127.0.0.1:8000/health` |
-| 求解 API | `http://127.0.0.1:8000/api/slider` |
+| 求解 API | `http://127.0.0.1:8000/api/slider`（POST JSON；deprecated GET query） |
 | OpenAPI | `http://127.0.0.1:8000/openapi.json` |
 
 在服务窗口按 `Ctrl+C` 可触发应用的关闭流程。关闭控制台窗口或用任务管理器结束进程属于强制停止，不应视为优雅关闭。
@@ -59,7 +59,7 @@ ali-slider-go-windows-amd64.zip
 
 页面打开只检查 health，不自动创建挑战。点击提交才访问真实上游；执行中防双击，不自动重试。RPC key、代理、`securityToken` 和 `certifyId` 默认遮罩，但原始值仍存在当前页面内存中；不要截图、复制到公开日志、工单或聊天。刷新或点击“清空”会移除页面内结果。
 
-页面固定同源调用 API。其他网站的跨源请求不会成功：需要预检的浏览器 fetch 可能先被浏览器拦截；若明确跨源的 POST 实际到达服务，则返回 `403 ApiOriginError` 且不进入 Solver。不要为绕过该保护而放宽 CORS。
+页面固定同源 POST JSON 调用 API，不使用 deprecated GET。其他网站的跨源请求不会成功：需要预检的浏览器 fetch 可能先被浏览器拦截；若明确跨源的 POST 或旧 GET 实际到达服务，则返回 `403 ApiOriginError` 且不进入 Solver。用户在地址栏直接打开的 `Sec-Fetch-Site: none` 与无浏览器头的旧客户端仍可用；这不是鉴权。不要为绕过该保护而放宽 CORS。
 
 也可直接使用 PowerShell：
 
@@ -77,6 +77,22 @@ Invoke-RestMethod `
 ```
 
 该请求会访问真实上游。HTTP `200` 仍需检查 `ok`、`VerifyCode` 和 `VerifyResult`。完整字段、状态码和敏感数据边界见 [HTTP API](./api.md)。
+
+### 旧 GET query 兼容
+
+仅当旧客户端无法立即迁移时才使用：
+
+```powershell
+Invoke-RestMethod `
+  -Method Get `
+  -Uri "http://127.0.0.1:8000/api/slider?SceneId=1ug4aptr"
+```
+
+这个 GET 会立即创建真实挑战，不是 health 或无副作用读取。raw query 上限为 `64 KiB`；支持 `SceneId/sceneId`、`prefix/Prefix`、`AaduaneId/aaduaneId` 和 `proxy/Proxy`。同名参数取最后值；canonical 键只要出现就压过 alias，空 canonical 值使用默认值而不是 alias。GET 只读 query，POST 只读 JSON body，两者不合并，URL-encoded/multipart form body 不受支持。
+
+发布服务不会在 Handler 之前把该上限截断：`server.MaxRequestBytes` 是 64 KiB，进程的 HTTP `MaxHeaderBytes` 另留 32 KiB 给 request line 和普通 header。CI 使用真实 `net/http.Server` 回归恰好 64 KiB query 可达；超出仍会返回 400。
+
+URL 可能被浏览器历史、代理/网关 access log 和复制记录收集；禁止在 URL 放入 `AaduaneId` 或含 userinfo 的 proxy。不要把旧 GET URL 做成链接、书签、预取、健康检查或监控地址。Solve POST 与 GET 的应用响应均只有 `200/400/403/500`，不会因本地在途数返回 429。
 
 临时改端口时，在解压目录打开 `cmd.exe`：
 
@@ -119,7 +135,7 @@ Unix 构建强制 Artifact 目录/文件为 `0700/0600`。Windows 的 Go `FileMo
 3. 使用 Go module 固定的 Go `1.26.5`、`CGO_ENABLED=0` 和 `GOARCH=amd64` 构建；
 4. 生成构建信息、UTF-8 BOM 中文说明、包内 SHA-256 和明确文件白名单；
 5. 解压到含中文及空格的临时路径；
-6. 通过最终 `start.bat` 启动 EXE，验证脚本参数转发、内嵌测试页及其安全头、`/health`、OpenAPI 3.0.3、跨源浏览器 POST `403 ApiOriginError` 和非法 JSON `400`；
+6. 通过最终 `start.bat` 启动 EXE，验证脚本参数转发、内嵌测试页及其安全头、`/health`、OpenAPI 3.0.3、deprecated GET query 合同、跨源浏览器 POST/GET `403 ApiOriginError` 和非法 JSON/query `400`；跨源 GET 的 bad prefix 与 POST 的 `[]` 作为 400 后备门禁，即使 origin gate 回归也不会进入真实 Solver；
 7. smoke 强制 `--device-prewarm=0`，不会发送 Device、Init、图片或 Verify 请求；
 8. `main` push 和 `workflow_dispatch` 直传单层 ZIP，PR 只验证不上传；
 9. 官方 actions 使用完整 commit SHA 固定，工作流权限保持 `contents: read`。
@@ -139,7 +155,8 @@ macOS/Linux 交叉构建只能证明 Windows 测试二进制可编译。发布�
 |---|---|---|
 | `go.mod:3`；`Makefile` · `build-windows` | Windows EXE 固定 Go 1.26.5、AMD64、CGO 关闭和 stripped 构建。 | source → pinned Go → PE executable |
 | `internal/track/track.go:21` | 生产运行所需默认轨迹已嵌入 EXE，不需要外置 fixture。 | embedded asset → single executable |
-| `internal/server/testpage.go`、`internal/server/web/test.html` | API 测试页、样式和脚本编译进同一 EXE，只能同源手工提交，不增加 ZIP 文件或运行时依赖。 | embedded page → browser GET `/` → explicit same-origin POST |
+| `internal/server/testpage.go`、`internal/server/web/test.html` | API 测试页、样式和脚本编译进同一 EXE，只能同源手工 POST，不生成敏感 query，不增加 ZIP 文件或运行时依赖。 | embedded page → browser GET `/` → explicit same-origin POST |
+| `internal/server/server.go` · `decodeQueryRequest` / `checkSolveOrigin`；`internal/server/server_test.go` · `TestLegacyGETQueryCompatibility` / `TestSolveParameterSourcesStaySeparated` / `TestBrowserOriginBoundaryPreservesLegacyClients` | 旧 GET query 仅做协议兼容，与 POST 分离参数源且共用跨源/Solver 边界。 | legacy URL → query validation → same Solve side effects |
 | `internal/artifact/store.go` · `ensureDirectory`；`store_test.go` | Unix 精确 mode 与 Windows ACL 语义分离，其他路径/竞态/配额保护保持。 | platform filesystem → safe directory → bounded artifact |
 | `.github/workflows/ali-slider-go-ci.yml` · `windows-package` | 只有跨平台门禁和 Windows 原生 package smoke 成功后才上传可分发 ZIP。 | commit → quality/race → native Windows test → ZIP |
 | `packaging/windows/start.bat` | 双击入口固定工作目录、提供回环监听默认值，并保留 console 诊断和 Ctrl+C。 | extracted package → local server → controlled shutdown |

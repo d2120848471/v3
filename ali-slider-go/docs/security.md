@@ -2,7 +2,9 @@
 
 ## 1. 默认信任模型
 
-> 服务没有应用内 API 鉴权，也没有基于活动请求数的本地接纳闸门。默认只监听 `127.0.0.1:8000`。显式改为 `0.0.0.0` 时，任何网络可达客户端都可以直接触发 `Solve`、消耗 CPU/内存、Client 连接/预热预算和上游配额，还可以传入代理路由并促使服务对外连接。`GET /` 测试页与 API 使用同一信任边界，不提供账号或权限隔离。
+> 服务没有应用内 API 鉴权，也没有基于活动请求数的本地接纳闸门。默认只监听 `127.0.0.1:8000`。显式改为 `0.0.0.0` 时，任何网络可达客户端都可以直接触发 `Solve`、消耗 CPU/内存、Client 连接/预热预算和上游配额，还可以传入代理路由并促使服务对外连接。`GET /api/slider?...` 只是 deprecated 的旧客户端兼容入口，会立即执行与 POST 相同的真实求解，不是安全的读操作。`GET /` 测试页与 API 使用同一信任边界，不提供账号或权限隔离。
+
+服务的 HTTP surface 仍是四个路径：`GET /`、`GET|POST /api/slider`、`GET /health` 和 `GET /openapi.json`。Solve 的两种方法都只声明 `200/400/403/500`；Handler 不主动返回 429。
 
 对外暴露前必须由反向代理/API gateway 提供：
 
@@ -16,7 +18,7 @@ Handler 不生成本地 429、`Retry-After`、`TooManyChallenges`、活动数或
 
 `MaxConcurrency` / `--max-concurrency` 是兼容旧名，只作为 Client 每 route/host 的出站连接与设备预热资源预算；它不限制 HTTP 请求进入。启动器在非回环监听时输出一条纯文本安全警告，但警告不是强制控制。
 
-回环监听只缩小网络暴露，不阻止同机不可信进程访问，也不能把浏览器页面当作身份边界。API 不启用宽松 CORS；Handler 还会根据 `Origin` / `Sec-Fetch-Site` 拒绝明确的浏览器跨源 POST，但这只是 drive-by 缓解，不是鉴权或完整 CSRF 保护。无这些浏览器头的旧 API 客户端仍保持兼容；共享机器仍需操作系统用户隔离和外层访问控制。
+回环监听只缩小网络暴露，不阻止同机不可信进程访问，也不能把浏览器页面当作身份边界。API 不启用宽松 CORS；Handler 根据 `Origin` / `Sec-Fetch-Site` 拒绝明确的浏览器跨源 POST 和 deprecated GET，但这只是 drive-by 缓解，不是鉴权或完整 CSRF 保护。Go `CrossOriginProtection` 原本会把 GET 视为安全方法，所以 Handler 在同源检查副本中将旧 GET 当作 POST，再保留原请求的 GET/query 语义。明确跨源返回 `403 ApiOriginError` 且不进入 Solver；同源请求、用户在地址栏直接发起的 `Sec-Fetch-Site: none` 以及无浏览器头的旧 API 客户端仍允许。共享机器仍需操作系统用户隔离和外层访问控制。
 
 ## 2. 授权与流量边界
 
@@ -47,9 +49,17 @@ Handler 不生成本地 429、`Retry-After`、`TooManyChallenges`、活动数或
 - 返回数据只用 `textContent`，不使用 `innerHTML`、`eval` 或动态代码执行；
 - `AaduaneId`、proxy、`securityToken`、`certifyId` 默认遮罩；显示明文需要用户显式勾选；
 - 不使用 Cookie、URL query/hash、localStorage、sessionStorage、IndexedDB、service worker 或 sendBeacon；刷新/清空即移除当前页面状态。
-- Handler 在解码和 Solver 之前拒绝明确跨源的浏览器 POST，同源内嵌页和无浏览器头的旧 API 客户端保持可用。
+- Handler 在解码和 Solver 之前拒绝明确跨源的浏览器 POST/deprecated GET；测试页始终使用同源 POST JSON，不生成 legacy query。
 
 这些控制减少页面自身泄漏和 DOM 注入风险，不保护被其他本机客户端直接调用的 `/api/slider`。调用方仍不得截图或把完整请求/响应复制到日志、工单或聊天。
+
+### Deprecated GET query
+
+旧 GET 只用于兼容已存在的 Python 客户端；新接入和内嵌测试页必须使用 POST JSON。GET query 的原始长度上限为 `64 KiB`，支持 `SceneId/sceneId`、`prefix/Prefix`、`AaduaneId/aaduaneId` 和 `proxy/Proxy`。同名参数取最后一个值；canonical 键只要出现就压过 alias，即使 canonical 值为空也不回退到 alias，而是按未传使用默认值。
+
+`server.MaxRequestBytes` 同时定义 POST body 和 raw query 的 `64 KiB` 数据上限；进程入口的 `MaxHeaderBytes` 另外保留 `32 KiB` 给 request line 和普通 header，使恰好 64 KiB 的 query 能经过真实 `net/http.Server` 到达 Handler。这个传输预算不放大 query 可用数据边界，也不是拒绝异常大 header 的替代。
+
+GET 只读 query，POST 只读 JSON body，两者不合并；服务不接受 `application/x-www-form-urlencoded` 或 multipart form body。GET URL 可能进入浏览器历史、代理/网关 access log、监控采集和复制粘贴记录；禁止在 URL 中放入 `AaduaneId` 或含 userinfo 的 proxy。不要把该 URL 写入 HTML 链接、浏览器预取、健康检查、搜索爬虫或 uptime 监控：每次成功路由都会创建真实挑战并消耗上游配额。
 
 ## 4. 日志与错误
 
@@ -63,7 +73,7 @@ traceId, status, elapsedMs
 
 错误边界：
 
-- API 输入错误返回稳定 400 JSON 错误；明确浏览器跨源请求返回脱敏 `403 ApiOriginError`；
+- API JSON/query 输入错误返回稳定 400 JSON 错误；明确浏览器跨源 POST/deprecated GET 返回脱敏 `403 ApiOriginError`；
 - 可识别的协议、网络、视觉和内部错误只返回稳定 Message；
 - 未分类错误或 panic 统一为 `UnhandledProtocolError`，不回显 panic/error cause；
 - HTTP 2xx 中的非法 JSON/schema 计入 Protocol，不污染“网络失败”统计；
@@ -163,8 +173,8 @@ Init 只能提供相对路径，不能指定完整 URL。下载器：
 
 | Evidence | Finding | Path |
 |---|---|---|
-| `internal/server/server.go` · `browserOriginProtection` / `handleSolve`；`internal/server/server_test.go` · `TestBrowserOriginBoundaryPreservesLegacyClients` / `TestConcurrentRequestsAlwaysEnterSolver` | 跨源和输入校验合法的请求直接进入 Solver；Handler 没有活动数接纳闸门、本地 429 或退避字段。 | reachable caller → origin/body validation → Solve → local and upstream resource consumption |
-| `internal/server/testpage.go` · `writeTestPage`；`internal/server/server_test.go` · `TestEmbeddedAPITestPage` | 页面使用随机 nonce、同源 CSP、无持久化/外链/危险 DOM API，GET/错误方法不调用 Solver。 | browser GET → constrained page memory → explicit same-origin POST |
+| `internal/server/server.go` · `MaxRequestBytes` / `checkSolveOrigin` / `decodeQueryRequest` / `handleSolve`；`cmd/server/main.go` · `maxHeaderBytes`；`internal/server/server_test.go` · `TestLegacyGETQueryCompatibility` / `TestLegacyGETQueryValidationNeverCallsSolver` / `TestSolveParameterSourcesStaySeparated` / `TestBrowserOriginBoundaryPreservesLegacyClients` / `TestConcurrentRequestsAlwaysEnterSolver`；`cmd/server/main_test.go` · `TestHeaderBudgetAcceptsMaximumLegacyQuery` | POST JSON 与 deprecated GET query 共用参数/Solver 合同但不合并输入；真实 HTTP 入口可承载恰好 64 KiB query；明确跨源和无效输入在 Solver 前拒绝，其他合法请求无本地 admission、429 或退避字段。 | reachable caller → HTTP budget → origin + JSON/query validation → Solve → local and upstream resource consumption |
+| `internal/server/testpage.go` · `writeTestPage`；`internal/server/server_test.go` · `TestEmbeddedAPITestPage` | 页面使用随机 nonce、同源 CSP、无持久化/外链/危险 DOM API；根路径 GET 不调用 Solver，手工求解只发送同源 POST。 | browser GET `/` → constrained page memory → explicit same-origin POST |
 | `internal/server/server.go` · `logResult` / `solverErrorResponse` | 普通日志只有 trace/status/elapsed，未分类错误不回显 cause。 | request/result → stable metadata log |
 | `pkg/slider/types.go` · DTO `String/GoString` | 公开结构的常见格式化不输出 token、ID 或代理凭据。 | DTO → fmt → redacted text |
 | `internal/artifact/store.go` · `SaveFailure` / `Purge` | Unix 强制 POSIX 私有 mode；Windows 继承 NTFS ACL；两者共用受管名称、排他创建、整组回滚、保留期和配额。 | platform directory policy → private bounded set → purge/evict |

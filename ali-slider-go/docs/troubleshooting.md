@@ -34,6 +34,8 @@ curl --fail --silent http://127.0.0.1:8000/health
 
 浏览器测试页位于 `http://127.0.0.1:8000/`。页面打开只检查 health；不要在普通排障或 CI 中点击发送真实求解。
 
+`GET /api/slider?...` 已恢复为 deprecated 旧客户端兼容入口，但它会立即执行真实 Solve，不是 health 或只读调试地址。新调用和内嵌页始终使用 POST JSON。
+
 处理问题时记录 commit、Go 版本、`X-Trace-ID`、HTTP 状态、客户端墙钟和脱敏后的错误类别/阶段。不要收集请求/响应正文、token、`CertifyId`、RPC key、代理密码或上游原始错误。
 
 ## 启动与生命周期
@@ -59,10 +61,11 @@ curl --fail --silent http://127.0.0.1:8000/health
 |---|---|---|
 | 测试页无法打开 | 服务尚未 ready、端口错误或浏览器访问了旧实例 | 先检查 `event=listen status=ready` 和 `/health`；使用启动日志中的实际端口打开根路径 `/` |
 | 测试页可打开，但显示 health 异常 | 页面 HTML 已返回，`/health` fetch 失败或不是 ready | 检查浏览器开发者工具的本机请求、端口和服务进程；不要因此重复提交 Solve |
-| `GET /api/slider` 返回 404 | 合同只允许 POST solve | 改为 `POST`；不要恢复 GET 副作用接口 |
-| `400 ApiRequestError` | JSON、类型、长度、prefix 或 proxy 在 Solver 前失败 | 从 `{}` 开始逐项加入字段；请求体不超过 64 KiB |
+| 旧 `GET /api/slider?...` 返回 `400 ApiRequestError` | query 不是合法 URL encoding、原始 query 超过 64 KiB，或字段/prefix/proxy 校验失败 | 先用 `?SceneId=1ug4aptr` 排查；正确 percent-encode 参数。不得在 URL 中放 `AaduaneId` 或含 userinfo 的 proxy |
+| `POST` form body 返回 `400 ApiRequestError` | Solve 不支持 URL-encoded/multipart form body | 使用 `Content-Type: application/json` 和单一 JSON object；不要把 POST query 当作 body 补充 |
+| `400 ApiRequestError` | POST JSON 或 GET query 的格式、类型、长度、prefix 或 proxy 在 Solver 前失败 | POST 从 `{}` 开始逐项加入字段；JSON body 和 GET raw query 分别不超过 64 KiB |
 | `400 InvalidRequest` | 公共 Client/Solver 认为请求不合法 | 检查 SceneId、prefix、RPC key 和 proxy 长度 |
-| `403 ApiOriginError` | 浏览器标记该 POST 来自跨源 origin | 从服务自带根页或正确同源页调用；不要放宽 CORS/绕过保护 |
+| `403 ApiOriginError` | 浏览器标记 POST 或 deprecated GET 来自明确跨源 origin/site | 从服务自带根页同源 POST，或使用受信的无浏览器头 API 客户端；不要放宽 CORS/绕过保护 |
 | 外层网关直接返回 429 | 网关的身份/IP 频率、并发或总量策略生效 | 按该网关合同处理；不要把它归因于应用内活动数闸门 |
 | `500 NetworkError` 且上游记录为 429 | 上游把本轮外部请求作为非 2xx 拒绝 | 用 traceId 与上游受控指标定位；Handler 不透传上游 429 或退避头，同一 `CertifyId` 不得重试 Verify |
 | HTTP 200 但 `ok=false` | 协议完成，Verify 业务拒绝 | 读取 `VerifyCode`、`VerifyResult`；不要当技术成功或自动重试 |
@@ -73,6 +76,8 @@ curl --fail --silent http://127.0.0.1:8000/health
 | HTTP 无普通日志 | 自定义宿主给 `server.New` 的 Logger 为 nil | cmd/server 已注入 stdout logger；library 宿主应显式注入安全 Logger |
 
 所有应用生成的 HTTP JSON 响应应有 `Cache-Control: no-store`；`/api/slider` 的 200/400/403/500 应包含与 body 一致的 `X-Trace-ID`。测试页响应还应有 HTML Content-Type、随机 nonce CSP、`nosniff`、`no-referrer` 和防 framing 头；缺失时视为构建/路由合同回归。Handler 不生成本地 429、`Retry-After`、`TooManyChallenges`、活动数或退避字段；403 仅是跨源浏览器安全边界，不是 admission。外层网关响应遵循网关自己的合同。
+
+GET 与 POST 的参数源严格分离：GET 只读 query，POST 只读 JSON body，POST URL 上的 query 不会填充 body，GET body 也不会参与。GET 同名参数取最后值；`SceneId/prefix/AaduaneId/proxy` canonical 键只要出现就压过对应 alias，空 canonical 值会使用默认值而不是 alias。
 
 ## Solver 阶段定位
 
@@ -216,7 +221,7 @@ go test -count=1 -race \
 | Evidence | Finding | Path |
 |---|---|---|
 | `cmd/server/main.go:36`、`:49`、`:55`、`:60`、`:93`、`:111`、`:147` | 启动器已实现配置、Prime、启动/每小时清理和优雅关闭。 | config → Client → HTTP → lifecycle |
-| `internal/server/server.go` · `browserOriginProtection` / `handleSolve`；`internal/server/server_test.go` · `TestBrowserOriginBoundaryPreservesLegacyClients` / `TestConcurrentRequestsAlwaysEnterSolver` | 通过跨源和 body 校验的 POST 均直接进入 Solver；Handler 不按活动数拒绝，也不生成本地 429 或退避字段。 | method/body → origin/body validation → timeout context → Solve or stable error |
+| `internal/server/server.go` · `checkSolveOrigin` / `decodeQueryRequest` / `handleSolve`；`internal/server/server_test.go` · `TestLegacyGETQueryCompatibility` / `TestLegacyGETQueryValidationNeverCallsSolver` / `TestSolveParameterSourcesStaySeparated` / `TestBrowserOriginBoundaryPreservesLegacyClients` / `TestConcurrentRequestsAlwaysEnterSolver` | POST JSON 与 deprecated GET query 分源解析；无效输入和明确跨源在 Solver 前拒绝，其他合法请求不按活动数拒绝。 | method/source → origin + JSON/query validation → timeout context → Solve or stable error |
 | `internal/server/testpage.go` · `writeTestPage`；`internal/server/server_test.go` · `TestEmbeddedAPITestPage` | 根路径只允许 GET，返回带严格页面安全头的内嵌测试台且不触发 Solver。 | start → browser GET `/` → health / explicit solve |
 | `internal/challenge/solver.go:107`、`:149`、`:289` | 完整 Solver 已按阶段执行并只在前置门禁后 Verify。 | setup → device/init/assets/vision/PE → Verify |
 | `internal/challenge/solver_test.go` · `TestSolverLowConfidenceStopsBeforeVerify` / `TestSolverVerifyNetworkErrorIsSingleAttemptAndSanitized` | 低置信零 Verify、网络未知单次 Verify 有计数测试。 | failure branch → counted transport calls |

@@ -7,9 +7,9 @@
 ## 已实现能力
 
 - 严格纯 Go：服务端求解、自动化测试、Linux/Windows 构建和容器不依赖 Python、Node.js、浏览器、OpenCV、GoCV、CGo、第三方动态库或子进程；内嵌测试页只需系统现有的现代浏览器。
-- 对外只提供 reusable Go library、`GET /` 内嵌 API 测试页、`POST /api/slider`、`GET /health`、`GET /openapi.json`。
+- 对外只提供 reusable Go library 和四个 HTTP 路径：`GET /` 内嵌 API 测试页、`GET|POST /api/slider`、`GET /health`、`GET /openapi.json`；Solve 的 GET 仅作为已废弃的旧 Python query 兼容入口。
 - 每个 `CertifyId` 最多尝试一次 Verify；网络结果未知也不重试。
-- 通过浏览器跨源与输入校验的 `POST /api/slider` 直接进入 Solver；HTTP 层不设置本地 admission gate，也不因在途请求数主动返回 `429` 或 `Retry-After`。
+- 通过浏览器跨源与输入校验的 GET/POST Solve 请求直接进入 Solver；HTTP 层不设置本地 admission gate，也不因在途请求数主动返回 `429` 或 `Retry-After`。
 - HTTP(S)、SOCKS4、SOCKS5、SOCKS5H 代理；同一轮设备、Init、图片与 Verify 固定同一路由。
 - 双图并发下载、纯 Go 视觉、PE/DeviceToken、可选设备会话预热和共享连接池。
 - 失败/低置信图片与脱敏指标私有落盘；服务启动时及每小时清理，library 调用方负责定期调用 `PurgeArtifacts`，默认保留 7 天；成功路径不落图。
@@ -41,7 +41,7 @@ go run ./cmd/server
 
 默认地址：`http://127.0.0.1:8000`。
 
-浏览器打开 `http://127.0.0.1:8000/` 可使用内嵌测试页。页面不会自动求解或重试；只有点击“发送一次求解”才会访问真实上游。页面不使用 Cookie 或浏览器存储，默认遮罩 RPC key、代理、`securityToken` 和 `certifyId`，刷新即清除当前结果。
+浏览器打开 `http://127.0.0.1:8000/` 可使用内嵌测试页。页面不会自动求解或重试；只有点击“发送一次求解”才会访问真实上游。页面始终使用推荐的 POST JSON，不会生成旧 GET query。页面不使用 Cookie 或浏览器存储，默认遮罩 RPC key、代理、`securityToken` 和 `certifyId`，刷新即清除当前结果。
 
 ```bash
 curl --fail --silent http://127.0.0.1:8000/health
@@ -51,6 +51,17 @@ curl --silent --show-error \
   -d '{"SceneId":"1ug4aptr","prefix":"fsgtmi"}' \
   http://127.0.0.1:8000/api/slider
 ```
+
+旧 Python GET query 仅作兼容，新代码不应继续使用：
+
+```bash
+curl --fail-with-body --get \
+  --data-urlencode 'SceneId=1ug4aptr' \
+  --data-urlencode 'prefix=fsgtmi' \
+  http://127.0.0.1:8000/api/slider
+```
+
+该 GET 会发起真实求解，不是无副作用的读取。URL 可能进入浏览器历史、网关或代理访问日志；不要用 query 传 `AaduaneId` 或带 username/password 的代理。
 
 成功或完成态业务失败都返回 HTTP `200`，调用方应同时检查：
 
@@ -69,9 +80,9 @@ curl --silent --show-error \
 }
 ```
 
-HTTP 输入不合法时返回 `400` 且不进入 Solver；明确的浏览器跨源 POST 返回 `403 ApiOriginError`。通过跨源和输入边界校验后，每个请求都直接调用一次 Solver。Solver 的参数错误仍返回 `400`，完成态业务结果返回 `200`，协议、网络、视觉、内部错误、超时或 panic 返回脱敏 `500`。`POST /api/slider` 的这些响应都带 `X-Trace-ID`，并与响应体 `traceId` 一致。
+HTTP 输入不合法时返回 `400` 且不进入 Solver；明确的浏览器跨源 GET 或 POST 返回 `403 ApiOriginError`。无浏览器来源头的 curl/程序客户端保持允许。通过跨源和输入边界校验后，每个请求都直接调用一次 Solver。Solver 的参数错误仍返回 `400`，完成态业务结果返回 `200`，协议、网络、视觉、内部错误、超时或 panic 返回脱敏 `500`。`/api/slider` 的这些响应都带 `X-Trace-ID`，并与响应体 `traceId` 一致。
 
-`SceneId/sceneId`、`prefix/Prefix`、`AaduaneId/aaduaneId`、`proxy/Proxy` 都兼容；同组同时出现时规范字段优先。完整合同见 [docs/api.md](docs/api.md)。
+`SceneId/sceneId`、`prefix/Prefix`、`AaduaneId/aaduaneId`、`proxy/Proxy` 是仅有的 8 个精确请求名称。同组同时出现时规范字段优先，同名 query 重复时最后一个值生效，空值回退默认。GET 只读 query，POST 只读 JSON body，两个参数源不合并；不支持 `application/x-www-form-urlencoded` 或 multipart form body。JSON body 和 query 分别最大 65,536 字节；非法 query URL encoding 返回 `400 ApiRequestError`。完整合同见 [docs/api.md](docs/api.md)。
 
 ## Go library
 

@@ -35,7 +35,7 @@
 
 双图并行使 `downloadAssets` 不等于两个单图耗时之和。毫秒取整也会使阶段相加与 total 有小幅差异。
 
-`Result.ElapsedMS` 来自 Solver 的 `total`，不包含客户端到 HTTP 服务的建连、请求解析和响应传输。完整 HTTP P95 应以负载发生器的端到端墙钟为主，以应用日志和 `timingsMs` 做归因，不能只排序 `elapsedMs`。
+`Result.ElapsedMS` 来自 Solver 的 `total`，不包含客户端到 HTTP 服务的建连、请求解析和响应传输。完整 HTTP P95 应以负载发生器的端到端墙钟为主，以应用日志和 `timingsMs` 做归因，不能只排序 `elapsedMs`。正式基准优先使用 POST JSON；deprecated GET query 只是协议兼容性输入，不是另一条更快的求解链。
 
 ## 指标边界
 
@@ -46,7 +46,7 @@
 | Solver total | `challenge.Solver.Solve` 进入到清理完成 | 本地计算与全部上游等待 | HTTP parse/write 和客户端网络 |
 | 完整请求 | 负载发生器发出 HTTP 到读完 response | 服务 HTTP、Solver、上游等待 | 负载发生器准备数据的时间 |
 | 吞吐 | 窗口内完成响应数 / 墙钟秒数 | 成功、业务失败、技术失败分别计数 | 不能只统计成功响应 |
-| 在途并发 | 合法请求进入 `Solve` 到 Solver 返回 | Solver 运行及上游等待 | 跨源边界、JSON/字段校验在 Solver 前拒绝的请求；外层代理在到达本进程前拒绝的请求 |
+| 在途并发 | 合法请求进入 `Solve` 到 Solver 返回 | Solver 运行及上游等待 | 跨源边界、JSON/query/字段校验在 Solver 前拒绝的请求；外层代理在到达本进程前拒绝的请求 |
 
 `internal/challenge/performance_test.go` 提供显式启用的 200 样本逐次纯计算 P99 门禁；普通 CI 跳过时钟硬断言。最终源码快照的 Mac ARM64 结果为 `P50=50.577458ms`、`P95=55.711708ms`、`P99=57.05075ms`、`max=60.337542ms`，达到硬门槛。它只使用固定困难 fixture，不包含任何网络阶段；扩展数据集和多轮重复仍可用于稳定性画像，但不能抹掉或夸大本次结论。
 
@@ -157,8 +157,9 @@ ALI_SLIDER_PERF=1 GOMAXPROCS=16 \
 
 - 并发至少按 `1/4/8/16/32/64` 逐级测试，固定每档请求数和 Mock 阶段延迟。
 - 同时测冷建与热态；记录预热命中、冷建、过期和补货失败。
-- 64 并发直通回归必须证明每个合法 HTTP 请求都已进入 Solver；释放 Mock 后全部返回 200，且没有 `Retry-After`。
-- OpenAPI 的 Solve response 只声明 200/400/403/500，其中 403 仅是明确浏览器跨源拒绝；不得包含 429、`Retry-After` 或旧本地过载字段。
+- 64 并发直通回归使用当前 POST JSON 入口，必须证明每个合法 HTTP 请求都已进入 Solver；释放 Mock 后全部返回 200，且没有 `Retry-After`。
+- deprecated GET 用单独功能回归锁定 64 KiB query、别名/重复/空值、GET/POST 分源和跨源拒绝；不把 GET 预取、爬虫、uptime 监控或浏览器自动化当作负载发生器，因为每次 GET 都有真实求解副作用。
+- OpenAPI 的 Solve POST 与 deprecated GET response 都只声明 200/400/403/500，其中 403 仅是明确浏览器跨源拒绝；不得包含 429、`Retry-After` 或旧本地过载字段。
 - 请求完成、取消、panic 或错误后都必须清理各自上下文与设备会话。
 - 记录完成吞吐、P50/P95/P99/max、错误分类、goroutine、RSS 和 GC；外层代理 429 与第三方上游 429 分开归因。
 - 在 `-race` 下复跑状态正确性，但性能数字来自无 race 插桩版本。
@@ -220,8 +221,8 @@ ALI_SLIDER_PERF=1 GOMAXPROCS=16 \
 | `internal/challenge/solver.go:107`、`:149`、`:431` | 完整 Solver 已实现，并固定 12 个阶段耗时 key。 | Solve → stage timings → Result |
 | `internal/challenge/solver_test.go` · `TestSolverOfflineCompleteSuccess` | 完整离线链成功路径和阶段输出已有 Mock 证据。 | device/init/assets/vision/PE/verify → outcome |
 | `internal/challenge/device_pool.go:15`、`:22`、`:190` | 预热池有 20s 默认年龄、完整 key 隔离和有界 Lease/补货。 | Prime → Lease or cold open → release/refill |
-| `internal/server/server.go` · `handleSolve`；`internal/server/server_test.go` · `TestConcurrentRequestsAlwaysEnterSolver` | Handler 无本地 admission；64 个并发合法请求全部进入 Solver。 | valid request → timeout context → Solve |
-| `internal/server/openapi.go` · `openAPIDocument`；`internal/server/server_test.go` · `TestOnlyFrozenRoutesAreExposed` | OpenAPI 只声明 200/400/403/500，并回归禁止 429 与旧本地过载字段。 | API document → response contract → no local 429 |
+| `internal/server/server.go` · `decodeQueryRequest` / `handleSolve`；`internal/server/server_test.go` · `TestLegacyGETQueryCompatibility` / `TestSolveParameterSourcesStaySeparated` / `TestConcurrentRequestsAlwaysEnterSolver` | Handler 同时兼容 deprecated GET query 与 POST JSON，两者共用 Solver 链但不合并参数源；64 个并发合法 POST 全部进入 Solver。 | valid request → timeout context → Solve |
+| `internal/server/openapi.go` · `legacyQueryParameters` / `solveResponses`；`internal/server/server_test.go` · `TestOnlyFrozenRoutesAreExposed` | OpenAPI 在四路径内同时声明 Solve POST/deprecated GET，两者只有 200/400/403/500，并回归禁止 429 与旧本地过载字段。 | API document → response contract → no local 429 |
 | `pkg/slider/client.go:183` | 公共 Result 的 elapsedMs 来自 Solver total，而非客户端完整 HTTP 墙钟。 | Solver timings → library result |
 | `internal/vision/solver_test.go:260`、`:271` | 视觉 benchmark 只提供均值/并行趋势；项目 P99 结论来自独立逐次纯计算门禁。 | repeated vision Solve → mean throughput only |
 | `internal/challenge/performance_test.go:21`、`:65`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 32 路 Mock 正确性通过；200 样本纯计算 `P99=57.05075ms`，达到硬门槛；6,400 次离线 Solve 压力通过。 | concurrent mock / explicit local sampler / repeated stress → verified compute and capacity gates |

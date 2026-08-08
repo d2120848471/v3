@@ -32,6 +32,13 @@ func openAPIDocument() map[string]any {
 				},
 			},
 			SolvePath: map[string]any{
+				"get": map[string]any{
+					"summary":     "执行一轮滑块验证（旧 query 兼容）",
+					"description": "仅为兼容旧 Python 客户端；新接入请使用 POST JSON，且不要把敏感参数放入 URL。",
+					"deprecated":  true,
+					"parameters":  legacyQueryParameters(),
+					"responses":   solveResponses(),
+				},
 				"post": map[string]any{
 					"summary": "执行一轮滑块验证",
 					"requestBody": map[string]any{
@@ -40,15 +47,7 @@ func openAPIDocument() map[string]any {
 							"application/json": map[string]any{"schema": requestSchema()},
 						},
 					},
-					"responses": map[string]any{
-						"200": responseSchema(
-							"一次完整协议往返；业务失败仍返回 200 + ok=false",
-							successSchema(),
-						),
-						"400": responseSchema("请求参数无效", errorSchema()),
-						"403": responseSchema("浏览器跨源请求被拒绝", errorSchema()),
-						"500": responseSchema("协议或运行错误", errorSchema()),
-					},
+					"responses": solveResponses(),
 				},
 			},
 			HealthPath: map[string]any{
@@ -73,6 +72,36 @@ func openAPIDocument() map[string]any {
 				},
 			},
 		},
+	}
+}
+
+func legacyQueryParameters() []map[string]any {
+	parameter := func(name string, maxLength int) map[string]any {
+		schema := map[string]any{"type": "string"}
+		if maxLength > 0 {
+			schema["maxLength"] = maxLength
+		}
+		return map[string]any{
+			"name": name, "in": "query", "required": false, "schema": schema,
+		}
+	}
+	return []map[string]any{
+		parameter("SceneId", 64), parameter("sceneId", 64),
+		parameter("prefix", 32), parameter("Prefix", 32),
+		parameter("AaduaneId", 128), parameter("aaduaneId", 128),
+		parameter("proxy", 0), parameter("Proxy", 0),
+	}
+}
+
+func solveResponses() map[string]any {
+	return map[string]any{
+		"200": responseSchema(
+			"一次完整协议往返；业务失败仍返回 200 + ok=false",
+			successSchema(),
+		),
+		"400": responseSchema("请求参数无效", errorSchema()),
+		"403": responseSchema("浏览器跨源请求被拒绝", errorSchema()),
+		"500": responseSchema("协议或运行错误", errorSchema()),
 	}
 }
 

@@ -37,8 +37,9 @@
 ### Changed
 
 - 运行时从 Python/OpenCV/浏览器 worker 模型切换为单一纯 Go 进程；旧 Python 源码已从当前工作树删除，需要审计或回滚时从 Git 历史提交 `0509bfd` 恢复。
-- 服务合同只开放 `GET /`、`POST /api/slider`、`GET /health` 和 `GET /openapi.json`；`GET /api/slider` 有意返回 404。
-- 移除 HTTP 本机 admission gate 与主动 `429 Retry-After`；每个通过浏览器跨源和输入校验的 POST 请求都在 timeout context 内直接调用 Solver。
+- 服务合同只开放 `/`、`/api/slider`、`/health` 和 `/openapi.json` 四个路径；Solve 同时支持推荐的 POST JSON 和已废弃的旧 Python GET query。
+- 恢复 `GET /api/slider?...` 兼容合同：8 个精确字段/别名、同名 query 取最后值、规范名压过别名、空值回退默认；GET/POST 参数源不合并，不支持 form body。
+- 移除 HTTP 本机 admission gate 与主动 `429 Retry-After`；每个通过浏览器跨源和输入校验的 GET/POST Solve 请求都在 timeout context 内直接调用 Solver。
 - 图片默认在内存处理；成功路径不落图，失败/低置信按 artifact 策略私有落盘。
 - 默认监听收紧为 `127.0.0.1:8000`；应用内仍不提供鉴权。
 - prefix 收紧为 1–32 个 ASCII 字母数字；proxy 必须使用支持的 scheme 且不含 path/query/fragment。
@@ -59,9 +60,9 @@
 
 ### Security
 
-- 限制 HTTP 请求体为 64 KiB，并在进入 Client 前校验 JSON、类型、长度、prefix 和 proxy。
+- 分别限制 HTTP JSON body 和 raw query 为 64 KiB，并在进入 Client 前校验 JSON/URL encoding、类型、长度、prefix 和 proxy。
 - 测试页使用每响应 128-bit 随机 CSP nonce，只允许同源 connect；不使用 Cookie、浏览器存储、遥测、外部资源或危险 DOM 注入 API，结果刷新即清除。
-- 使用 Go 1.26 标准库 `http.CrossOriginProtection` 拒绝明确浏览器跨源 POST；返回脱敏 `403 ApiOriginError` 且不进入 Solver，同源页和无浏览器头的旧 API 客户端保持兼容。
+- 使用 Go 1.26 标准库 `http.CrossOriginProtection` 拒绝明确浏览器跨源 GET/POST Solve；有副作用的 GET 在检查副本中按 POST 对待，返回脱敏 `403 ApiOriginError` 且不进入 Solver，同源页和无浏览器来源头的 curl/程序客户端保持兼容。
 - HTTP Handler 不内置访问频率或并发准入保护；对外暴露必须由受控网络、反向代理或 API gateway 限制身份、频率、并发和总量。
 - 每个 `CertifyId` 最多尝试一次 Verify；前置失败为零 Verify，网络未知也不重试。
 - 代理 route 和每 host 连接数限制在 `1..32`；直连显式忽略环境 proxy。
@@ -85,7 +86,7 @@
 - 完整 Solver Mock 链通过：成功路径一次 Verify、低置信零 Verify、Verify 网络错误一次尝试。
 - 完整 Solver 的 32 路并发 Mock 正确性测试通过；该测试不作为吞吐、资源或尾延迟报告。
 - 设备预热池通过有界容量、key 隔离、过期、取消、失败、补货及并发 Lease/Close 的 race 测试。
-- HTTP 四入口、内嵌页安全头/nonce/无 Solver 副作用、跨源 403 与旧客户端兼容、64 个并发合法请求全部进入 Solver、OpenAPI 不含本地 429、启动配置、日志脱敏、artifact 清理和 Client Close 均有离线测试。
+- HTTP 四路径、Solve 两种 method、旧 GET query 重复键/默认值/64 KiB/非法 encoding、GET/POST 参数源隔离、内嵌页安全头/nonce/无 Solver 副作用、两种 method 跨源 403 与旧客户端兼容、64 个并发合法请求全部进入 Solver、OpenAPI 不含本地 429 均有离线测试。
 - 困难视觉 benchmark 均值为 `53.10ms/op`；独立纯计算 200 样本 nearest-rank `P50=50.577458ms`、`P95=55.711708ms`、`P99=57.05075ms`、`max=60.337542ms`，满足 `P99<=100ms` 硬门槛。
 - 唯一授权候选批次恰好执行 200 个新挑战、并发 32、每个 job 一次 Solve、应用层零重试：严格成功 `196`、业务失败 `3`、`VisionError=1`、网络错误 `0`，成功率 `98%`。该批先于传输 one-shot 加固，最终源码受授权上限约束未再在线重跑。
 - 候选批次直接调用 `Client.Solve`；Client 完整求解链墙钟 `P50=816ms`、`P95=984ms`、`P99=1018ms`、`max=1555ms`，成功样本墙钟 `P95=989ms`，总批次约 `6.16s`；`>=190/200` 与 Client 完整链 `P95<=1000ms` 均通过。
@@ -99,6 +100,7 @@
 - 应用内没有鉴权；对外暴露必须由受控网络、反向代理或 API gateway 提供访问控制。
 - 应用内没有 admission gate；请求激增可导致连接等待、超时、GC 压力、内存耗尽或进程退出，不承诺无界并发下的延迟与可用性。
 - 逐请求 proxy 允许调用方指定网络出口，外部部署必须限制调用方或实施 allowlist。
+- 已废弃 GET query 为兼容保留真实副作用，参数可进入 URL 历史或访问日志；不应携带 `AaduaneId` 或代理凭据，新接入应使用 POST JSON。
 - Python 业务提交/重放、交互式 CLI、桌面 UI、PyInstaller 和 Swagger UI 不属于 1.0.0 范围；`GET /` 第一方测试页不改变这些排除项。
 - Windows EXE 尚未配置 Authenticode 代码签名，Defender/SmartScreen 可能提示未知发布者；SHA-256 不能替代发布者签名。
 
@@ -115,5 +117,6 @@
 | `pkg/slider/online_acceptance_test.go:37`、`:49`、`:98`、`:128`、`:147`、`:165`、`:168`；[脱敏验证证据](docs/evidence/validation-2026-08-07.md) | 授权候选 200/32/应用层零重试批次成功 `196/200`，Client 完整链墙钟 P95 `984ms`，两项冻结门槛通过；该 harness 不经过 HTTP Handler，最终 one-shot 加固后未再在线重跑。 | authorized jobs → one Solve each → sanitized aggregate → bounded acceptance |
 | `internal/challenge/device_pool.go:22`、`:134`、`:190` | 设备预热池已实现有界 Prime/Lease、key 隔离和冷建回退。 | startup Prime → request Lease → release/refill |
 | `cmd/server/main.go:36`、`:49`、`:55`、`:60`、`:93`、`:111`、`:147` | 可执行服务、启动/定时清理和优雅关闭已经接线。 | config → Client → HTTP → cleanup |
+| `internal/server/server.go` · `checkSolveOrigin` / `decodeQueryRequest` / `requestFromPayload`；`internal/server/server_test.go` · `TestLegacyGETQueryCompatibility` / `TestLegacyGETQueryValidationNeverCallsSolver` / `TestSolveParameterSourcesStaySeparated` / `TestBrowserOriginBoundaryPreservesLegacyClients` | 已废弃 GET query 的传输兼容、方法参数源隔离和 GET/POST 跨源边界已固定。 | method + path → origin + JSON/query gate → one Solver call |
 | `Makefile` · `build-linux`；`.github/workflows/ali-slider-go-ci.yml` · `quality` | Linux AMD64 静态二进制已有本地和 CI 构建路径。 | commit → verified server binary |
 | `internal/vision/solver_test.go:260`；`internal/challenge/performance_test.go:65` | `53.10ms/op` 是视觉均值；完整纯计算链 P99 由独立逐次采样得到 `57.05075ms`。 | benchmark mean / sorted samples → separate performance claims |

@@ -150,6 +150,158 @@ func TestCanonicalAliasPrecedenceAndDefaults(t *testing.T) {
 	}
 }
 
+func TestLegacyGETQueryCompatibility(t *testing.T) {
+	var requests []slider.Request
+	handler := newTestHandler(t, solverFunc(func(_ context.Context, request slider.Request) (slider.Result, error) {
+		requests = append(requests, request)
+		return slider.Result{}, nil
+	}), nil)
+
+	tests := []struct {
+		name string
+		path string
+		want slider.Request
+	}{
+		{
+			name: "canonical keys take precedence and duplicate keys use last value",
+			path: SolvePath + "?sceneId=alias&SceneId=first&SceneId=canonical%20scene" +
+				"&Prefix=alias9&prefix=canon9&aaduaneId=alias&AaduaneId=rpc%20key" +
+				"&Proxy=alias.invalid%3A81&proxy=socks5h%3A%2F%2Fuser%3Apass%40proxy.invalid%3A1080&futureField=ignored",
+			want: slider.Request{
+				SceneID: "canonical scene", Prefix: "canon9", RPCKeyID: "rpc key",
+				Proxy: "socks5h://user:pass@proxy.invalid:1080",
+			},
+		},
+		{
+			name: "aliases",
+			path: SolvePath + "?sceneId=alias-scene&Prefix=alias9&aaduaneId=alias-key&Proxy=proxy.invalid%3A8080",
+			want: slider.Request{SceneID: "alias-scene", Prefix: "alias9", RPCKeyID: "alias-key", Proxy: "http://proxy.invalid:8080"},
+		},
+		{
+			name: "blank canonical keys suppress aliases and use defaults",
+			path: SolvePath + "?SceneId=&sceneId=ignored&prefix=+&Prefix=ignored&AaduaneId=&aaduaneId=ignored&proxy=&Proxy=ignored.invalid%3A80",
+			want: slider.Request{SceneID: "default-scene", Prefix: "default1"},
+		},
+		{
+			name: "empty query",
+			path: SolvePath,
+			want: slider.Request{SceneID: "default-scene", Prefix: "default1"},
+		},
+		{
+			name: "query null is a string",
+			path: SolvePath + "?SceneId=null",
+			want: slider.Request{SceneID: "null", Prefix: "default1"},
+		},
+		{
+			name: "raw query at exact limit",
+			path: SolvePath + "?future=" + strings.Repeat("x", int(MaxRequestBytes)-len("future=")),
+			want: slider.Request{SceneID: "default-scene", Prefix: "default1"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := performRequest(handler, http.MethodGet, test.path, "")
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", response.Code, response.Body.String())
+			}
+			if response.Header().Get("X-Trace-ID") == "" || response.Header().Get("Retry-After") != "" {
+				t.Fatalf("legacy GET headers = %#v", response.Header())
+			}
+			if got := requests[len(requests)-1]; got != test.want {
+				t.Fatalf("request = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+	if len(requests) != len(tests) {
+		t.Fatalf("solver calls = %d, want %d", len(requests), len(tests))
+	}
+}
+
+func TestLegacyGETQueryValidationNeverCallsSolver(t *testing.T) {
+	var calls atomic.Int32
+	handler := newTestHandler(t, solverFunc(func(context.Context, slider.Request) (slider.Result, error) {
+		calls.Add(1)
+		return slider.Result{}, nil
+	}), nil)
+	tests := []struct {
+		name     string
+		rawQuery string
+	}{
+		{name: "invalid URL encoding", rawQuery: "SceneId=%zz"},
+		{name: "query too large", rawQuery: "future=" + strings.Repeat("x", int(MaxRequestBytes))},
+		{name: "scene too long", rawQuery: "SceneId=" + strings.Repeat("a", 65)},
+		{name: "invalid prefix", rawQuery: "prefix=bad-prefix"},
+		{name: "invalid proxy", rawQuery: "proxy=ftp%3A%2F%2Fproxy.invalid%3A21"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, SolvePath, nil)
+			request.URL.RawQuery = test.rawQuery
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", response.Code, response.Body.String())
+			}
+			body := decodeObject(t, response)
+			if body["errorType"] != "ApiRequestError" || response.Header().Get("X-Trace-ID") != body["traceId"] {
+				t.Fatalf("legacy GET error = %#v headers=%#v", body, response.Header())
+			}
+		})
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("invalid legacy GET requests called Solver %d times", calls.Load())
+	}
+}
+
+func TestSolveParameterSourcesStaySeparated(t *testing.T) {
+	var requests []slider.Request
+	handler := newTestHandler(t, solverFunc(func(_ context.Context, request slider.Request) (slider.Result, error) {
+		requests = append(requests, request)
+		return slider.Result{}, nil
+	}), nil)
+
+	post := performRequest(handler, http.MethodPost, SolvePath+"?SceneId=query-scene", `{}`)
+	if post.Code != http.StatusOK {
+		t.Fatalf("POST status = %d: %s", post.Code, post.Body.String())
+	}
+	get := performRequest(handler, http.MethodGet, SolvePath+"?SceneId=query-scene", `{"SceneId":"body-scene"}`)
+	if get.Code != http.StatusOK {
+		t.Fatalf("GET status = %d: %s", get.Code, get.Body.String())
+	}
+	for _, form := range []struct {
+		name        string
+		contentType string
+		body        string
+	}{
+		{name: "urlencoded", contentType: "application/x-www-form-urlencoded", body: "SceneId=form-scene"},
+		{name: "multipart", contentType: "multipart/form-data; boundary=legacy", body: "--legacy\r\nContent-Disposition: form-data; name=SceneId\r\n\r\nform-scene\r\n--legacy--\r\n"},
+	} {
+		t.Run(form.name, func(t *testing.T) {
+			formRequest := httptest.NewRequest(http.MethodPost, SolvePath, strings.NewReader(form.body))
+			formRequest.Header.Set("Content-Type", form.contentType)
+			formResponse := httptest.NewRecorder()
+			handler.ServeHTTP(formResponse, formRequest)
+			if formResponse.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", formResponse.Code, formResponse.Body.String())
+			}
+		})
+	}
+
+	want := []slider.Request{
+		{SceneID: "default-scene", Prefix: "default1"},
+		{SceneID: "query-scene", Prefix: "default1"},
+	}
+	if len(requests) != len(want) {
+		t.Fatalf("solver calls = %d, want %d", len(requests), len(want))
+	}
+	for index := range want {
+		if requests[index] != want[index] {
+			t.Errorf("request[%d] = %#v, want %#v", index, requests[index], want[index])
+		}
+	}
+}
+
 func TestRequestValidationNeverCallsSolver(t *testing.T) {
 	tests := map[string]string{
 		"top level null":     `null`,
@@ -199,7 +351,7 @@ func TestRequestBodyLimit(t *testing.T) {
 		calls.Add(1)
 		return slider.Result{}, nil
 	}), nil)
-	body := `{"unknown":"` + strings.Repeat("x", int(maxRequestBytes)) + `"}`
+	body := `{"unknown":"` + strings.Repeat("x", int(MaxRequestBytes)) + `"}`
 	response := performRequest(handler, http.MethodPost, SolvePath, body)
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", response.Code)
@@ -333,9 +485,9 @@ func TestBrowserOriginBoundaryPreservesLegacyClients(t *testing.T) {
 		return slider.Result{}, nil
 	}), nil)
 
-	request := func(origin, fetchSite string) *httptest.ResponseRecorder {
+	request := func(method, origin, fetchSite string) *httptest.ResponseRecorder {
 		t.Helper()
-		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8000"+SolvePath, nil)
+		req := httptest.NewRequest(method, "http://127.0.0.1:8000"+SolvePath, nil)
 		if origin != "" {
 			req.Header.Set("Origin", origin)
 		}
@@ -347,49 +499,53 @@ func TestBrowserOriginBoundaryPreservesLegacyClients(t *testing.T) {
 		return response
 	}
 
-	for _, test := range []struct {
-		name      string
-		origin    string
-		fetchSite string
-	}{
-		{name: "cross-site metadata", fetchSite: "cross-site"},
-		{name: "same-site metadata", fetchSite: "same-site"},
-		{name: "foreign origin", origin: "https://attacker.example"},
-		{name: "opaque origin", origin: "null"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			response := request(test.origin, test.fetchSite)
-			if response.Code != http.StatusForbidden {
-				t.Fatalf("status = %d, want 403; body=%s", response.Code, response.Body.String())
-			}
-			body := decodeObject(t, response)
-			if body["errorType"] != "ApiOriginError" || response.Header().Get("X-Trace-ID") != body["traceId"] {
-				t.Fatalf("cross-site response = %#v headers=%#v", body, response.Header())
-			}
-		})
+	for _, method := range []string{http.MethodPost, http.MethodGet} {
+		for _, test := range []struct {
+			name      string
+			origin    string
+			fetchSite string
+		}{
+			{name: "cross-site metadata", fetchSite: "cross-site"},
+			{name: "same-site metadata", fetchSite: "same-site"},
+			{name: "foreign origin", origin: "https://attacker.example"},
+			{name: "opaque origin", origin: "null"},
+		} {
+			t.Run(method+"/"+test.name, func(t *testing.T) {
+				response := request(method, test.origin, test.fetchSite)
+				if response.Code != http.StatusForbidden {
+					t.Fatalf("status = %d, want 403; body=%s", response.Code, response.Body.String())
+				}
+				body := decodeObject(t, response)
+				if body["errorType"] != "ApiOriginError" || response.Header().Get("X-Trace-ID") != body["traceId"] {
+					t.Fatalf("cross-origin response = %#v headers=%#v", body, response.Header())
+				}
+			})
+		}
 	}
 	if calls.Load() != 0 {
-		t.Fatalf("cross-site requests called Solver %d times", calls.Load())
+		t.Fatalf("cross-origin requests called Solver %d times", calls.Load())
 	}
 
-	for _, test := range []struct {
-		name      string
-		origin    string
-		fetchSite string
-	}{
-		{name: "same-origin page", origin: "http://127.0.0.1:8000", fetchSite: "same-origin"},
-		{name: "user initiated browser request", fetchSite: "none"},
-		{name: "legacy headerless client"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			response := request(test.origin, test.fetchSite)
-			if response.Code != http.StatusOK {
-				t.Fatalf("status = %d, want 200; body=%s", response.Code, response.Body.String())
-			}
-		})
+	for _, method := range []string{http.MethodPost, http.MethodGet} {
+		for _, test := range []struct {
+			name      string
+			origin    string
+			fetchSite string
+		}{
+			{name: "same-origin page", origin: "http://127.0.0.1:8000", fetchSite: "same-origin"},
+			{name: "user initiated browser request", fetchSite: "none"},
+			{name: "legacy headerless client"},
+		} {
+			t.Run(method+"/"+test.name, func(t *testing.T) {
+				response := request(method, test.origin, test.fetchSite)
+				if response.Code != http.StatusOK {
+					t.Fatalf("status = %d, want 200; body=%s", response.Code, response.Body.String())
+				}
+			})
+		}
 	}
-	if calls.Load() != 3 {
-		t.Fatalf("allowed requests called Solver %d times, want 3", calls.Load())
+	if calls.Load() != 6 {
+		t.Fatalf("allowed requests called Solver %d times, want 6", calls.Load())
 	}
 }
 
@@ -400,11 +556,13 @@ func TestOnlyFrozenRoutesAreExposed(t *testing.T) {
 		return slider.Result{}, nil
 	}), nil)
 
-	if response := performRequest(handler, http.MethodGet, SolvePath, ""); response.Code != http.StatusNotFound {
-		t.Fatalf("GET solve status = %d, want 404", response.Code)
+	for _, method := range []string{http.MethodHead, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodOptions} {
+		if response := performRequest(handler, method, SolvePath, ""); response.Code != http.StatusNotFound {
+			t.Errorf("%s solve status = %d, want 404", method, response.Code)
+		}
 	}
 	if calls.Load() != 0 {
-		t.Fatalf("GET solve called solver %d times", calls.Load())
+		t.Fatalf("unsupported solve methods called solver %d times", calls.Load())
 	}
 	health := performRequest(handler, http.MethodGet, HealthPath, "")
 	if health.Code != http.StatusOK || health.Header().Get("Cache-Control") != "no-store" {
@@ -434,14 +592,41 @@ func TestOnlyFrozenRoutesAreExposed(t *testing.T) {
 	if _, exists := pageFailureContent["text/plain"]; !exists {
 		t.Fatalf("test page OpenAPI failure content = %#v", pageFailureContent)
 	}
-	solve := paths[SolvePath].(map[string]any)["post"].(map[string]any)
+	solvePath := paths[SolvePath].(map[string]any)
+	if len(solvePath) != 2 {
+		t.Fatalf("solve methods = %#v", solvePath)
+	}
+	legacyGET := solvePath["get"].(map[string]any)
+	if legacyGET["deprecated"] != true {
+		t.Fatalf("legacy GET deprecated = %#v", legacyGET["deprecated"])
+	}
+	parameters := legacyGET["parameters"].([]any)
+	if len(parameters) != 8 {
+		t.Fatalf("legacy GET parameters = %d, want 8", len(parameters))
+	}
+	parameterNames := make(map[string]bool, len(parameters))
+	for _, rawParameter := range parameters {
+		parameter := rawParameter.(map[string]any)
+		parameterNames[parameter["name"].(string)] = true
+	}
+	for _, name := range []string{"SceneId", "sceneId", "prefix", "Prefix", "AaduaneId", "aaduaneId", "proxy", "Proxy"} {
+		if !parameterNames[name] {
+			t.Errorf("legacy GET parameter missing %q", name)
+		}
+	}
+	for _, method := range []string{"get", "post"} {
+		responses := solvePath[method].(map[string]any)["responses"].(map[string]any)
+		if len(responses) != 4 {
+			t.Errorf("OpenAPI %s response count = %d, want 4", method, len(responses))
+		}
+		for _, status := range []string{"200", "400", "403", "500"} {
+			if _, exists := responses[status]; !exists {
+				t.Errorf("OpenAPI %s response missing %s", method, status)
+			}
+		}
+	}
+	solve := solvePath["post"].(map[string]any)
 	responses := solve["responses"].(map[string]any)
-	if _, exists := responses["403"]; !exists {
-		t.Fatal("OpenAPI does not advertise the cross-site browser rejection")
-	}
-	if _, exists := responses["429"]; exists {
-		t.Fatal("OpenAPI still advertises local 429")
-	}
 	success := responses["200"].(map[string]any)["content"].(map[string]any)["application/json"].(map[string]any)["schema"].(map[string]any)
 	properties := success["properties"].(map[string]any)
 	for _, field := range []string{"ok", "securityToken", "VerifyCode", "VerifyResult", "certifyId", "sceneId", "proxied", "elapsedMs", "timingsMs", "traceId"} {

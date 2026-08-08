@@ -2,7 +2,7 @@
 
 ## 1. 系统定位
 
-`ali-slider-go` 是独立的纯 Go module，提供可并发复用的 `slider.Client` 和四个 HTTP 入口。生产求解链不启动 Python、Node.js、浏览器或子进程，不依赖 OpenCV、GoCV、CGo 或动态库；`GET /` 返回编译进 EXE 的第一方浏览器测试页，不代表服务端启动浏览器。
+`ali-slider-go` 是独立的纯 Go module，提供可并发复用的 `slider.Client` 和四个 HTTP 路径：`GET /`、`GET|POST /api/slider`、`GET /health` 和 `GET /openapi.json`。生产求解链不启动 Python、Node.js、浏览器或子进程，不依赖 OpenCV、GoCV、CGo 或动态库；`GET /` 返回编译进 EXE 的第一方浏览器测试页，不代表服务端启动浏览器。
 
 完整单轮编排已实现：
 
@@ -24,8 +24,8 @@ Device RPC 响应按 action 解码：顶层 Code 统一校验，只有 Log1 将 
 
 ```mermaid
 flowchart LR
-    caller["授权调用方"] --> http["server.Handler<br/>Origin / JSON / Trace / Timeout<br/>合法 POST 直接调用"]
-    page["内嵌 API 测试页<br/>GET / · 手工提交"] --> http
+    caller["授权调用方<br/>POST JSON / deprecated GET query"] --> http["server.Handler<br/>Origin / JSON|query / Trace / Timeout<br/>合法 Solve 直接调用"]
+    page["内嵌 API 测试页<br/>GET / · 手工 POST"] --> http
     http --> client["slider.Client"]
 
     subgraph one_request["单轮私有状态"]
@@ -52,7 +52,9 @@ flowchart LR
     failure -.-> verify
 ```
 
-HTTP 层先完成浏览器跨源和输入校验；合法 `POST /api/slider` 不经过本地 admission gate，直接调用 Solver，也不因本机在途请求数主动返回 `429` 或 `Retry-After`。Handler 和 concrete Client 都会传播超时 context；Solver 必须尊重 context，不使用无界 goroutine 伪造“强制取消”。Client 连接池或预热池的资源预算不等于 HTTP 请求上限。
+HTTP 层先完成浏览器跨源和输入校验；合法 `POST /api/slider` JSON 与 deprecated `GET /api/slider?...` query 都不经过本地 admission gate，直接调用 Solver，也不因本机在途请求数主动返回 `429` 或 `Retry-After`。GET 与 POST 不合并参数源，form body 不受支持。Handler 和 concrete Client 都会传播超时 context；Solver 必须尊重 context，不使用无界 goroutine 伪造“强制取消”。Client 连接池或预热池的资源预算不等于 HTTP 请求上限。
+
+deprecated GET 并非 REST 语义上的安全读取；它只为旧 Python 客户端保留，会创建真实挑战和上游请求。Handler 使用 `checkSolveOrigin` 将 GET 的同源检查副本视为 unsafe POST，以复用 Go `CrossOriginProtection`；明确跨源 POST/GET 均在 Solver 前返回 403，同源、`Sec-Fetch-Site: none` 和无浏览器头的旧客户端则允许。
 
 内嵌测试页不依赖外部 CDN/框架/字体，只能向同源 `/health` 和 `/api/slider` 发起 fetch。页面打开只检查 health；Solve 必须由用户显式提交，执行期间防双击，不做重试或批量压测。页面 CSP、随机 nonce、默认敏感字段遮罩和无浏览器持久化只保护本页边界，不替代 API 鉴权。
 
@@ -62,7 +64,7 @@ HTTP 层先完成浏览器跨源和输入校验；合法 `POST /api/slider` 不�
 |---|---|---|
 | 进程入口 | `cmd/server` | 解析配置、先 bind 端口、构造 Client、预热、定时清理、信号关闭 |
 | 公共 library | `pkg/slider` | `Client` / `Request` / `Result` / 稳定错误类别与生命周期 |
-| HTTP 适配 | `internal/server` | 四入口、内嵌测试页、跨源边界、别名解析、64 KiB 限制、合法 POST 直接调用、deadline、panic 恢复、OpenAPI、脱敏日志 |
+| HTTP 适配 | `internal/server` | 四路径、内嵌测试页、POST JSON/deprecated GET query、跨源边界、别名/空值解析、`MaxRequestBytes` 对 JSON body/raw query 各限 64 KiB、合法 Solve 直接调用、deadline、panic 恢复、OpenAPI、脱敏日志 |
 | 单轮编排 | `internal/challenge` | Solver 状态机、Captcha RPC、资产下载、路由池、设备预热池 |
 | 设备协议 | `internal/device` | 画像、111 字段、Log1/2/3、DeviceConfig、token 与最终 getter |
 | 纯计算 | `internal/vision` | PNG 边界、多信号匹配、Chamfer 兜底、置信度 |
@@ -110,7 +112,7 @@ stateDiagram-v2
 
 | 资源 | 所有者 | 并发策略 | 释放 |
 |---|---|---|---|
-| HTTP 请求、trace、请求 DTO、结果 DTO | 单请求 | `net/http` 按请求调度；输入合法后直接进入 Solver，无本地 admission 槽 | 响应后 |
+| HTTP 请求、trace、请求 DTO、结果 DTO | 单请求 | `net/http` 按请求调度；POST JSON 或 deprecated GET query 输入合法后直接进入 Solver，无本地 admission 槽 | 响应后 |
 | Device Session / CertifyId / Verify 位 | 单轮 | 不跨挑战共享 | Solve 返回时 close/release |
 | 预热 Device Session | DeviceSessionPool | `ready + pending + leased <= capacity <= MaxConcurrency`；一次性消费 | release 关闭后有界回补 |
 | HTTP transport | TransportPool | 按规范 route 隔离；直连保留；有界 LRU；每 route/host 连接受 Client `MaxConcurrency` 预算约束，但不限制 Solve 调用数 | Client.Close 关闭空闲连接并清表 |
@@ -120,12 +122,14 @@ stateDiagram-v2
 
 Client 的关闭顺序是：禁止新工作 → 等待活动 Solve/Prime/Purge → 关预热池 → 关 transport。`Close` 并发幂等。
 
+HTTP 进程入口的 `maxHeaderBytes` 是 `server.MaxRequestBytes + 32 KiB`：64 KiB 是 Handler 对 raw query 数据的真实上限，多出的 32 KiB 只留给 request line 与普通 header。该分层避免真实 `net/http.Server` 在 Handler 之前误拒恰好达到上限的旧 query。
+
 ## 6. 超时与错误分类
 
 - Handler 为每个通过跨源和输入校验的请求建立 `Options.Timeout` deadline，并保留调用方取消信号。
 - concrete Solver 内再建立同一总时限，保护直接 library 调用。
 - Device RPC 可在总 context 内使用更窄的请求超时。
-- HTTP 输入错误返回 `400` 且不调用 Solver；明确的浏览器跨源 POST 返回 `403 ApiOriginError` 且不调用 Solver。Solver 参数错误返回 `400`，完成态业务结果返回 `200`，技术错误、超时或 panic 返回脱敏 `500`。
+- JSON/query HTTP 输入错误返回 `400` 且不调用 Solver；明确的浏览器跨源 POST/deprecated GET 返回 `403 ApiOriginError` 且不调用 Solver。Solver 参数错误返回 `400`，完成态业务结果返回 `200`，技术错误、超时或 panic 返回脱敏 `500`。两种 Solve 方法都不声明 429。
 - 每个 `/api/slider` 响应保留服务端 trace，`X-Trace-ID` 与响应体 `traceId` 一致。
 - `NetworkError` 只表示已标记的 DNS/TLS/HTTP/响应读取/超时失败。
 - HTTP 2xx 中的 JSON/schema、签名、DeviceConfig、时钟和本地不变量失败归入 `ProtocolError`。
@@ -150,9 +154,9 @@ Client 的关闭顺序是：禁止新工作 → 等待活动 Solve/Prime/Purge �
 | `pkg/slider/client.go` · `Client.Solve/Prime/Close` | library 拥有完整 Solver、预热与并发安全关闭生命周期。 | caller → Client → challenge.Solver → Result |
 | `internal/challenge/solver.go` · `Solver.Solve` / `completeAndVerify` | 前置协议阶段通过后只有一个 Verify 调用点。 | Device → Init → Assets → Vision → PE → Complete → Verify |
 | `internal/challenge/rpc.go` · `RPCClient.Init/Verify` | Init 与唯一 Verify 有实例级状态与 CertifyId 绑定。 | Init consumes attempt → issued ID → Verify consumes attempt |
-| `internal/server/server.go` · `browserOriginProtection` / `handleSolve` / `callSolver` | HTTP 层用 Go 标准库先拒绝明确浏览器跨源请求并校验 body；合法请求不经过本地 admission，在请求派生的 deadline context 中调用 Solver，并在同一调用栈恢复 panic。 | request → origin/body gate → timeout context → Solve → mapped response |
+| `internal/server/server.go` · `MaxRequestBytes` / `checkSolveOrigin` / `decodeQueryRequest` / `requestFromPayload` / `handleSolve` / `callSolver`；`cmd/server/main.go` · `maxHeaderBytes`；`cmd/server/main_test.go` · `TestHeaderBudgetAcceptsMaximumLegacyQuery` | HTTP 入口保留足够 request-line/header 预算，再对 POST 和 deprecated GET 拒绝明确浏览器跨源请求，分别校验 JSON body 与 query；合法请求不经过本地 admission，在请求派生的 deadline context 中调用 Solver。 | request → HTTP budget → origin + source-specific gate → timeout context → Solve → mapped response |
 | `internal/server/testpage.go` · `writeTestPage`；`internal/server/web/test.html` | 第一方页面编译进二进制，以随机 nonce CSP 约束为同源手工调用且不持久化结果。 | GET `/` → embedded page → explicit POST `/api/slider` |
-| `internal/config/config.go:26` · `MaxConcurrency`；`pkg/slider/client.go:91` · `NewTransportPool`；`:122` · `NewDeviceSessionPool` | `MaxConcurrency` 是 Client 每 route/host 出站连接与预热资源预算，不是 HTTP 并发阈值。 | config → ClientOptions → transport/prewarm budget；valid POST → Solver |
+| `internal/config/config.go:26` · `MaxConcurrency`；`pkg/slider/client.go:91` · `NewTransportPool`；`:122` · `NewDeviceSessionPool` | `MaxConcurrency` 是 Client 每 route/host 出站连接与预热资源预算，不是 HTTP 并发阈值。 | config → ClientOptions → transport/prewarm budget；valid Solve request → Solver |
 | `internal/device/rpc.go:119`、`:130`；`internal/device/online_session_test.go:17` | Device schema 按 action 解码；在线 Log1/2/3 探针约 `0.53s` 通过。 | raw response → schema gate → authorized probe |
 | `internal/challenge/performance_test.go`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 离线 32 路 Mock Solver 链正确性通过；200 样本纯计算 `P99=57.05075ms`。 | fixture → concurrent Solver chain / sorted compute samples → verified gates |
 | `pkg/slider/online_acceptance_test.go:37`、`:49`、`:98`、`:128`、`:147`、`:165`、`:168`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 2026-08-07 的 200/32/应用层零重试候选批次严格成功 `196/200`，Client 完整链墙钟 P95 `984ms`；最终 one-shot 加固后未在线重跑。 | public Client → one Solve per job → aggregate summary → bounded Client acceptance；不经过 HTTP Handler |

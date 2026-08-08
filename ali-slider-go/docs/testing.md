@@ -9,6 +9,7 @@
 - 正确性优先于性能；oracle、负例、唯一 Verify 或竞态测试失败时，性能结果无效。
 - 在线验收必须有明确授权、由人工显式发起，并与普通 CI 隔离。
 - 同一个 `CertifyId` 最多尝试一次 Verify；网络结果未知也视为已经消耗尝试位。
+- Deprecated `GET /api/slider?...` 是具有真实上游副作用的兼容入口；普通测试只用 Mock Solver，不得用浏览器、爬虫或健康检查访问真实 GET Solve。
 - 覆盖率必须从同一源码快照、同一份全项目 `coverprofile` 计算，不能拼接不同时间点的包级数字。
 
 ## 分层测试模型
@@ -19,7 +20,7 @@
 | L1 跨语言 oracle | 锁定 Python 与 Go 的协议和困难视觉语义 | `protocol/testdata`、`vision/testdata`、PE oracle | 静态 fixture | 通过 |
 | L2 组件集成 | 验证设备 RPC schema、Captcha RPC、代理、下载、预热池及清理 | `internal/device`、`internal/challenge`、`internal/artifact` | Fake `RoundTripper` | 通过 |
 | L3 完整离线链 | 验证 Device → Init → Assets → Vision → PE → Device Complete → Verify | `solver_test.go` | 单一 Mock transport | 通过 |
-| L4 服务合同 | HTTP 四入口、内嵌页/CSP、别名、状态码、OpenAPI、64 并发直通、无本地主动 429、日志脱敏、启动配置 | `server_test.go`、`cmd/server/main_test.go` | Mock Solver/占用端口 | 通过 |
+| L4 服务合同 | HTTP 四路径、POST JSON + deprecated GET query、内嵌页/CSP、别名/空值/参数源、状态码、OpenAPI、64 并发直通、无本地主动 429、日志脱敏、启动配置 | `server_test.go`、`cmd/server/main_test.go` | Mock Solver/占用端口 | 通过 |
 | L5 工程门禁 | fmt、vet、test、race、coverage、staticcheck、govulncheck、静态构建与便携包 | `Makefile`、Go CI | Linux quality + Darwin race + Windows 原生 package 均为 `CGO_ENABLED=0`；工具安装/漏洞库可联网 | 发布 commit 由 CI 重跑 |
 | L6 授权在线 | Device 探针及 200 个新挑战、32 并发、每 job 一次 Solve、应用层零重试、成功率和 Client 完整求解链 P95 | `online` build tag 测试 | 显式授权 | 候选批次通过；one-shot 加固后未获授权重跑 |
 
@@ -162,9 +163,13 @@ go test -count=1 -v ./internal/server
 - 池处理过期、取消、失败、异步补货、并发 Lease/Close 和幂等 release。
 - `TestConcurrentRequestsAlwaysEnterSolver` 同时发出 64 个合法 HTTP 请求，在 Mock Solver 阻塞期间确认 `64/64` 均已进入；释放后全部返回 HTTP 200，且没有 `Retry-After`。
 - `TestEmbeddedAPITestPage` / `TestEmbeddedAPITestPageNonceFailure` 验证 `GET /` 返回内嵌 HTML 且不调用 Solver；POST/HEAD 根路径仍为 404；连续响应使用不同 128-bit nonce，CSP 无 unsafe 指令，页面无外链、浏览器持久化或危险 DOM API；随机源失败时返回脱敏 500 且零 Solver。
-- `TestBrowserOriginBoundaryPreservesLegacyClients` 验证 Go 标准库拒绝明确浏览器跨源 POST 且零 Solver，同源页、用户直接发起和无浏览器头的旧客户端仍通过。
-- OpenAPI Solve response 只声明 200/400/403/500；403 仅是浏览器 origin 安全边界，不是 admission。测试同时断言文档不含 429、`Retry-After`、`TooManyChallenges` 等旧本地过载字段。
-- JSON/字段校验失败不调用 Client；每个合法请求都进入 Solve，业务失败仍返回 HTTP `200`。
+- `TestLegacyGETQueryCompatibility` 锁定 GET query `64 KiB` 边界下的旧别名、同名参数最后值、canonical 压过 alias、空 canonical 抑制 alias 并回落默认值，以及未知字段忽略。
+- `TestLegacyGETQueryValidationNeverCallsSolver` 验证非法 URL encoding、超长 query/字段、prefix 和 proxy 错误统一返回 `400 ApiRequestError`，且零 Solver。
+- `TestHeaderBudgetAcceptsMaximumLegacyQuery` 从真实 `net/http.Server` 层验证 `maxHeaderBytes = server.MaxRequestBytes + 32 KiB`：64 KiB raw query 之外仍有 request line/普通 header 预算，精确上限的 URL 不会在到达 Handler 前被拒绝。
+- `TestSolveParameterSourcesStaySeparated` 验证 GET 只读 query、POST 只读 JSON body，两者不合并，并且 URL-encoded/multipart form body 不是支持的 Solve 输入。
+- `TestBrowserOriginBoundaryPreservesLegacyClients` 验证 Go 标准库边界对 POST 和 deprecated GET 都拒绝明确浏览器跨源请求且零 Solver；同源、`Sec-Fetch-Site: none` 和无浏览器头的旧客户端仍通过。
+- `TestOnlyFrozenRoutesAreExposed` 验证仍只有四个路径，Solve 同时声明 POST 与 deprecated GET，两种方法都只有 200/400/403/500；文档不含 429、`Retry-After`、`TooManyChallenges` 等旧本地过载字段。
+- JSON/query/字段校验失败不调用 Client；每个合法 Solve 请求都进入 Solver，业务失败仍返回 HTTP `200`。
 - 外层反向代理、负载均衡或 API 网关可能在请求到达进程前返回 429；第三方上游也可能在 Solve 内返回 429。两者必须分开归因，不能写成本服务的本地 admission 429。
 - Solver error/panic、普通日志和 artifact 均不泄漏 token、`CertifyId`、代理凭据或原始正文。
 - `slider.Client.Close` 等待活跃 Solve/Prime/Purge，再关闭预热会话和空闲连接。
@@ -203,9 +208,9 @@ file dist/ali-slider-go-windows-amd64.exe
 - `CGO_ENABLED=0`、AMD64 console PE 构建；
 - 最终 ZIP 五文件白名单与 EXE SHA-256；
 - 解压到含中文和空格的路径后，通过最终 `start.bat` 启动 EXE 并验证参数转发；
-- 精确检查内嵌 `GET /` 的 HTML marker、同源 API 路径、CSP/no-store/nosniff/no-referrer、`/health`、OpenAPI 3.0.3 与非法 JSON `400`；
+- 精确检查内嵌 `GET /` 的 HTML marker、同源 POST API 路径、CSP/no-store/nosniff/no-referrer、`/health`、OpenAPI 3.0.3、deprecated GET 合同与非法 JSON/query `400`；
 - 检查启动日志没有 `artifact_purge status=warning`；
-- smoke 设置 `--device-prewarm=0`；只 GET 页面/health/OpenAPI，并发送一个在 Solver 前返回 403 的跨源 POST 和一个返回 400 的非法 JSON，不发送任何会进入真实 Solver 的合法请求。
+- smoke 设置 `--device-prewarm=0`；只 GET 页面/health/OpenAPI，并发送在 Solver 前返回 403 的跨源 POST/deprecated GET 以及返回 400 的非法 JSON/query。跨源 GET 同时带非法 prefix，POST 同时使用非 object `[]`；即使 origin gate 意外回归，后续输入门禁也只能返回 400，不会进入真实 Solver。
 
 PR 执行完整 Windows 验证但不上传。`main` push 和 `workflow_dispatch` 在 Linux quality、Darwin race 与 Windows package 全部成功后，上传保留 30 天的单层 `ali-slider-go-windows-amd64.zip`。下载后的 ZIP 可直接转发，接收者不需要 GitHub 账号。详细合同见 [Windows AMD64 便携包](./windows.md)。
 
@@ -289,9 +294,9 @@ docker stop ali-slider-go-smoke
 | `internal/pe/builder_test.go:96` | PE 对 Python oracle 做完整解包语义对照。 | profile + track → PE build → Pack/Unpack equality |
 | `internal/challenge/solver_test.go` · `TestSolverOfflineCompleteSuccess` / `TestSolverLowConfidenceStopsBeforeVerify` / `TestSolverVerifyNetworkErrorIsSingleAttemptAndSanitized` | 完整离线链覆盖成功、前置零 Verify 和网络错误单次 Verify。 | Device → Init → Vision/PE → guarded Verify |
 | `internal/challenge/device_pool_test.go:138`、`:177`、`:930` | 预热池覆盖有界并行、key 隔离及 Lease/Close 竞态。 | Prime/Lease → bounded ownership → Close |
-| `internal/server/server.go` · `handleSolve`；`internal/server/server_test.go` · `TestConcurrentRequestsAlwaysEnterSolver` / `TestBrowserOriginBoundaryPreservesLegacyClients` | HTTP 无本地 admission；64 个合法并发请求全部进入 Solver，明确跨源浏览器 POST 在 Solver 前返回 403。 | origin/body gate → every valid Solve entered → release → 200 |
+| `internal/server/server.go` · `checkSolveOrigin` / `decodeQueryRequest` / `handleSolve`；`internal/server/server_test.go` · `TestLegacyGETQueryCompatibility` / `TestLegacyGETQueryValidationNeverCallsSolver` / `TestSolveParameterSourcesStaySeparated` / `TestConcurrentRequestsAlwaysEnterSolver` / `TestBrowserOriginBoundaryPreservesLegacyClients`；`cmd/server/main_test.go` · `TestHeaderBudgetAcceptsMaximumLegacyQuery` | POST JSON 与 deprecated GET query 的输入、分源、HTTP header 预算和跨源合同有回归；HTTP 无本地 admission，64 个合法并发 POST 全部进入 Solver。 | origin + JSON/query gate → every valid Solve entered → release → 200 |
 | `internal/server/testpage.go`；`internal/server/server_test.go` · `TestEmbeddedAPITestPage` | 页面嵌入二进制，GET 不调用 Solver，nonce/安全头/无外链和无持久化合同均有离线回归。 | embedded source → GET `/` → constrained browser page |
-| `internal/server/openapi.go`；`internal/server/server_test.go` · `TestOnlyFrozenRoutesAreExposed` | OpenAPI 描述四入口；Solve 只声明 200/400/403/500，且回归禁止 429、`Retry-After` 和旧本地过载字段。 | generated contract → positive/negative assertions → stable surface |
+| `internal/server/openapi.go` · `legacyQueryParameters` / `solveResponses`；`internal/server/server_test.go` · `TestOnlyFrozenRoutesAreExposed` | OpenAPI 描述四路径和 Solve POST/deprecated GET；两种方法只声明 200/400/403/500，且回归禁止 429、`Retry-After` 和旧本地过载字段。 | generated contract → positive/negative assertions → stable surface |
 | `internal/device/rpc.go:119`、`:130`；`internal/device/session_test.go:130`、`:146`、`:150`、`:165`；`internal/device/online_session_test.go:17` | Device schema 按 action 解码，离线回归与约 `0.53s` 在线 Log1/2/3 探针通过。 | raw JSON → Log1 DeviceConfig / Log2-3 Code → authorized probe |
 | `internal/challenge/performance_test.go:21`、`:65`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 32 路 Mock 正确性与 6,400 次压力通过；200 样本纯计算 `P99=57.05075ms`，达到硬门槛。 | concurrent mock / repeated stress / local sampler → verified compute and capacity gates |
 | `pkg/slider/online_acceptance_test.go:37`、`:49`、`:98`、`:128`、`:147`、`:165`、`:168`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 候选 200/32/应用层零重试批次严格成功 `196/200`，Client 完整求解链 P95 `984ms`；不经过 HTTP Handler，最终 one-shot 加固后未在线重跑。 | authorized jobs → one Solve each → aggregate summary → bounded acceptance |
