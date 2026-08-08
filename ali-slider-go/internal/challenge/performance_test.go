@@ -20,7 +20,9 @@ import (
 
 func TestSolverOffline32ConcurrentSuccess(t *testing.T) {
 	transport := newSolverTransport(t, "gap")
-	solver, artifactDirectory := newIntegrationSolver(t, transport, 0.45)
+	// 该用例验证 32 路完整离线链的正确性，不承担延迟门槛。Race 插桩会在
+	// GitHub hosted ARM64 上显著放大视觉耗时，因此使用独立的有界测试时限。
+	solver, artifactDirectory := newIntegrationSolverWithTimeout(t, transport, 0.45, 30*time.Second)
 
 	const concurrency = 32
 	var group sync.WaitGroup

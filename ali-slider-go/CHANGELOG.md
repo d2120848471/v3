@@ -54,6 +54,7 @@
 - 设备 Log1/Log2/Log3 同样使用不可回卷请求体，保证一次性会话动作不会被 Transport 在已发送后透明重放。
 - 修复零值 `ClientOptions{}` 漏补默认设备预热容量；显式关闭预热仍通过 `DefaultClientOptions()` 后覆盖为零。
 - 修复 Windows 无法表达 POSIX `0700` 导致 Artifact 保存/清理失败；保留目录真实性、同文件复核、symlink 拒绝、排他创建和配额保护。
+- 修复 Darwin ARM64 race 插桩下 32 路离线正确性测试误触 5 秒 Solver 时限；只放宽测试时限，不改变生产 timeout 或性能门槛。
 
 ### Security
 

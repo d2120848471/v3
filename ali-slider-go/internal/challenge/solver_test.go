@@ -207,12 +207,16 @@ func solverResponse(request *http.Request, status int, content []byte) *http.Res
 }
 
 func newIntegrationSolver(t *testing.T, transport *solverTransport, minimumConfidence float64) (*Solver, string) {
+	return newIntegrationSolverWithTimeout(t, transport, minimumConfidence, 5*time.Second)
+}
+
+func newIntegrationSolverWithTimeout(t *testing.T, transport *solverTransport, minimumConfidence float64, timeout time.Duration) (*Solver, string) {
 	t.Helper()
 	artifactDirectory := filepath.Join(t.TempDir(), "artifacts")
 	sources := runtimekit.Sources{Clock: transport.clock, Entropy: &byteEntropy{}}
 	store := &artifact.Store{Directory: artifactDirectory, Retention: 7 * 24 * time.Hour, Entropy: sources.Entropy, Now: transport.clock.Now}
 	solver, err := NewSolver(SolverOptions{
-		Timeout: 5 * time.Second, MinimumConfidence: minimumConfidence,
+		Timeout: timeout, MinimumConfidence: minimumConfidence,
 		GatherCostMin: 180, GatherCostMax: 260, FirstTouchAgeMin: 650, FirstTouchAgeMax: 850,
 		AssetMaxBytes: 8 << 20, AssetMaxDimension: 16_384, AssetMaxPixels: 16 << 20,
 		Sources: sources, Artifacts: store,
