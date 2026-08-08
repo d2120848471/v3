@@ -1,0 +1,132 @@
+name: ali-slider-go-ci
+
+on:
+  pull_request:
+    paths:
+      - "ali-slider-go/**"
+      - ".github/workflows/ali-slider-go-ci.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "ali-slider-go/**"
+      - ".github/workflows/ali-slider-go-ci.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ali-slider-go-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Pure Go offline tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ali-slider-go
+    env:
+      CGO_ENABLED: "0"
+      GOFLAGS: -mod=readonly
+      GOTOOLCHAIN: local
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.5"
+          check-latest: false
+          cache: false
+
+      # 工具下载与漏洞库查询不运行项目代码，也不携带真实目标配置。
+      # 下方测试本身全部使用 Mock/静态 fixture，不访问验证码、设备 RPC、CDN 或代理。
+      - name: Install pinned analysis tools
+        env:
+          GOBIN: ${{ runner.temp }}/ali-slider-go-tools
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          echo "${GOBIN}" >> "${GITHUB_PATH}"
+
+      - name: Verify zero production dependencies
+        env:
+          GOPROXY: "off"
+        run: |
+          test "$(go list -m all | wc -l | tr -d ' ')" = "1"
+          go mod verify
+
+      - name: Formatting and static analysis
+        env:
+          GOPROXY: "off"
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          staticcheck ./...
+
+      - name: Unit, integration and fuzz seeds
+        env:
+          GOPROXY: "off"
+        run: |
+          go test -count=1 ./...
+
+      - name: Coverage gates
+        env:
+          GOPROXY: "off"
+        run: |
+          go test -count=1 -coverprofile="${RUNNER_TEMP}/all.cover" ./...
+          total="$(go tool cover -func="${RUNNER_TEMP}/all.cover" | awk '/^total:/{gsub(/%/,"",$3); print $3}')"
+          awk -v got="${total}" 'BEGIN { if (got + 0 < 80) exit 1 }'
+
+          go test -count=1 -coverprofile="${RUNNER_TEMP}/protocol.cover" ./internal/protocol
+          protocol="$(go tool cover -func="${RUNNER_TEMP}/protocol.cover" | awk '/^total:/{gsub(/%/,"",$3); print $3}')"
+          awk -v got="${protocol}" 'BEGIN { if (got + 0 < 90) exit 1 }'
+
+          go test -count=1 -coverprofile="${RUNNER_TEMP}/vision.cover" ./internal/vision
+          vision="$(go tool cover -func="${RUNNER_TEMP}/vision.cover" | awk '/^total:/{gsub(/%/,"",$3); print $3}')"
+          awk -v got="${vision}" 'BEGIN { if (got + 0 < 90) exit 1 }'
+
+          printf 'coverage total=%s%% protocol=%s%% vision=%s%%\n' "${total}" "${protocol}" "${vision}"
+
+      - name: Vulnerability scan
+        run: govulncheck ./...
+
+      - name: Linux AMD64 static build
+        env:
+          GOPROXY: "off"
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          go build -trimpath -ldflags="-s -w" -o "${RUNNER_TEMP}/ali-slider-go-linux-amd64" ./cmd/server
+          file "${RUNNER_TEMP}/ali-slider-go-linux-amd64" | grep -q "statically linked"
+
+  race:
+    name: Pure Go race detector (Darwin)
+    runs-on: macos-14
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ali-slider-go
+    env:
+      CGO_ENABLED: "0"
+      GOFLAGS: -mod=readonly
+      GOTOOLCHAIN: local
+      GOPROXY: "off"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.5"
+          check-latest: false
+          cache: false
+
+      # Linux 的 Go race runtime 强制依赖 CGo；Darwin 可在 CGO_ENABLED=0
+      # 下运行同一门禁，因此不为测试工具链放宽项目的纯 Go 边界。
+      - name: Race detector
+        run: go test -count=1 -race ./...

@@ -1,0 +1,9 @@
+.git
+.github
+.planning
+bin
+dist
+coverage.out
+coverage.html
+var/artifacts
+*.log

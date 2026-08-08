@@ -1,0 +1,12 @@
+/bin/
+/dist/
+/coverage.out
+/coverage.html
+/vision.test
+*.test
+/var/artifacts/*
+!/var/artifacts/.gitkeep
+
+# 以下四张是脱敏合成 oracle fixture，不是运行失败样本。
+!/internal/vision/testdata/python-edge-decoy/*/back.png
+!/internal/vision/testdata/python-edge-decoy/*/shadow.png

@@ -1,32 +1,11 @@
-# ── Python ────────────────────────────────────────────────────────────
-__pycache__/
-*.py[cod]
-*.egg-info/
-build/
-dist/
-.pytest_cache/
-.ruff_cache/
+# 本地任务、系统与编辑器文件
+.planning/
+.DS_Store
+.idea/
+.vscode/
+*.swp
 
-# ── 虚拟环境 ──────────────────────────────────────────────────────────
-.venv/
-venv/
-env/
-
-# ── 运行产物 ──────────────────────────────────────────────────────────
-# --artifacts-dir 保留的本轮图片与动态 PE；默认走临时目录，显式保留时勿入库。
-artifacts/
-*.log
-back.png
-shadow.png
-main.css
-pe.js
-
-# ── 敏感材料（绝不入库）────────────────────────────────────────────────
-# 原始抓包、app bundle、Cookie、业务 token 与 securityToken 都属于会话材料，
-# 由使用者从受控路径提供，不进源码、日志或提交历史。
-#
-# 注意：这里只写仓库根目录下的配置文件名（前导 /）。不要用 `secrets.*` 这类
-# 无锚点的通配 —— 它会连 protocol/secrets.py 这样的源码一起忽略掉。
+# 原始抓包、前端 bundle、Cookie、业务 token 与 securityToken 不进入仓库。
 *capture*.json
 *bundle*.js
 AliyunCaptcha.js
@@ -34,14 +13,3 @@ AliyunCaptcha.js
 /secrets.yaml
 /secrets.toml
 .env
-
-# ── 编辑器 / 系统 ─────────────────────────────────────────────────────
-.DS_Store
-.idea/
-.vscode/
-*.swp
-
-# ── 图像标定工作区 ────────────────────────────────────────────────────
-# gap_solver 的参数标定要用真实挑战图与人工标注，属于会话材料，绝不入库。
-# 重建方式与结论见 README 第 4.5 节和第 8 节；源码不依赖这个目录。
-/dataset/

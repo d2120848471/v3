@@ -1,0 +1,12 @@
+{
+  "candidateMethods": [
+    "like",
+    "probe",
+    "probe",
+    "probe"
+  ],
+  "confidence": 0.3973021802550538,
+  "hasGap": false,
+  "slidePos": 209,
+  "xPos": 171
+}

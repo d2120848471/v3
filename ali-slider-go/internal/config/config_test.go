@@ -1,0 +1,47 @@
+package config
+
+import (
+	"testing"
+	"time"
+)
+
+func TestDefaultsValidate(t *testing.T) {
+	config := Defaults()
+	if err := config.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if config.Host != "127.0.0.1" || config.MaxConcurrency != 32 || config.SceneID != DefaultSceneID || config.Prefix != DefaultPrefix {
+		t.Fatalf("unexpected defaults: %+v", config)
+	}
+}
+
+func TestParsePrecedence(t *testing.T) {
+	environment := map[string]string{
+		"ALI_SLIDER_PORT":            "9000",
+		"ALI_SLIDER_TIMEOUT":         "12s",
+		"ALI_SLIDER_MAX_CONCURRENCY": "8",
+	}
+	config, err := Parse([]string{"-port=9100", "-max-concurrency=4"}, func(key string) string { return environment[key] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Port != 9100 || config.MaxConcurrency != 4 || config.Timeout != 12*time.Second {
+		t.Fatalf("unexpected precedence: %+v", config)
+	}
+}
+
+func TestParseRejectsInvalidValues(t *testing.T) {
+	if _, err := Parse(nil, func(key string) string {
+		if key == "ALI_SLIDER_PORT" {
+			return "not-a-port"
+		}
+		return ""
+	}); err == nil {
+		t.Fatal("expected environment parse error")
+	}
+	for _, arguments := range [][]string{{"-max-concurrency=33"}, {"-prefix=bad_prefix"}, {"-host=example.com"}, {"extra"}} {
+		if _, err := Parse(arguments, func(string) string { return "" }); err == nil {
+			t.Fatalf("expected error for %v", arguments)
+		}
+	}
+}
