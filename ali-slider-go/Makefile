@@ -1,12 +1,13 @@
 GO ?= go
 BINARY := dist/ali-slider-go-linux-amd64
+WINDOWS_BINARY := dist/ali-slider-go-windows-amd64.exe
 
 # 所有工程门禁默认禁用 CGo，保证测试与发布构建使用同一纯 Go 边界。
 # Go 1.26 的 Linux race runtime 强制依赖 CGo，因此严格 race 门禁在
 # Darwin 上运行；根 CI 已单列对应 macOS job。
 export CGO_ENABLED := 0
 
-.PHONY: fmt fmt-check vet test race staticcheck vuln cover build-linux check check-linux
+.PHONY: fmt fmt-check vet test race staticcheck vuln cover build-linux build-windows check check-linux
 
 fmt:
 	$(GO) fmt ./...
@@ -40,6 +41,10 @@ cover:
 build-linux:
 	mkdir -p dist
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -ldflags="-s -w" -o $(BINARY) ./cmd/server
+
+build-windows:
+	mkdir -p dist
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -ldflags="-s -w -buildid=" -o $(WINDOWS_BINARY) ./cmd/server
 
 check: fmt-check vet test race staticcheck vuln build-linux
 

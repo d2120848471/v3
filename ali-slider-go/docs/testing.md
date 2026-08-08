@@ -20,7 +20,7 @@
 | L2 组件集成 | 验证设备 RPC schema、Captcha RPC、代理、下载、预热池及清理 | `internal/device`、`internal/challenge`、`internal/artifact` | Fake `RoundTripper` | 通过 |
 | L3 完整离线链 | 验证 Device → Init → Assets → Vision → PE → Device Complete → Verify | `solver_test.go` | 单一 Mock transport | 通过 |
 | L4 服务合同 | HTTP 别名、状态码、OpenAPI、64 并发直通、无本地主动 429、日志脱敏、启动配置 | `server_test.go`、`cmd/server/main_test.go` | Mock Solver/占用端口 | 通过 |
-| L5 工程门禁 | fmt、vet、test、race、coverage、staticcheck、govulncheck、静态构建 | `Makefile`、Go CI | Linux 普通门禁 + Darwin race 均为 `CGO_ENABLED=0`；工具安装/漏洞库可联网 | 通过；发布 commit 重跑 |
+| L5 工程门禁 | fmt、vet、test、race、coverage、staticcheck、govulncheck、静态构建与便携包 | `Makefile`、Go CI | Linux quality + Darwin race + Windows 原生 package 均为 `CGO_ENABLED=0`；工具安装/漏洞库可联网 | 发布 commit 由 CI 重跑 |
 | L6 授权在线 | Device 探针及 200 个新挑战、32 并发、每 job 一次 Solve、应用层零重试、成功率和 Client 完整求解链 P95 | `online` build tag 测试 | 显式授权 | 候选批次通过；one-shot 加固后未获授权重跑 |
 
 ## Go 版本与快速验证
@@ -38,6 +38,7 @@ make staticcheck
 make vuln
 make cover
 make build-linux
+make build-windows
 ```
 
 `make check` 会串行执行除 `cover` 外的全部质量门禁：
@@ -182,6 +183,30 @@ file dist/ali-slider-go-linux-amd64
 
 当前验证结果为 Linux x86-64、statically linked、stripped，且全链使用纯 Go。该结果证明构建属性，不证明 Linux 与 Mac 的性能等价。
 
+## Windows 原生便携包
+
+本地交叉构建命令：
+
+```bash
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+  go build -trimpath -ldflags='-s -w -buildid=' \
+  -o dist/ali-slider-go-windows-amd64.exe ./cmd/server
+
+file dist/ali-slider-go-windows-amd64.exe
+```
+
+交叉构建只证明 PE 可以生成。根 CI 的 `windows-package` job 必须在 `windows-2025` 原生完成：
+
+- 全量 `go vet` 与 `go test -count=1 ./...`，包括 Windows Artifact 保存/Purge；
+- `CGO_ENABLED=0`、AMD64 console PE 构建；
+- 最终 ZIP 五文件白名单与 EXE SHA-256；
+- 解压到含中文和空格的路径后，通过最终 `start.bat` 启动 EXE 并验证参数转发；
+- 精确检查 `/health`、OpenAPI 3.0.3 与非法 JSON `400`；
+- 检查启动日志没有 `artifact_purge status=warning`；
+- smoke 设置 `--device-prewarm=0`，且不发送任何会进入真实 Solver 的合法请求。
+
+PR 执行完整 Windows 验证但不上传。`main` push 和 `workflow_dispatch` 在 Linux quality、Darwin race 与 Windows package 全部成功后，上传保留 30 天的单层 `ali-slider-go-windows-amd64.zip`。下载后的 ZIP 可直接转发，接收者不需要 GitHub 账号。详细合同见 [Windows AMD64 便携包](./windows.md)。
+
 ## Docker 功能冒烟
 
 Docker 镜像使用 Go `1.26.5` 构建层、`scratch` 运行层、静态二进制和非 root UID/GID `65532`。当前 Linux AMD64 镜像构建及关闭预热后的非 root `/health` smoke 已通过。以下是复现命令；它只访问 `/health`，不会触发设备外部请求：
@@ -212,7 +237,8 @@ docker stop ali-slider-go-smoke
 - gofmt、vet、staticcheck、unit、integration、race；
 - 全项目 `>=80%`、protocol/vision 各 `>=90%`；
 - govulncheck；
-- `CGO_ENABLED=0` Linux AMD64 静态二进制及 `file` 断言。
+- `CGO_ENABLED=0` Linux AMD64 静态二进制及 `file` 断言；
+- Windows 2025 原生 test/vet、PE 构建、解压 smoke、文件白名单、SHA-256 和单层 ZIP artifact。
 
 工具下载和漏洞数据库查询可以联网，但测试步骤设置 `GOPROXY=off`，且不配置真实目标凭据，不访问验证码、设备 RPC、CDN或代理。工作流由相关路径的 pull request/push 触发，也可 `workflow_dispatch` 手动运行。
 
@@ -255,7 +281,7 @@ docker stop ali-slider-go-smoke
 | Evidence | Finding | Path |
 |---|---|---|
 | `go.mod:3`；`Dockerfile:3`；`.github/workflows/ali-slider-go-ci.yml:41` | module、Docker 构建层和 CI 统一固定 Go `1.26.5`。 | source → pinned toolchain → reproducible gates |
-| `.github/workflows/ali-slider-go-ci.yml:32`、`:62`、`:70`、`:76`、`:94`、`:97`、`:107`、`:115`、`:131` | Linux quality job 在 `CGO_ENABLED=0` 下实现静态分析、全量 test、覆盖率、漏洞扫描和静态构建；Darwin job 在同一纯 Go 边界运行 race。 | PR/push → Linux quality + Darwin race → release evidence |
+| `.github/workflows/ali-slider-go-ci.yml` · `quality` / `race` / `windows-package` | Linux quality、Darwin race 与 Windows 原生 test/build/smoke 均固定 `CGO_ENABLED=0`；只有全部通过才上传便携 ZIP。 | PR/push → cross-platform gates → verified release artifact |
 | `internal/protocol/protocol_test.go:47`、`:125`、`:211` | 协议关键输出由静态 Python oracle 锁定。 | Python fixture → Go primitives → equality |
 | `internal/vision/solver_test.go:17` | edge-decoy 正负 fixture 已通过跨语言静态对照。 | PNG fixture → Go vision → accept/reject assertion |
 | `internal/pe/builder_test.go:96` | PE 对 Python oracle 做完整解包语义对照。 | profile + track → PE build → Pack/Unpack equality |
@@ -267,4 +293,5 @@ docker stop ali-slider-go-smoke
 | `internal/challenge/performance_test.go:21`、`:65`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 32 路 Mock 正确性与 6,400 次压力通过；200 样本纯计算 `P99=57.05075ms`，达到硬门槛。 | concurrent mock / repeated stress / local sampler → verified compute and capacity gates |
 | `pkg/slider/online_acceptance_test.go:37`、`:49`、`:98`、`:128`、`:147`、`:165`、`:168`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 候选 200/32/应用层零重试批次严格成功 `196/200`，Client 完整求解链 P95 `984ms`；不经过 HTTP Handler，最终 one-shot 加固后未在线重跑。 | authorized jobs → one Solve each → aggregate summary → bounded acceptance |
 | `Makefile:40`；`Dockerfile:14` | 本地和容器均从 `cmd/server` 生成 `CGO_ENABLED=0` 静态二进制。 | Go source → Linux AMD64 binary → scratch image |
+| `Makefile` · `build-windows`；`packaging/windows/start.bat` | Windows 本地交叉构建固定 console 服务，最终用户入口提供回环监听的安全默认值。 | Go source → Windows PE → extracted local API |
 | `internal/vision/solver_test.go:260` | 困难视觉 benchmark 只产生均值和分配，不能提供 P99。 | fixture → repeated Solve → mean only |

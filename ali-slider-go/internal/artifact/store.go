@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"sync"
 	"time"
@@ -276,7 +277,9 @@ func ensureDirectory(directory string, create bool) error {
 		return errors.New("artifact directory must be a real directory, not a symlink")
 	}
 	before := info
-	if info.Mode().Perm() != 0o700 {
+	// Windows 的 os.Chmod 只映射 owner-write 位，FileMode 无法表达 ACL。
+	// 该平台继承父目录 ACL；Unix 继续强制并复核 0700。
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o700 {
 		if err := os.Chmod(directory, 0o700); err != nil {
 			return fmt.Errorf("restrict artifact directory permissions: %w", err)
 		}
@@ -285,7 +288,8 @@ func ensureDirectory(directory string, create bool) error {
 	if err != nil {
 		return fmt.Errorf("recheck artifact directory: %w", err)
 	}
-	if after.Mode()&os.ModeSymlink != 0 || !after.IsDir() || !os.SameFile(before, after) || after.Mode().Perm() != 0o700 {
+	if after.Mode()&os.ModeSymlink != 0 || !after.IsDir() || !os.SameFile(before, after) ||
+		(runtime.GOOS != "windows" && after.Mode().Perm() != 0o700) {
 		return errors.New("artifact directory security check failed")
 	}
 	return nil

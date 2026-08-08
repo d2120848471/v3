@@ -26,6 +26,8 @@
 - 增加 HTTP Handler、OpenAPI 3.0.3 JSON、Trace ID、请求级 timeout 和脱敏错误映射。
 - 增加 `Makefile` 的 fmt/vet/test/race/staticcheck/govulncheck/coverage/Linux 静态构建目标。
 - 增加 Go CI `.github/workflows/ali-slider-go-ci.yml`，固定工具版本、覆盖率阈值和静态二进制断言。
+- 增加 Windows AMD64 便携包：独立 EXE、双击启动脚本、中文说明、构建信息和 SHA-256。
+- CI 增加 Windows 2025 原生 test/vet、PE 构建、最终 ZIP 解压 smoke 与单层 artifact 上传；官方 actions 使用完整 commit SHA 固定。
 - 增加 `docs/evidence/validation-2026-08-07.md`，固化命令、聚合数字、构建哈希与在线快照时序边界。
 - 增加 `docs/evidence/validation-2026-08-08-no-local-admission.md`，固化删除本地准入闸门后的离线合同、质量门禁、源码选择集摘要与临时 Linux 二进制哈希。
 - 增加 multi-stage `Dockerfile`：Go `1.26.5` 构建、scratch runtime、非 root UID/GID `65532`。
@@ -42,6 +44,7 @@
 - 普通日志只记录事件、traceId、HTTP 状态和耗时，不记录 token、`CertifyId`、代理凭据或正文。
 - 默认设备预热容量随 Client 连接/预热资源上限收敛；逐请求 proxy 因 route key 不同按设计冷建。
 - artifact 默认保留 7 天；服务启动时清理一次，此后每小时清理。
+- Windows Artifact 权限改为继承解压目录 NTFS ACL；Unix 继续强制 `0700/0600`。
 
 ### Fixed
 
@@ -50,6 +53,7 @@
 - 禁用 Verify POST 的 `GetBody` 回卷入口，阻止 `net/http` 在 HTTP/2 GOAWAY/REFUSED_STREAM 等已发送 body 的失败后透明重放。
 - 设备 Log1/Log2/Log3 同样使用不可回卷请求体，保证一次性会话动作不会被 Transport 在已发送后透明重放。
 - 修复零值 `ClientOptions{}` 漏补默认设备预热容量；显式关闭预热仍通过 `DefaultClientOptions()` 后覆盖为零。
+- 修复 Windows 无法表达 POSIX `0700` 导致 Artifact 保存/清理失败；保留目录真实性、同文件复核、symlink 拒绝、排他创建和配额保护。
 
 ### Security
 
@@ -60,7 +64,7 @@
 - 设备预热池只复用完整 endpoint/prefix/region/route/profile/timing key 一致的会话。
 - 资产固定 HTTPS CDN，重定向逐跳校验；单图默认最多 8 MiB。
 - PNG 在完整解码前检查签名、IHDR、尺寸、像素数和 shadow alpha。
-- artifact 目录/文件使用 `0700/0600`，随机名 `O_EXCL` 创建，清理不跟随 symlink。
+- Unix artifact 目录/文件使用 `0700/0600`；Windows 继承 NTFS ACL；随机名以 `O_EXCL` 创建，清理不跟随 symlink。
 - Solver、HTTP、日志和 artifact 测试覆盖 token、CertifyId、代理密码及原始 cause 脱敏。
 - Docker runtime 为 scratch 且以非 root UID/GID `65532` 运行。
 
@@ -68,6 +72,7 @@
 
 - Go `1.26.5` 下全量 `go test`、`go test -race`、`go vet`、staticcheck 和 govulncheck 已验证通过；普通门禁和 Darwin race 都固定 `CGO_ENABLED=0`。
 - Linux AMD64 `CGO_ENABLED=0` 静态、stripped `cmd/server` 构建已验证通过。
+- Windows AMD64 发布工作流要求原生全量测试、最终 ZIP 解压启动、HTTP 合同、文件白名单和 SHA-256 全部通过。
 - Linux AMD64 Docker 镜像构建及非 root `/health` smoke 已验证通过。
 - 全项目统一语句覆盖率记录为 `83.0%`，达到 `>=80%` 门槛；发布 commit 仍由 CI 重跑归档。
 - Python 协议 oracle 与 fuzz seeds 对照通过；`internal/protocol` 覆盖率 `91.4%`。
@@ -91,6 +96,7 @@
 - 应用内没有 admission gate；请求激增可导致连接等待、超时、GC 压力、内存耗尽或进程退出，不承诺无界并发下的延迟与可用性。
 - 逐请求 proxy 允许调用方指定网络出口，外部部署必须限制调用方或实施 allowlist。
 - Python 业务提交/重放、交互式 CLI、桌面 UI、PyInstaller 和 Swagger UI 不属于 1.0.0 范围。
+- Windows EXE 尚未配置 Authenticode 代码签名，Defender/SmartScreen 可能提示未知发布者；SHA-256 不能替代发布者签名。
 
 ## Evidence → Finding → Path
 

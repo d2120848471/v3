@@ -1,0 +1,129 @@
+# Windows AMD64 便携包
+
+GitHub Actions 在 Linux quality 与 Darwin race 门禁全部通过后，使用 Windows 2025 runner 原生测试、构建、解压并启动最终包。产物 `ali-slider-go-windows-amd64.zip` 支持 Windows 10 / Windows Server 2016 或更高版本的 AMD64/x64 机器，解压即可运行，不需要安装 Go、Python、Node.js、OpenCV、VC++ Runtime 或第三方 DLL。
+
+平台下限依据 Go 1.26 的官方 [Minimum Requirements](https://go.dev/wiki/MinimumRequirements)。
+
+> 本程序是本机 HTTP 服务，不是图形界面。当前包只支持 Windows AMD64/x64。默认启动会访问外部 Device RPC 做会话预热；真实求解还需要访问 Captcha RPC 和图片 CDN。仅限自有系统或获得明确授权的测试环境。
+
+## 下载并启动
+
+1. 打开 GitHub 仓库的 **Actions** 页面。
+2. 选择 `ali-slider-go-ci`，打开 `main` 最新一次成功运行。
+3. 下载 `ali-slider-go-windows-amd64.zip`。Actions 产物保留 30 天；下载者需要仓库读取权限。
+4. 把 ZIP 完整解压到当前用户的私有可写目录。不要直接在压缩软件预览窗口中运行。
+5. 双击 `start.bat`。
+6. 等待控制台出现 `event=listen status=ready`。
+
+启动后：
+
+| 用途 | 地址 |
+|---|---|
+| 健康检查 | `http://127.0.0.1:8000/health` |
+| 求解 API | `http://127.0.0.1:8000/api/slider` |
+| OpenAPI | `http://127.0.0.1:8000/openapi.json` |
+
+在服务窗口按 `Ctrl+C` 可触发应用的关闭流程。关闭控制台窗口或用任务管理器结束进程属于强制停止，不应视为优雅关闭。
+
+## 包内容
+
+```text
+ali-slider-go-windows-amd64.zip
+├── ali-slider-go.exe
+├── start.bat
+├── README-Windows.txt
+├── BUILD-INFO.txt
+└── SHA256SUMS.txt
+```
+
+- `ali-slider-go.exe` 是 `CGO_ENABLED=0` 的 Windows AMD64 console PE；默认触摸轨迹已经嵌入 EXE。
+- `start.bat` 先切换到自身目录，再提供回环地址、端口与 `var\artifacts` 路径的安全默认值；异常退出时保留窗口显示错误。
+- `README-Windows.txt` 是可脱离仓库阅读的最终用户说明。
+- `BUILD-INFO.txt` 记录完整 commit、ref、Go 版本、目标平台和 UTC 构建时间，不包含 Secret 或 runner 用户路径。
+- `SHA256SUMS.txt` 保存包内文件校验值。
+
+包内没有源码、测试 fixture、Git 元数据、日志、凭据或运行 artifact。下载后的 ZIP 可以直接转发给使用者；使用者不需要 GitHub 账号。
+
+## 调用与配置
+
+默认启动不需要配置。PowerShell 调用示例：
+
+```powershell
+$body = @{
+  SceneId = "1ug4aptr"
+  prefix  = "fsgtmi"
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://127.0.0.1:8000/api/slider" `
+  -ContentType "application/json" `
+  -Body $body
+```
+
+该请求会访问真实上游。HTTP `200` 仍需检查 `ok`、`VerifyCode` 和 `VerifyResult`。完整字段、状态码和敏感数据边界见 [HTTP API](./api.md)。
+
+临时改端口时，在解压目录打开 `cmd.exe`：
+
+```bat
+start.bat --port=8001
+```
+
+此时健康检查、API 和 OpenAPI 地址中的端口也要改为 `8001`；最终以 `event=listen` 日志中的实际监听地址为准。`start.bat` 把额外参数放在内置默认参数之后，因此高级用户可以覆盖 flag。完整配置见 [配置参考](./configuration.md)。不要把 `--host` 改为 `0.0.0.0` 后直接对外暴露：服务没有应用内鉴权或本地 admission gate。
+
+## 完整性与 SmartScreen
+
+在 PowerShell 中计算 EXE 哈希：
+
+```powershell
+Get-FileHash .\ali-slider-go.exe -Algorithm SHA256
+```
+
+结果应与 `SHA256SUMS.txt` 中 `ali-slider-go.exe` 的值一致。CI 还会核对 ZIP SHA-256 与 GitHub artifact digest。
+
+当前流水线没有 Authenticode 代码签名证书，因此 Defender 或 SmartScreen 可能显示“未知发布者”。SHA-256 只证明文件未变化，不证明发布者身份；不要关闭系统防护或绕过组织安全策略。需要降低未知发布者提示时，应另行配置组织持有的代码签名证书和受保护 GitHub Secret。
+
+## Artifact 与 Windows 权限
+
+Unix 构建强制 Artifact 目录/文件为 `0700/0600`。Windows 的 Go `FileMode` 不能表达 NTFS DACL，因此便携版继承解压目录的 ACL，同时仍执行：
+
+- 文件系统根目录拒绝；
+- 真实目录与同一文件复核；
+- symlink/reparse 异常路径拒绝；
+- 随机受管文件名与 `O_EXCL` 创建；
+- 完整组回滚、保留期和总量配额。
+
+应解压到当前用户的私有目录，不要放在 Web root、公共共享盘、多人可写目录或公开同步目录。`var\artifacts` 可能包含失败/低置信图片与脱敏指标，不应随普通诊断包转发。
+
+## CI 构建合同
+
+根工作流 `.github/workflows/ali-slider-go-ci.yml` 的 `windows-package` job：
+
+1. 依赖 Linux quality 与 Darwin race 成功；
+2. 在 `windows-2025` 原生运行 `go vet` 和全量 `go test`；
+3. 使用 Go module 固定的 Go `1.26.5`、`CGO_ENABLED=0` 和 `GOARCH=amd64` 构建；
+4. 生成构建信息、包内 SHA-256 和明确文件白名单；
+5. 解压到含中文及空格的临时路径；
+6. 通过最终 `start.bat` 启动 EXE，验证脚本参数转发、`/health`、OpenAPI 3.0.3 和非法 JSON `400`；
+7. smoke 强制 `--device-prewarm=0`，不会发送 Device、Init、图片或 Verify 请求；
+8. `main` push 和 `workflow_dispatch` 直传单层 ZIP，PR 只验证不上传；
+9. 官方 actions 使用完整 commit SHA 固定，工作流权限保持 `contents: read`。
+
+本地只构建 EXE：
+
+```bash
+make build-windows
+file dist/ali-slider-go-windows-amd64.exe
+```
+
+macOS/Linux 交叉构建只能证明 Windows 测试二进制可编译。发布判断以 Windows runner 的原生测试和最终 ZIP smoke 为准。
+
+## Evidence → Finding → Path
+
+| Evidence | Finding | Path |
+|---|---|---|
+| `go.mod:3`；`Makefile` · `build-windows` | Windows EXE 固定 Go 1.26.5、AMD64、CGO 关闭和 stripped 构建。 | source → pinned Go → PE executable |
+| `internal/track/track.go:21` | 生产运行所需默认轨迹已嵌入 EXE，不需要外置 fixture。 | embedded asset → single executable |
+| `internal/artifact/store.go` · `ensureDirectory`；`store_test.go` | Unix 精确 mode 与 Windows ACL 语义分离，其他路径/竞态/配额保护保持。 | platform filesystem → safe directory → bounded artifact |
+| `.github/workflows/ali-slider-go-ci.yml` · `windows-package` | 只有跨平台门禁和 Windows 原生 package smoke 成功后才上传可分发 ZIP。 | commit → quality/race → native Windows test → ZIP |
+| `packaging/windows/start.bat` | 双击入口固定工作目录、提供回环监听默认值，并保留 console 诊断和 Ctrl+C。 | extracted package → local server → controlled shutdown |

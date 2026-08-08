@@ -12,6 +12,14 @@ CGO_ENABLED=0 GOPROXY=off go test -count=1 ./...
 go run ./cmd/server
 ```
 
+## Windows 免环境压缩包
+
+GitHub Actions 会在全部质量门禁通过后生成 `ali-slider-go-windows-amd64.zip`。包内是独立 EXE、双击启动脚本、中文说明、构建信息和 SHA-256；适用于 Windows 10 / Windows Server 2016 或更高版本的 AMD64/x64 机器，接收者无需安装 Go、Python、Node.js 或 VC++ Runtime。
+
+下载：GitHub 仓库 **Actions** → `ali-slider-go-ci` → `main` 最新成功运行 → `ali-slider-go-windows-amd64.zip`。完整解压后双击 `start.bat`，等待 `event=listen status=ready`。这是本机 HTTP 服务，不是桌面 GUI。
+
+完整说明见 [Windows AMD64 便携包](./ali-slider-go/docs/windows.md)。
+
 项目入口：
 
 - [完整 README](./ali-slider-go/README.md)
@@ -20,6 +28,7 @@ go run ./cmd/server
 - [配置](./ali-slider-go/docs/configuration.md)
 - [测试与质量门禁](./ali-slider-go/docs/testing.md)
 - [安全边界](./ali-slider-go/docs/security.md)
+- [Windows AMD64 便携包](./ali-slider-go/docs/windows.md)
 - [最新离线验证证据](./ali-slider-go/docs/evidence/validation-2026-08-08-no-local-admission.md)
 
 ## 目录
@@ -31,6 +40,7 @@ go run ./cmd/server
 │   ├── cmd/server/
 │   ├── docs/
 │   ├── internal/
+│   ├── packaging/windows/
 │   ├── pkg/slider/
 │   ├── Dockerfile
 │   ├── Makefile

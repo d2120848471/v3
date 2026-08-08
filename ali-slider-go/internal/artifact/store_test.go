@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -47,12 +48,18 @@ func TestSaveFailureIsSanitizedAndPrivate(t *testing.T) {
 		t.Fatalf("expected three files, got %d", len(entries))
 	}
 	directoryInfo, err := os.Stat(directory)
-	if err != nil || directoryInfo.Mode().Perm() != 0o700 {
-		t.Fatalf("directory mode=%v err=%v", directoryInfo.Mode().Perm(), err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" && directoryInfo.Mode().Perm() != 0o700 {
+		t.Fatalf("directory mode=%v", directoryInfo.Mode().Perm())
 	}
 	for _, entry := range entries {
 		info, infoErr := entry.Info()
-		if infoErr != nil || info.Mode().Perm() != 0o600 {
+		if infoErr != nil {
+			t.Fatal(infoErr)
+		}
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 			t.Fatalf("artifact %q mode=%v err=%v", entry.Name(), info.Mode().Perm(), infoErr)
 		}
 	}
@@ -256,8 +263,11 @@ func TestDirectoryPermissionsAndDirectorySymlinkRejection(t *testing.T) {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(directory)
-	if err != nil || info.Mode().Perm() != 0o700 {
-		t.Fatalf("directory permissions=%v err=%v", info.Mode().Perm(), err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o700 {
+		t.Fatalf("directory permissions=%v", info.Mode().Perm())
 	}
 
 	link := filepath.Join(base, "artifact-link")

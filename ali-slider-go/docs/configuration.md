@@ -66,6 +66,14 @@ export ALI_SLIDER_DEVICE_PREWARM=16
 go run ./cmd/server
 ```
 
+Windows 便携包不需要配置文件。完整解压后双击 `start.bat`；脚本先切换到自身目录，再提供回环地址、端口和包内 Artifact 路径的安全默认值。高级用户可在 `cmd.exe` 追加 flag，后出现的值覆盖脚本默认值：
+
+```bat
+start.bat --port=8001 --device-prewarm=16
+```
+
+正常便携版保留默认预热容量 32，以降低后续请求时延。CI 的本地启动 smoke 使用 `--device-prewarm=0`，只验证 HTTP 合同且不发送真实外部请求。完整交付说明见 [Windows AMD64 便携包](./windows.md)。
+
 环境变量示例：
 
 ```bash

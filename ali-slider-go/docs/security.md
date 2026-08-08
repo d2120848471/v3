@@ -63,8 +63,8 @@ Store 只在失败、低置信或 Verify 业务拒绝时保存可用图像和脱
 
 文件级控制：
 
-- 目录必须是真实目录，拒绝符号链接；使用时收紧为 `0700`，无法收紧则报错；
-- 文件以 `0600` + `O_EXCL` 创建；
+- 目录必须是真实目录并拒绝符号链接；Unix 使用时收紧并精确复核为 `0700`，无法收紧则报错；
+- Unix 文件以 `0600` + `O_EXCL` 创建；Windows 继承父目录 NTFS ACL 并保留 `O_EXCL`，因为 Go `FileMode` 无法表达 Windows DACL；
 - 16 字节密码学随机 ID，文件名为 32 位 hex + 受管后缀；
 - 任一写入失败回滚本组已建文件；
 - 同一目录的 Save/Purge 在进程内串行配额决策；
@@ -72,7 +72,7 @@ Store 只在失败、低置信或 Verify 业务拒绝时保存可用图像和脱
 - 默认硬上限 64 组和 512 MiB，写入前先清过期，再按完整组淘汰最旧记录；
 - 超大单组安全拒绝；非受管文件与符号链接不删除。
 
-配额是可用性上限，不是数据脱敏的替代。Artifact 目录不得放在 Web root，需要单独磁盘告警。
+配额是可用性上限，不是数据脱敏的替代。Artifact 目录不得放在 Web root，需要单独磁盘告警。Windows 便携包必须解压到当前用户的私有可写目录，不得放公共共享盘、多人可写目录或公开同步目录；如需显式组织 DACL，应在部署层配置并验证。
 
 ## 6. 代理、SSRF 与路由池
 
@@ -121,6 +121,9 @@ Init 只能提供相对路径，不能指定完整 URL。下载器：
 - 生产 module 零第三方 Go 依赖。
 - `go.mod`、CI 和 Docker 使用 Go 1.26.5；本地 `govulncheck` 在该工具链下未发现可达漏洞。
 - Linux AMD64 二进制使用 `CGO_ENABLED=0`、`-trimpath`、stripped 静态构建。
+- Windows AMD64 便携版使用 `CGO_ENABLED=0` 的单一 console PE；不依赖 Go、Python、VC++ Runtime 或第三方 DLL。Windows 原生 CI 负责 test、解压启动和本地 HTTP smoke。
+- 官方 GitHub actions 使用完整 commit SHA 固定；普通 CI 权限保持 `contents: read`。Windows ZIP 包含 commit/build 信息和 SHA-256。
+- 当前 Windows EXE 没有 Authenticode 代码签名；SmartScreen 可能提示未知发布者。SHA-256 不替代发布者签名，不得要求用户关闭 Defender。
 - 容器运行层为 `scratch`，只含 CA 证书、二进制和私有 artifact 目录；使用 UID/GID 65532。
 - Linux AMD64 Docker 镜像构建及关闭预热后的非 root `/health` smoke 已验证通过。
 - CI 中项目测试和分析设为 `GOPROXY=off`，不访问真实业务目标。工具下载和漏洞库查询仍需要供应链网络；这不是完全 air-gap job。
@@ -134,6 +137,7 @@ Init 只能提供相对路径，不能指定完整 URL。下载器：
 - [ ] Artifact 目录不在 Web root，权限、配额、保留期和磁盘告警已验证。
 - [x] 当前源码快照的全量 unit/mock/race/vet/staticcheck/govulncheck/coverage 门禁通过；统一覆盖率 `83.0%`，发布 commit 仍须 CI 重跑。
 - [x] Linux AMD64 静态构建与容器非 root `/health` smoke 通过。
+- [ ] Windows AMD64 原生测试、最终 ZIP smoke、SHA-256 与 Artifact 下载已在发布 commit 的 CI 中通过并归档。
 - [x] 纯计算 P99 与 2026-08-07 历史候选批次 200 轮、32 并发、应用层零重试的 Client 完整求解链 P95/成功率报告已生成并达到当时冻结门槛；该批未经过 HTTP Handler，且先于最终 one-shot 加固。
 - [ ] 针对实际机器资源的 RSS、GC、goroutine 峰值和长时间稳定性压测，以及生产外层控制的上线评审已完成。
 
@@ -144,10 +148,10 @@ Init 只能提供相对路径，不能指定完整 URL。下载器：
 | `internal/server/server.go` · `handleSolve`；`internal/server/server_test.go` · `TestConcurrentRequestsAlwaysEnterSolver` | 合法请求完成解码后直接进入 Solver；Handler 没有活动数接纳闸门、本地 429 或退避字段。 | reachable caller → validation → Solve → local and upstream resource consumption |
 | `internal/server/server.go` · `logResult` / `solverErrorResponse` | 普通日志只有 trace/status/elapsed，未分类错误不回显 cause。 | request/result → stable metadata log |
 | `pkg/slider/types.go` · DTO `String/GoString` | 公开结构的常见格式化不输出 token、ID 或代理凭据。 | DTO → fmt → redacted text |
-| `internal/artifact/store.go` · `SaveFailure` / `Purge` | 权限、受管名称、整组回滚、保留期和配额同时执行。 | failure → private bounded set → purge/evict |
+| `internal/artifact/store.go` · `SaveFailure` / `Purge` | Unix 强制 POSIX 私有 mode；Windows 继承 NTFS ACL；两者共用受管名称、排他创建、整组回滚、保留期和配额。 | platform directory policy → private bounded set → purge/evict |
 | `internal/challenge/pool.go` · `canonicalProxyRoute` / `TransportPool.Get` | 路由归一、摘要 key、直连保留和 LRU 限制凭据泄漏与永久耗尽。 | proxy → canonical → SHA-256 key → bounded transport |
 | `internal/challenge/assets.go` · `DownloadAssets` | 固定 CDN、逐跳校验、字节上限和首错取消降低 SSRF/内存/尾延迟风险。 | relative path → allowlisted HTTPS → bounded bytes |
 | `internal/challenge/rpc.go` · `RPCClient.Init/Verify` | Init 只一次，Verify 绑定该 ID 并在网络前消耗唯一尝试位。 | issued ID → irreversible Verify attempt |
-| `.github/workflows/ali-slider-go-ci.yml` | 项目测试不访问真实目标；工具与 vuln DB 供应链网络被明确区分。 | pinned tools → offline project checks → static binary |
+| `.github/workflows/ali-slider-go-ci.yml` | 官方 action 全 SHA 固定；项目测试与 Windows smoke 不访问真实目标，工具与 vuln DB 供应链网络被明确区分。 | pinned actions/tools → offline project checks → verified binary/ZIP |
 | `internal/device/rpc.go:119`、`:130`；`internal/device/session_test.go:130`、`:146`、`:150`、`:165` | Device `ResultObject` 保留原始 JSON，只在 Log1 解码配置，避免对 Log2/3 施加错误对象 schema。 | bounded response → action-specific decode → regression proof |
 | `pkg/slider/online_acceptance_test.go:37`、`:49`、`:98`、`:128`、`:147`、`:165`、`:168`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 2026-08-07 的历史 Client harness 每个 job 只调用一次 Solve，只输出分类计数和聚合延迟；`196/200` 且 network `0`。它不经过 HTTP Handler；最终源码通过 `GetBody == nil` 离线回归证明 one-shot，但未在线重跑。 | dated authorization → no-application-retry Client jobs → sanitized aggregate → bounded historical finding |

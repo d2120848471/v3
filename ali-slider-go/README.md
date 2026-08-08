@@ -6,7 +6,7 @@
 
 ## 已实现能力
 
-- 严格纯 Go：运行、测试、Linux 构建和容器不依赖 Python、Node.js、浏览器、OpenCV、GoCV、CGo、动态库或子进程。
+- 严格纯 Go：运行、测试、Linux/Windows 构建和容器不依赖 Python、Node.js、浏览器、OpenCV、GoCV、CGo、第三方动态库或子进程。
 - 对外只提供 reusable Go library、`POST /api/slider`、`GET /health`、`GET /openapi.json`。
 - 每个 `CertifyId` 最多尝试一次 Verify；网络结果未知也不重试。
 - 通过输入校验的 `POST /api/slider` 直接进入 Solver；HTTP 层不设置本地 admission gate，也不因在途请求数主动返回 `429` 或 `Retry-After`。
@@ -22,6 +22,14 @@
 该批次发生在 `net/http` one-shot 加固之前：当时未出现网络错误，也没有证据表明发生了透明重放，但没有对 HTTP/2 内部回卷做线级观测。最终源码已对 Verify 和一次性 Device POST 清空 `Request.GetBody` 并以离线测试锁定不可回卷；受 200 次授权上限约束，没有再跑第二批真实挑战。因此上述在线数字证明的是唯一授权候选批次，不是最终加固快照的第二份在线报告。当次还未保留精确起止时间和阶段聚合，不能事后补造，故不满足后续完整发布报告模板。完整命令、哈希与边界见 [2026-08-07 脱敏验证证据](docs/evidence/validation-2026-08-07.md)。
 
 ## 快速启动
+
+### Windows 便携包
+
+不安装开发环境即可使用：在 GitHub **Actions** 的 `ali-slider-go-ci` 最新成功运行中下载 `ali-slider-go-windows-amd64.zip`，完整解压后双击 `start.bat`，等待 `event=listen status=ready`。
+
+这是本机 HTTP 服务，不是 GUI。包内包含独立 EXE、中文说明、构建信息和 SHA-256；支持 Windows 10 / Windows Server 2016 或更高版本的 AMD64/x64 机器，默认监听 `127.0.0.1:8000`。完整下载、运行、SmartScreen 和 NTFS ACL 说明见 [Windows AMD64 便携包](docs/windows.md)。
+
+### 源码运行
 
 要求 Go `1.26.5` 或更高的兼容补丁版本。
 
@@ -145,6 +153,7 @@ make staticcheck
 make vuln
 make cover
 make build-linux
+make build-windows
 ```
 
 `staticcheck` 与 `govulncheck` 由开发/CI 环境提供，不写入生产 `go.mod`。CI 位于根目录 [`.github/workflows/ali-slider-go-ci.yml`](../.github/workflows/ali-slider-go-ci.yml)，路径隔离，不运行真实挑战。
@@ -165,6 +174,7 @@ ali-slider-go/
 ├── internal/vision/       PNG 安全解码与缺口识别
 ├── internal/track/        嵌入轨迹、缩放与扰动
 ├── internal/artifact/     脱敏失败样本与过期清理
+├── packaging/windows/     Windows 双击入口与最终用户说明
 ├── docs/                  架构、API、配置、测试、性能与安全文档
 ├── Dockerfile
 └── Makefile
@@ -178,6 +188,7 @@ ali-slider-go/
 - [测试与质量门禁](docs/testing.md)
 - [性能口径与验收](docs/performance.md)
 - [安全边界](docs/security.md)
+- [Windows AMD64 便携包](docs/windows.md)
 - [Python → Go 迁移](docs/migration.md)
 - [故障排查](docs/troubleshooting.md)
 - [2026-08-08 无本地 admission 验证证据](docs/evidence/validation-2026-08-08-no-local-admission.md)

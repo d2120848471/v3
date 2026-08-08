@@ -39,10 +39,10 @@ curl --fail --silent http://127.0.0.1:8000/health
 | 现象 | 直接证据 | 常见原因 | 处理 |
 |---|---|---|---|
 | `配置无效` | 进程退出并给出配置边界 | host/port、Client 连接/预热资源预算、timeout、confidence、artifact 或预热值越界 | 对照 [配置说明](./configuration.md) 修正 flag/env；不要绕过 Validate |
-| `HTTP 服务退出: bind... address already in use` | 启动器退出 | 端口被占用 | `lsof -nP -iTCP:8000 -sTCP:LISTEN` 定位；换端口或按运维流程停止旧实例 |
+| `HTTP 服务退出: bind... address already in use` | 启动器退出 | 端口被占用 | Unix 用 `lsof -nP -iTCP:8000 -sTCP:LISTEN`；Windows 用 `Get-NetTCPConnection -LocalPort 8000`；关闭旧实例或换端口 |
 | `event=device_prewarm status=warning` | 进程继续启动 | 设备 RPC 超时、部分 Prime 失败或配置/出口问题 | 请求会冷建兜底；检查网络和 device 日志阶段，不把 warning 当预热成功 |
 | 服务 ready 前较慢 | 端口已绑定，但尚未出现 `event=listen status=ready` | 默认预热会在开始 `Serve` 前执行 Log1/2/3 | 开发 health 冒烟用 `--device-prewarm=0`；生产记录 Prime 耗时 |
-| `event=artifact_purge status=warning` | 启动或每小时出现 | artifact 目录权限、磁盘或读取失败 | 检查目录、UID、配额；清理失败不应阻止服务，但必须告警 |
+| `event=artifact_purge status=warning` | 启动或每小时出现 | artifact 目录权限/ACL、磁盘或读取失败 | Unix 检查 UID/mode；Windows 检查解压目录可写性和 NTFS ACL；清理失败不应阻止服务，但必须告警 |
 | 非回环绑定出现 security warning | `unauthenticated=true` | 服务监听 `0.0.0.0` 或非回环 IP | 确认外层鉴权、防火墙、TLS 和来源限制；否则改回回环 |
 | SIGTERM 后关闭慢 | `event=shutdown status=starting` 后等待 | 活跃 Solve/Prime/Purge 尚未结束 | 等待总 timeout；检查上游取消传播和长尾阶段，不要强制重复 Verify |
 | `/health` ready 但 solve 失败 | health 200、solve 4xx/5xx | health 只验证 HTTP handler，不探测全部上游 | 按 errorType/traceId 和阶段排查；不要把 health 当在线成功率证明 |
@@ -149,7 +149,7 @@ go test -count=1 -race \
 |---|---|---|
 | 成功请求没有 artifact | 成功路径按设计不落图 | 正常，不要为调试保存成功 token/正文 |
 | 低置信/业务拒绝没有完整三件套 | 图片尚未取得、目录权限或 SaveFailure best-effort 失败 | 检查阶段和目录；早期失败可能只有 metrics |
-| 目录创建/写入失败 | UID、父目录、只读文件系统或磁盘配额 | 目录应可由服务 UID 写入，权限保持 `0700/0600` |
+| 目录创建/写入失败 | UID、父目录、Windows ACL、只读文件系统或磁盘配额 | Unix 保持 `0700/0600`；Windows 解压到当前用户私有可写目录并检查继承 ACL |
 | 文件超过 7 天仍存在 | server 未持续运行、purge warning 或使用 library 未调度 | cmd/server 启动时和每小时清理；library 调用方需调 `PurgeArtifacts` |
 | 清理数量小于预期 | 名称不受管、symlink/目录或尚未过期 | 这是保护行为；不要扩大删除范围 |
 | 保存半组文件 | 中途写失败 | Store 回滚本组已创建文件；检查磁盘和权限 |
@@ -180,6 +180,10 @@ go test -count=1 -race \
 | 覆盖率变化 | commit/命令/缓存不同 | 使用 `-count=1` 和单一 coverprofile，记录 commit；当前基线 `83.0%` |
 | `go build ./...` 没有目标文件 | 该命令只验证包 | 使用 `make build-linux` 生成 `dist/ali-slider-go-linux-amd64` |
 | Linux 二进制不是 static | 未设置 CGO 或构建参数改变 | 使用 Makefile/CI 命令，并用 `file` 断言 `statically linked` |
+| Actions 没有 Windows ZIP | quality/race/Windows job 失败、运行来自 PR 或 artifact 已过期 | 打开同一 run 的 `windows-package`；只在 main push/手动运行上传，保留 30 天 |
+| Windows 显示未知发布者 | EXE 未做 Authenticode 商业签名 | 从可信仓库下载并核对 SHA-256；不要关闭 Defender 或绕过组织策略 |
+| Windows 提示应用无法运行 | 系统低于 Windows 10 / Windows Server 2016、使用 32 位 Windows 或非原生架构 | 当前包要求 Windows 10 / Windows Server 2016 或更高版本的 AMD64/x64；不要把它标成所有 Windows 通用包 |
+| 双击后没有图形窗口 | 误把本地 HTTP 服务当 GUI | 完整解压后运行 `start.bat`，等待 console 的 ready 日志，再访问 `/health` |
 | 容器端口不可达 | 应用默认监听容器回环 | 容器内设 `ALI_SLIDER_HOST=0.0.0.0`，宿主只发布到 `127.0.0.1` |
 | 无法在容器内 exec shell/curl | runtime 是 scratch | 从宿主做 health；不要为调试把生产镜像改成 root/full OS |
 | artifact 重启后丢失 | 容器未挂持久卷 | 将 `/app/var/artifacts` 挂受控卷并保持 UID 65532 权限 |
@@ -213,7 +217,7 @@ go test -count=1 -race \
 | `internal/challenge/device_pool.go:190`、`:299` | 预热池按完整 key Lease，Close 有界清理后台任务。 | Prime/Lease → release/refill → Close |
 | `pkg/slider/client.go:203`、`:213` | library 暴露 Purge，并在 Close 前等待活跃 Solve/Prime/Purge。 | caller lifecycle → safe resource cleanup |
 | `internal/artifact/store.go:121`；`cmd/server/main.go:147` | Store 只清理受管过期文件；服务已按小时调度。 | failure artifact → retention → scheduled Purge |
-| `.github/workflows/ali-slider-go-ci.yml:32`、`:62`、`:70`、`:76`、`:94`、`:97`、`:107`、`:115`、`:131` | Linux quality 与 Darwin race 两个 CI job 均固定 `CGO_ENABLED=0`；静态 Linux 构建门禁已经存在。 | source change → split-platform gates → verified binary |
+| `.github/workflows/ali-slider-go-ci.yml` · `quality` / `race` / `windows-package` | Linux quality、Darwin race 与 Windows 原生 package 都固定 `CGO_ENABLED=0`；只有全部通过才上传便携 ZIP。 | source change → cross-platform gates → verified ZIP |
 | `Dockerfile:19`、`:26` | 运行镜像为 scratch、非 root，因此无 shell且需要正确卷权限。 | static binary → minimal runtime |
 | `internal/device/rpc.go:119`、`:130`；`internal/device/session_test.go:130`、`:146`、`:150`、`:165` | Device schema 只在 Log1 解码对象，Log2/3 接受非对象成功结果。 | raw response → action gate → stable session |
 | `pkg/slider/online_acceptance_test.go:37`、`:49`、`:98`、`:128`、`:147`、`:165`、`:168`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 2026-08-07 的历史 Client harness 以 200/32/应用层零重试运行并达到当时成功率与完整链 P95 门槛；不经过 HTTP Handler，不能作为当前 HTTP 限流证据，最终 one-shot 加固后也未在线重跑。 | dated authorization → aggregate Client metrics → bounded historical conclusion |

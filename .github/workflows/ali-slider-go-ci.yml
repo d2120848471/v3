@@ -5,12 +5,14 @@ on:
     paths:
       - "ali-slider-go/**"
       - ".github/workflows/ali-slider-go-ci.yml"
+      - ".gitattributes"
   push:
     branches:
       - main
     paths:
       - "ali-slider-go/**"
       - ".github/workflows/ali-slider-go-ci.yml"
+      - ".gitattributes"
   workflow_dispatch: {}
 
 permissions:
@@ -34,11 +36,13 @@ jobs:
       GOTOOLCHAIN: local
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          go-version: "1.26.5"
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ali-slider-go/go.mod
           check-latest: false
           cache: false
 
@@ -118,11 +122,13 @@ jobs:
       GOPROXY: "off"
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          go-version: "1.26.5"
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ali-slider-go/go.mod
           check-latest: false
           cache: false
 
@@ -130,3 +136,284 @@ jobs:
       # 下运行同一门禁，因此不为测试工具链放宽项目的纯 Go 边界。
       - name: Race detector
         run: go test -count=1 -race ./...
+
+  windows-package:
+    name: Windows AMD64 portable package
+    needs:
+      - quality
+      - race
+    runs-on: windows-2025
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: ali-slider-go
+    env:
+      CGO_ENABLED: "0"
+      GOARCH: amd64
+      GOFLAGS: -mod=readonly
+      GOTOOLCHAIN: local
+      GOPROXY: "off"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ali-slider-go/go.mod
+          check-latest: false
+          cache: false
+
+      - name: Verify and test on Windows
+        run: |
+          go mod verify
+          go vet ./...
+          go test -count=1 ./...
+
+      - name: Build and assemble portable package
+        run: |
+          $packageName = "ali-slider-go-windows-amd64"
+          $packageDir = Join-Path $env:RUNNER_TEMP $packageName
+          $zipPath = Join-Path $env:RUNNER_TEMP "$packageName.zip"
+
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+
+          go build `
+            -trimpath `
+            -buildvcs=true `
+            -ldflags="-s -w -buildid=" `
+            -o (Join-Path $packageDir "ali-slider-go.exe") `
+            ./cmd/server
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows build failed"
+          }
+
+          Copy-Item `
+            "packaging/windows/start.bat" `
+            (Join-Path $packageDir "start.bat")
+          Copy-Item `
+            "packaging/windows/README-Windows.txt" `
+            (Join-Path $packageDir "README-Windows.txt")
+
+          $utf8 = [System.Text.UTF8Encoding]::new($false)
+          $buildInfo = @(
+            "project=ali-slider-go"
+            "commit=$env:GITHUB_SHA"
+            "ref=$env:GITHUB_REF"
+            "go=$(go version)"
+            "goos=windows"
+            "goarch=amd64"
+            "cgo=0"
+            "builtAtUTC=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+          )
+          [IO.File]::WriteAllLines(
+            (Join-Path $packageDir "BUILD-INFO.txt"),
+            [string[]]$buildInfo,
+            $utf8
+          )
+
+          $checksumNames = @(
+            "ali-slider-go.exe"
+            "BUILD-INFO.txt"
+            "README-Windows.txt"
+            "start.bat"
+          ) | Sort-Object
+          $checksumLines = foreach ($name in $checksumNames) {
+            $hash = (Get-FileHash `
+              -Algorithm SHA256 `
+              (Join-Path $packageDir $name)).Hash.ToLowerInvariant()
+            "$hash  $name"
+          }
+          [IO.File]::WriteAllLines(
+            (Join-Path $packageDir "SHA256SUMS.txt"),
+            [string[]]$checksumLines,
+            $utf8
+          )
+
+          Compress-Archive `
+            -Path (Join-Path $packageDir "*") `
+            -DestinationPath $zipPath `
+            -CompressionLevel Optimal
+
+          "WINDOWS_PACKAGE_ZIP=$zipPath" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WINDOWS_PACKAGE_SHA256=$((Get-FileHash -Algorithm SHA256 $zipPath).Hash.ToLowerInvariant())" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify extracted package and smoke-test executable
+        run: |
+          $verifyDir = Join-Path $env:RUNNER_TEMP "便携 包 verify"
+          Expand-Archive `
+            -LiteralPath $env:WINDOWS_PACKAGE_ZIP `
+            -DestinationPath $verifyDir
+
+          $expected = @(
+            "ali-slider-go.exe"
+            "BUILD-INFO.txt"
+            "README-Windows.txt"
+            "SHA256SUMS.txt"
+            "start.bat"
+          ) | Sort-Object
+          $actual = Get-ChildItem -Path $verifyDir -File |
+            Select-Object -ExpandProperty Name |
+            Sort-Object
+          $difference = Compare-Object $expected $actual
+          if ($difference) {
+            $difference | Format-Table | Out-String | Write-Error
+            throw "Unexpected portable-package contents"
+          }
+
+          $exe = Join-Path $verifyDir "ali-slider-go.exe"
+          $header = [IO.File]::ReadAllBytes($exe)
+          if ($header.Length -lt 2 -or $header[0] -ne 0x4d -or $header[1] -ne 0x5a) {
+            throw "Packaged executable is not a PE file"
+          }
+
+          $recordedChecksums = @{}
+          foreach ($line in Get-Content (Join-Path $verifyDir "SHA256SUMS.txt")) {
+            if ($line -notmatch "^([0-9a-f]{64})  (.+)$") {
+              throw "Malformed SHA256SUMS entry: $line"
+            }
+            if ($recordedChecksums.ContainsKey($Matches[2])) {
+              throw "Duplicate SHA256SUMS entry: $($Matches[2])"
+            }
+            $recordedChecksums[$Matches[2]] = $Matches[1]
+          }
+          $hashedNames = $expected | Where-Object { $_ -ne "SHA256SUMS.txt" }
+          if ($recordedChecksums.Count -ne $hashedNames.Count) {
+            throw "Unexpected SHA256SUMS entry count"
+          }
+          foreach ($name in $hashedNames) {
+            if (-not $recordedChecksums.ContainsKey($name)) {
+              throw "Missing SHA256SUMS entry: $name"
+            }
+            $actualHash = (Get-FileHash `
+              -Algorithm SHA256 `
+              (Join-Path $verifyDir $name)).Hash.ToLowerInvariant()
+            if ($recordedChecksums[$name] -ne $actualHash) {
+              throw "Packaged file checksum mismatch: $name"
+            }
+          }
+
+          $stdout = Join-Path $env:RUNNER_TEMP "windows-smoke.stdout.log"
+          $stderr = Join-Path $env:RUNNER_TEMP "windows-smoke.stderr.log"
+          $smokeArtifacts = Join-Path $verifyDir "var\artifacts"
+          New-Item -ItemType Directory -Force -Path $smokeArtifacts | Out-Null
+          $arguments = @(
+            "/d"
+            "/c"
+            "start.bat"
+            "--host=127.0.0.1"
+            "--port=18080"
+            "--device-prewarm=0"
+          )
+          $launcher = Start-Process `
+            -FilePath $env:ComSpec `
+            -ArgumentList $arguments `
+            -WorkingDirectory $verifyDir `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr `
+            -PassThru
+
+          try {
+            $ready = $false
+            for ($attempt = 0; $attempt -lt 60; $attempt++) {
+              if ($launcher.HasExited) {
+                throw "Packaged start.bat exited with code $($launcher.ExitCode)"
+              }
+              Start-Sleep -Milliseconds 250
+              try {
+                $health = Invoke-RestMethod `
+                  -Uri "http://127.0.0.1:18080/health" `
+                  -TimeoutSec 1
+                if ($health.ok -eq $true -and $health.status -eq "ready") {
+                  $ready = $true
+                  break
+                }
+              } catch {
+                # 服务尚未 ready，继续有界轮询。
+              }
+            }
+            if (-not $ready) {
+              throw "Packaged executable did not become ready"
+            }
+
+            $serverProcesses = @(
+              Get-Process -Name "ali-slider-go" -ErrorAction SilentlyContinue |
+                Where-Object { $_.Path -eq $exe }
+            )
+            if ($serverProcesses.Count -ne 1) {
+              throw "start.bat did not create exactly one packaged executable"
+            }
+
+            $openapi = Invoke-RestMethod `
+              -Uri "http://127.0.0.1:18080/openapi.json" `
+              -TimeoutSec 2
+            if ($openapi.openapi -ne "3.0.3") {
+              throw "Packaged executable returned unexpected OpenAPI metadata"
+            }
+
+            $invalid = Invoke-WebRequest `
+              -Method Post `
+              -Uri "http://127.0.0.1:18080/api/slider" `
+              -ContentType "application/json" `
+              -Body "[]" `
+              -SkipHttpErrorCheck `
+              -TimeoutSec 2
+            if ($invalid.StatusCode -ne 400) {
+              throw "Invalid JSON contract smoke returned $($invalid.StatusCode)"
+            }
+          } finally {
+            $packagedServers = @(
+              Get-Process -Name "ali-slider-go" -ErrorAction SilentlyContinue |
+                Where-Object { $_.Path -eq $exe }
+            )
+            foreach ($serverProcess in $packagedServers) {
+              if (-not $serverProcess.HasExited) {
+                Stop-Process -Id $serverProcess.Id -Force
+                $serverProcess.WaitForExit(5000) | Out-Null
+              }
+            }
+            if (-not $launcher.HasExited) {
+              Stop-Process -Id $launcher.Id -Force
+              $launcher.WaitForExit(5000) | Out-Null
+            }
+            if (Test-Path $stdout) {
+              Get-Content $stdout | Write-Host
+            }
+            if (Test-Path $stderr) {
+              Get-Content $stderr | Write-Host
+            }
+          }
+
+          $startupLog = Get-Content -Raw $stdout
+          if ($startupLog -match "artifact_purge status=warning") {
+            throw "Windows artifact startup purge reported a warning"
+          }
+
+      - name: Upload shareable Windows ZIP
+        if: github.event_name != 'pull_request'
+        id: windows-artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ runner.temp }}/ali-slider-go-windows-amd64.zip
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Record Windows package evidence
+        if: github.event_name != 'pull_request'
+        run: |
+          $artifactDigest = "${{ steps.windows-artifact.outputs.artifact-digest }}"
+          if ($artifactDigest -ne $env:WINDOWS_PACKAGE_SHA256) {
+            throw "Uploaded artifact digest does not match package SHA-256"
+          }
+          "### Windows portable package" >> $env:GITHUB_STEP_SUMMARY
+          "" >> $env:GITHUB_STEP_SUMMARY
+          "- Commit: ``${{ github.sha }}``" >> $env:GITHUB_STEP_SUMMARY
+          "- File: ``ali-slider-go-windows-amd64.zip``" >> $env:GITHUB_STEP_SUMMARY
+          "- ZIP SHA-256: ``$env:WINDOWS_PACKAGE_SHA256``" >> $env:GITHUB_STEP_SUMMARY
+          "- Retention: 30 days" >> $env:GITHUB_STEP_SUMMARY
