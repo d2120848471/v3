@@ -38,6 +38,7 @@ type Config struct {
 	AssetMaxBytes         int64
 	AssetMaxDimension     int
 	DevicePrewarmCapacity int
+	PEKeyNodeBinary       string
 }
 
 // Defaults 返回适合本地运行的保守默认值。
@@ -59,6 +60,7 @@ func Defaults() Config {
 		AssetMaxBytes:         8 << 20,
 		AssetMaxDimension:     16_384,
 		DevicePrewarmCapacity: 32,
+		PEKeyNodeBinary:       "node",
 	}
 }
 
@@ -118,6 +120,9 @@ func Parse(args []string, getenv func(string) string) (Config, error) {
 	if cfg.DevicePrewarmCapacity, err = envInt(getenv, "ALI_SLIDER_DEVICE_PREWARM", cfg.DevicePrewarmCapacity); err != nil {
 		return Config{}, err
 	}
+	if cfg.PEKeyNodeBinary, err = envString(getenv, "ALI_SLIDER_PE_KEY_NODE", cfg.PEKeyNodeBinary); err != nil {
+		return Config{}, err
+	}
 
 	set := flag.NewFlagSet("ali-slider-go", flag.ContinueOnError)
 	set.StringVar(&cfg.Host, "host", cfg.Host, "监听地址")
@@ -136,6 +141,7 @@ func Parse(args []string, getenv func(string) string) (Config, error) {
 	set.Int64Var(&cfg.AssetMaxBytes, "asset-max-bytes", cfg.AssetMaxBytes, "单张图片最大字节数")
 	set.IntVar(&cfg.AssetMaxDimension, "asset-max-dimension", cfg.AssetMaxDimension, "图片最大边长")
 	set.IntVar(&cfg.DevicePrewarmCapacity, "device-prewarm", cfg.DevicePrewarmCapacity, "设备会话预热容量")
+	set.StringVar(&cfg.PEKeyNodeBinary, "pe-key-node", cfg.PEKeyNodeBinary, "设备与动态 PE 运行时使用的 Node 可执行文件")
 	if err := set.Parse(args); err != nil {
 		return Config{}, err
 	}
@@ -193,6 +199,9 @@ func (c Config) Validate() error {
 	}
 	if c.DevicePrewarmCapacity < 0 || c.DevicePrewarmCapacity > c.MaxConcurrency {
 		return errors.New("device prewarm must be within 0..max-concurrency")
+	}
+	if c.PEKeyNodeBinary == "" || len(c.PEKeyNodeBinary) > 4_096 || strings.ContainsRune(c.PEKeyNodeBinary, 0) || !utf8.ValidString(c.PEKeyNodeBinary) {
+		return errors.New("PE runtime Node binary must contain 1..4096 valid UTF-8 bytes")
 	}
 	return nil
 }

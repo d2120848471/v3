@@ -2,7 +2,7 @@
 
 本文件记录 `ali-slider-go` 的用户可见变化。格式参考 Keep a Changelog，版本遵循语义化版本。
 
-> **发布状态**：`1.0.0` 仍为 Unreleased。纯 Go 完整实现、离线门禁、Docker smoke、纯计算 P99 和唯一授权候选批次均已有验证证据。候选批次达到成功率与 Client 完整链 P95 目标，但它先于传输 one-shot 加固；最终源码未获授权再跑第二批。HTTP Handler 不设本地 admission gate、不因本机在途数主动返回 429；HTTP 端到端 P95、无界请求下的生产资源峰值和长时间稳定性压测仍未完成。
+> **发布状态**：`1.0.0` 仍为 Unreleased。2026-08-08 同机 A/B 证明历史 `d92c7d1` 可返回 `T001`，而迁移后的纯 Go 设备/PE 路径持续 `F001`。当前候选已恢复同挑战持久 FeiLin VM 和当前动态 PE 原生执行，并以 1 个新挑战、一次 Solve、零重试重新得到 `T001`。该单次 smoke 不替代成功率/性能批次；2026-08-07 的历史成功率/P95 证据也不自动外推到当前架构。HTTP 端到端 P95、生产资源峰值和长时间稳定性压测仍未完成。
 
 ## [1.0.0] - Unreleased
 
@@ -10,11 +10,13 @@
 
 - 新建独立纯 Go module，固定 Go `1.26.5`，生产 `go.mod` 无第三方依赖且不使用 CGo。
 - 增加可并发复用的公共 `slider.Client`：`NewClient`、`Solve`、`Prime`、`PurgeArtifacts` 和幂等 `Close`。
-- 增加完整纯 Go Solver：Device → InitCaptchaV3 → 双图下载 → Vision → Track/PE → Device Complete → 唯一 VerifyCaptchaV3。
+- 增加完整 Go 编排：Node Device → InitCaptchaV3 → 双图下载 → Vision → Track/动态 PE → Node Device Complete → 唯一 VerifyCaptchaV3。
 - 增加稳定请求、结果和分类错误合同，包含完整阶段 `timingsMs`。
 - 增加 JS/RPC 编码、RPC v1 签名、AES-CBC、DeviceToken、data codec、Verify 参数和自校验。
 - 增加设备画像、浏览器头、指纹、Log1/2/3、首枚/刷新 token、getter/event 和单会话完成态。
-- 增加纯 Go PE builder：轨迹字段、坐标、逻辑时钟、getter plan、交互事件及 Pack/Unpack 自检。
+- 保留纯 Go PE builder 作为历史 oracle/离线兼容实现：轨迹字段、坐标、逻辑时钟、getter plan、交互事件及 Pack/Unpack 自检。
+- 增加动态 PE `KeyResolver`：公开 SDK 与精确 PE 源码/结构画像缓存 5 分钟；每轮用本轮挑战输入运行当前 PE 原生生成 `data`，再由 Go 独立解包并校验 schema、坐标、getter、事件和时钟合同。
+- 增加持久 Node 设备会话：同一个公开 SDK/FeiLin VM 从 Log1/2/3 保留至 PE getter，回放本轮原生交互事件后生成同 session 的 Verify DeviceToken。
 - 增加 Captcha Init/Verify RPC client；每个 client 最多尝试一次 Verify，网络结果未知也不重发。
 - 增加 HTTP(S)、SOCKS4、SOCKS5、SOCKS5H 和按 proxy route 隔离的有界连接池。
 - 增加有界设备预热池：完整 key 隔离、20 秒默认年龄、并行 Prime、Lease、冷建、过期和异步补货。
@@ -27,16 +29,16 @@
 - 增加 `GET /` 第一方内嵌 API 测试页：同源 health/solve、手工单次提交、取消/客户端等待上限、状态/耗时/trace 展示与敏感字段默认遮罩；不增加 Node、CDN 或 ZIP 文件。
 - 增加 `Makefile` 的 fmt/vet/test/race/staticcheck/govulncheck/coverage/Linux 静态构建目标。
 - 增加 Go CI `.github/workflows/ali-slider-go-ci.yml`，固定工具版本、覆盖率阈值和静态二进制断言。
-- 增加 Windows AMD64 便携包：独立 EXE、双击启动脚本、中文说明、构建信息和 SHA-256。
+- 增加 Windows AMD64 便携包：Go 服务 EXE、固定 Node `24.14.1`、Node 许可证、双击启动脚本、中文说明、构建信息和 SHA-256。
 - CI 增加 Windows 2025 原生 test/vet、PE 构建、最终 ZIP 解压 smoke 与单层 artifact 上传；官方 actions 使用完整 commit SHA 固定。
 - 增加 `docs/evidence/validation-2026-08-07.md`，固化命令、聚合数字、构建哈希与在线快照时序边界。
 - 增加 `docs/evidence/validation-2026-08-08-no-local-admission.md`，固化删除本地准入闸门后的离线合同、质量门禁、源码选择集摘要与临时 Linux 二进制哈希。
-- 增加 multi-stage `Dockerfile`：Go `1.26.5` 构建、scratch runtime、非 root UID/GID `65532`。
+- 增加 multi-stage `Dockerfile`：Go `1.26.5` 构建、Node `24.14.1` Alpine runtime、非 root UID/GID `65532`。
 - 增加架构、API、配置、安全、测试、性能、迁移和排障文档。
 
 ### Changed
 
-- 运行时从 Python/OpenCV/浏览器 worker 模型切换为单一纯 Go 进程；旧 Python 源码已从当前工作树删除，需要审计或回滚时从 Git 历史提交 `0509bfd` 恢复。
+- 运行时从 Python/OpenCV/浏览器 worker 模型切换为 Go 主进程加有界 Node 24 VM；Node 按挑战执行设备/动态 PE，公开脚本与结构画像按 5 分钟复用。旧 Python 源码已从当前工作树删除，需要审计或回滚时从 Git 历史提交恢复。
 - 服务合同只开放 `/`、`/api/slider`、`/health` 和 `/openapi.json` 四个路径；Solve 同时支持推荐的 POST JSON 和已废弃的旧 Python GET query。
 - 恢复 `GET /api/slider?...` 兼容合同：8 个精确字段/别名、同名 query 取最后值、规范名压过别名、空值回退默认；GET/POST 参数源不合并，不支持 form body。
 - 移除 HTTP 本机 admission gate 与主动 `429 Retry-After`；每个通过浏览器跨源和输入校验的 GET/POST Solve 请求都在 timeout context 内直接调用 Solver。
@@ -50,6 +52,11 @@
 
 ### Fixed
 
+- 修复把动态 PE 简化成静态 key + Go 近似构造导致新 `.058` 分片持续返回 `F001`：删除随机兜底，按每轮 `StaticPath`、`CertifyId`、DeviceConfig、轨迹和时钟执行当前 PE；同时兼容当前 10 字段与历史 11 字段 TrackList。
+- 修复纯 Go Device 指纹没有保持旧版 Init→Verify 的同一 FeiLin VM：设备 Node 会话跨阶段持久化，Init 固定验证 111 个字段，Verify 接受真实事件回放后动态扩展的安全字段数（实测 142），但仍独立验证 token、session、时钟和 action 序列。
+- 修复缓存边界：只缓存公开 SDK/PE 源码和结构画像 5 分钟；DeviceToken、`CertifyId`、轨迹、`data` 不进入分钟级缓存，预热设备会话仍是最多 20 秒的一次性资源。
+- 修复 HTTP(S) 与 SOCKS 代理下 Node 设备流量未统一路由：HTTP(S) 使用 Node 环境代理，SOCKS 经仅允许目标 HTTPS host 的进程内 CONNECT relay 复用 Go SOCKS dialer。
+- 修复 Docker `scratch` 和旧 Windows 单 EXE 没有逐挑战 Node 运行时：容器切到固定 Node Alpine，Windows ZIP 携带固定 `node.exe` 与许可证。
 - 修复 Device RPC 响应 schema：保留 `ResultObject` 原始 JSON，仅在 Log1 解码对象内的 `DeviceConfig`；Log2/Log3 成功响应允许非对象结果，避免真实设备链被误判为协议错误。
 - 增加 Device schema 离线回归和显式授权的在线 Log1/2/3 探针；在线设备初始化通过，耗时约 `0.53s`。
 - 禁用 Verify POST 的 `GetBody` 回卷入口，阻止 `net/http` 在 HTTP/2 GOAWAY/REFUSED_STREAM 等已发送 body 的失败后透明重放。
@@ -65,13 +72,14 @@
 - 使用 Go 1.26 标准库 `http.CrossOriginProtection` 拒绝明确浏览器跨源 GET/POST Solve；有副作用的 GET 在检查副本中按 POST 对待，返回脱敏 `403 ApiOriginError` 且不进入 Solver，同源页和无浏览器来源头的 curl/程序客户端保持兼容。
 - HTTP Handler 不内置访问频率或并发准入保护；对外暴露必须由受控网络、反向代理或 API gateway 限制身份、频率、并发和总量。
 - 每个 `CertifyId` 最多尝试一次 Verify；前置失败为零 Verify，网络未知也不重试。
+- 动态公开脚本限制为精确 HTTPS host/默认端口/路径格式和 2 MiB；Node 子进程使用清理后的环境、有限输入输出和超时。设备 VM 只允许 `g.alicdn.com`/`*.aliyuncs.com` HTTPS 且逐跳校验重定向；PE VM 禁网。挑战输出由 Go 独立复核。
 - 代理 route 和每 host 连接数限制在 `1..32`；直连显式忽略环境 proxy。
 - 设备预热池只复用完整 endpoint/prefix/region/route/profile/timing key 一致的会话。
 - 资产固定 HTTPS CDN，重定向逐跳校验；单图默认最多 8 MiB。
 - PNG 在完整解码前检查签名、IHDR、尺寸、像素数和 shadow alpha。
 - Unix artifact 目录/文件使用 `0700/0600`；Windows 继承 NTFS ACL；随机名以 `O_EXCL` 创建，清理不跟随 symlink。
 - Solver、HTTP、日志和 artifact 测试覆盖 token、CertifyId、代理密码及原始 cause 脱敏。
-- Docker runtime 为 scratch 且以非 root UID/GID `65532` 运行。
+- Docker runtime 固定 Node 24.14.1 Alpine，Go 服务仍以非 root UID/GID `65532` 运行。
 
 ### Testing
 
@@ -79,10 +87,11 @@
 - Linux AMD64 `CGO_ENABLED=0` 静态、stripped `cmd/server` 构建已验证通过。
 - Windows AMD64 发布工作流要求原生全量测试、最终 ZIP 解压启动、HTTP 合同、文件白名单和 SHA-256 全部通过。
 - Linux AMD64 Docker 镜像构建及非 root `/health` smoke 已验证通过。
-- 全项目统一语句覆盖率重复运行为 `83.1–83.2%`，均达到 `>=80%` 门槛；发布 commit 仍由 CI 重跑归档。
+- 全项目统一语句覆盖率为 `81.9%`，达到 `>=80%` 门槛；发布 commit 仍由 CI 重跑归档。
 - Python 协议 oracle 与 fuzz seeds 对照通过；`internal/protocol` 覆盖率 `91.4%`。
 - Python edge-decoy 正负视觉 fixture 对照通过；`internal/vision` 覆盖率 `91.9%`。
-- PE builder 的 Python oracle 解包语义对照通过；`internal/pe` 覆盖率 `95.1%`。
+- PE builder 的 Python oracle 解包语义对照通过；加入逐挑战 Device/PE runtime 后，`internal/pe` 覆盖率为 `80.9%`。
+- 动态 PE/设备 runtime 的 5 分钟精确缓存、24 路并发 miss 合并、不安全路径、下载上限、缺失 Node 分类、持久进程、指纹字段、getter/事件/时钟合同和 SOCKS relay 生命周期均有离线测试；公开 `.058` 分片探针可显式复现。
 - 完整 Solver Mock 链通过：成功路径一次 Verify、低置信零 Verify、Verify 网络错误一次尝试。
 - 完整 Solver 的 32 路并发 Mock 正确性测试通过；该测试不作为吞吐、资源或尾延迟报告。
 - 设备预热池通过有界容量、key 隔离、过期、取消、失败、补货及并发 Lease/Close 的 race 测试。
@@ -90,6 +99,7 @@
 - 困难视觉 benchmark 均值为 `53.10ms/op`；独立纯计算 200 样本 nearest-rank `P50=50.577458ms`、`P95=55.711708ms`、`P99=57.05075ms`、`max=60.337542ms`，满足 `P99<=100ms` 硬门槛。
 - 唯一授权候选批次恰好执行 200 个新挑战、并发 32、每个 job 一次 Solve、应用层零重试：严格成功 `196`、业务失败 `3`、`VisionError=1`、网络错误 `0`，成功率 `98%`。该批先于传输 one-shot 加固，最终源码受授权上限约束未再在线重跑。
 - 候选批次直接调用 `Client.Solve`；Client 完整求解链墙钟 `P50=816ms`、`P95=984ms`、`P99=1018ms`、`max=1555ms`，成功样本墙钟 `P95=989ms`，总批次约 `6.16s`；`>=190/200` 与 Client 完整链 `P95<=1000ms` 均通过。
+- 当前修复快照于 2026-08-08 用 1 个新挑战、一次 Solve、并发 1、零重试得到严格成功 `1/1`，墙钟约 `1579ms`；它只作为 `T001` 功能 smoke，不用于更新成功率或 P95 门槛。
 
 ### Known limitations
 

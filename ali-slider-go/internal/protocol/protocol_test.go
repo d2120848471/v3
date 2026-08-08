@@ -147,6 +147,16 @@ func TestTransformAndDataMatchPythonOracle(t *testing.T) {
 	if decoded.JSONText != oracle.PayloadJSON || decoded.CompressedBase64 != oracle.CompressedBase64 {
 		t.Fatal("decoded data mismatch")
 	}
+	currentPayload := decoded.Payload
+	currentPayload.TrackList.SI = ""
+	currentData, err := PackData(currentPayload, decoded.ChecksumPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentDecoded, err := UnpackData(currentData)
+	if err != nil || currentDecoded.Payload.TrackList.SI != "" || strings.Contains(currentDecoded.JSONText, `"si"`) {
+		t.Fatalf("current 10-field TrackList rejected: %v", err)
+	}
 	repacked, err := PackData(decoded.Payload, decoded.ChecksumPrefix)
 	if err != nil {
 		t.Fatal(err)

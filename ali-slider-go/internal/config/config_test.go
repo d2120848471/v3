@@ -10,7 +10,7 @@ func TestDefaultsValidate(t *testing.T) {
 	if err := config.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if config.Host != "127.0.0.1" || config.MaxConcurrency != 32 || config.SceneID != DefaultSceneID || config.Prefix != DefaultPrefix {
+	if config.Host != "127.0.0.1" || config.MaxConcurrency != 32 || config.SceneID != DefaultSceneID || config.Prefix != DefaultPrefix || config.PEKeyNodeBinary != "node" {
 		t.Fatalf("unexpected defaults: %+v", config)
 	}
 }
@@ -20,12 +20,13 @@ func TestParsePrecedence(t *testing.T) {
 		"ALI_SLIDER_PORT":            "9000",
 		"ALI_SLIDER_TIMEOUT":         "12s",
 		"ALI_SLIDER_MAX_CONCURRENCY": "8",
+		"ALI_SLIDER_PE_KEY_NODE":     "/environment/node",
 	}
-	config, err := Parse([]string{"-port=9100", "-max-concurrency=4"}, func(key string) string { return environment[key] })
+	config, err := Parse([]string{"-port=9100", "-max-concurrency=4", "-pe-key-node=/flag/node"}, func(key string) string { return environment[key] })
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.Port != 9100 || config.MaxConcurrency != 4 || config.Timeout != 12*time.Second {
+	if config.Port != 9100 || config.MaxConcurrency != 4 || config.Timeout != 12*time.Second || config.PEKeyNodeBinary != "/flag/node" {
 		t.Fatalf("unexpected precedence: %+v", config)
 	}
 }
@@ -43,5 +44,10 @@ func TestParseRejectsInvalidValues(t *testing.T) {
 		if _, err := Parse(arguments, func(string) string { return "" }); err == nil {
 			t.Fatalf("expected error for %v", arguments)
 		}
+	}
+	invalid := Defaults()
+	invalid.PEKeyNodeBinary = ""
+	if err := invalid.Validate(); err == nil {
+		t.Fatal("empty PE key Node binary accepted")
 	}
 }

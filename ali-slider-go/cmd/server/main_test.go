@@ -22,8 +22,9 @@ func TestClientOptionsMapsServiceConfiguration(t *testing.T) {
 	cfg.MaxConcurrency = 7
 	cfg.Timeout = 9 * time.Second
 	cfg.DevicePrewarmCapacity = 3
+	cfg.PEKeyNodeBinary = "/opt/node/bin/node"
 	options := clientOptions(cfg)
-	if options.DefaultSceneID != "scene" || options.DefaultPrefix != "prefix9" || options.MaxConcurrency != 7 || options.Timeout != 9*time.Second || options.DevicePrewarmCapacity != 3 {
+	if options.DefaultSceneID != "scene" || options.DefaultPrefix != "prefix9" || options.MaxConcurrency != 7 || options.Timeout != 9*time.Second || options.DevicePrewarmCapacity != 3 || options.PEKeyNodeBinary != "/opt/node/bin/node" {
 		t.Fatalf("options=%+v", options)
 	}
 	if options.AssetMaxBytes != cfg.AssetMaxBytes || options.ArtifactRetention != cfg.ArtifactRetention {

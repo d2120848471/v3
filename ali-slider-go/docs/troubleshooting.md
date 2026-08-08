@@ -1,6 +1,6 @@
 # 排障手册
 
-> **当前边界**：服务、完整 Solver、公共 Client、预热池和定时清理已经可运行。纯计算 `P99=57.05075ms`、2026-08-07 历史授权候选批次 `196/200` 和 Client 完整求解链墙钟 `P95=984ms` 已达到当时冻结门槛。1 秒只约束 P95；该批 `P99=1018ms`、`max=1555ms`，且是未经过 HTTP Handler 的 Client harness。该批先于最终传输 one-shot 加固，最终源码未获授权再跑第二批。离线 6,400 次 Solve 压力已通过；生产形态的长稳资源压测仍无结论。排障过程中不得擅自重跑或扩大在线流量，也不得重试同一 `CertifyId`。
+> **当前边界**：服务、完整 Solver、公共 Client、预热池和定时清理已经可运行；当前动态 Device/PE 修复以单次零重试得到 `T001`，只证明功能恢复。纯计算 `P99=57.05075ms`、2026-08-07 `196/200` 和 Client 完整链 `P95=984ms` 都属于旧近似 PE 路径，只保留为历史对照；离线 6,400 次 Solve 也使用 fake PE runtime。当前 Node 生产链的正式成功率、P95/P99、资源峰值和长稳压测仍无结论。排障过程中不得擅自重跑或扩大在线流量，也不得重试同一 `CertifyId`。
 
 ## 快速分流
 
@@ -69,9 +69,10 @@ curl --fail --silent http://127.0.0.1:8000/health
 | 外层网关直接返回 429 | 网关的身份/IP 频率、并发或总量策略生效 | 按该网关合同处理；不要把它归因于应用内活动数闸门 |
 | `500 NetworkError` 且上游记录为 429 | 上游把本轮外部请求作为非 2xx 拒绝 | 用 traceId 与上游受控指标定位；Handler 不透传上游 429 或退避头，同一 `CertifyId` 不得重试 Verify |
 | HTTP 200 但 `ok=false` | 协议完成，Verify 业务拒绝 | 读取 `VerifyCode`、`VerifyResult`；不要当技术成功或自动重试 |
-| `500 NetworkError` | 设备、Init、下载、Complete 或 Verify 网络阶段失败 | 用 traceId 与受控指标定位；同一 CertifyId 不得重试 Verify |
+| `500 NetworkError` | 设备、Init、动态 PE 公开脚本下载、图片、Complete 或 Verify 网络阶段失败 | 用 traceId/Stage 与受控指标定位；同一 CertifyId 不得重试 Verify |
 | `500 VisionError` | PNG/识别失败或低置信 | 检查脱敏 artifact、置信度、坐标和 fixture 回归 |
-| `500 ProtocolError` | PE、getter、token 或上游 schema 合同失败 | 运行 protocol/PE/device/challenge 测试；禁止输出敏感原文 |
+| `500 ProtocolError` | 动态 PE 路径/脚本/算法不受支持，或 PE、getter、token、上游 schema 合同失败 | 先看 Stage；`resolvePEKey` 运行公开分片探针，其他阶段运行 protocol/PE/device/challenge 测试；禁止输出敏感原文 |
+| `500 InternalError` 且 Stage=`deviceSession`/`resolvePEKey`/`buildVerifyData`/`completeDevice` | Node 不在 PATH、`--pe-key-node` 错误、版本不兼容、子进程超时或输出不合法 | 验证 `node --version` 为 `v24.14.1`；裸二进制用绝对路径，Docker/Windows 包检查运行时文件完整性；不要对同一挑战重试 |
 | `500 UnhandledProtocolError` | 未分类 error 或 panic | 视为缺陷；用本地 Mock 最小复现并映射为稳定脱敏错误 |
 | HTTP 无普通日志 | 自定义宿主给 `server.New` 的 Logger 为 nil | cmd/server 已注入 stdout logger；library 宿主应显式注入安全 Logger |
 
@@ -86,12 +87,13 @@ library 错误的 `Stage` 和成功结果 `timingsMs` 使用稳定阶段名：
 | 阶段 | 常见问题 | 检查 |
 |---|---|---|
 | `setup` | proxy route、画像或 client 构造 | proxy 格式、route 容量、prefix |
-| `deviceSession` | 预热 Lease 或冷建 Log1/2/3 | pool key、会话年龄、设备 endpoint/时钟 |
+| `deviceSession` | 预热 Lease 或冷建同一 Node FeiLin VM 的 Log1/2/3 | Node 路径、pool key、会话年龄、设备 endpoint/时钟、代理 |
 | `init` | InitCaptchaV3 | 签名、SceneId/prefix、出口 |
+| `resolvePEKey` | 精确 `StaticPath` 的公开 SDK/PE 下载、5 分钟结构画像采样或缓存命中 | Node 24.14.1、CDN allowlist、代理路由；有效缓存命中应接近 0 ms |
 | `downloadAssets` | CDN/重定向/大小 | 相对路径、HTTPS allowlist、Content-Length |
 | `vision` | PNG 或低置信 | alpha、尺寸、候选、edge-decoy |
-| `buildVerifyData` | 轨迹/PE/逻辑时钟 | Track、ExpectedXPos、Pack/Unpack |
-| `completeDevice` | getter/event 或最终 Log2 | Session 状态、event、token 刷新 |
+| `buildVerifyData` | 用本轮输入执行当前动态 PE，并由 Go 复核 | Node 路径、Track、ExpectedXPos、DeviceConfig、getter、Pack/Unpack、逻辑时钟 |
+| `completeDevice` | 在同一 FeiLin VM 回放 PE events/getter 并执行最终 Log2 | VM 生命周期、事件顺序、getter 参数、DeviceToken session |
 | `verify` | 唯一 Verify 请求/响应 | 网络未知也不得重试同一挑战 |
 | `clientCleanup` | release/关闭/补货 | pool Lease 所有权、Close 竞态 |
 
@@ -138,6 +140,9 @@ Device RPC 的成功响应 schema 按 action 处理：Log1 必须给出对象形
 | shadow 无 alpha/空形状 | 拼图图错误 | 不 Verify；纳入授权负例回归 |
 | 两图尺寸不匹配 | 跨请求错配或缓存污染 | 检查单轮状态隔离；禁止复用 mutable 图片 |
 | 低置信 | 无缺口、诱饵或算法不确定 | 不 Verify；查看脱敏 artifact，先复现 oracle |
+| `dynamic PE runtime failed` | 逐挑战设备/PE Node 不可用、超时或输出不合法 | 用 `node --version`、离线假进程测试和显式组件探针检查；Docker/Windows 包不应改用宿主随机 Node |
+| `unsupported dynamic PE script` | StaticPath 格式、公开脚本结构、候选唯一性或 Go 独立复核失败 | 不随机兜底、不 Verify；保存路径和稳定错误类别，不保存真实 CertifyId/正文，更新 bridge 前先做离线逆向验证 |
+| 同一路径每次都启动 Node | 逐挑战 Device/PE VM 本来就会启动；若同时每轮重下公开脚本/重采画像，才说明 Client/KeyResolver 被逐请求重建或 5 分钟 TTL 已过 | 复用一个 `slider.Client`；用 `resolvePEKey` 耗时/受控下载计数区分 VM 执行与 cache miss，不要缓存挑战级 token/data |
 | PE xPos mismatch | 轨迹换算与视觉坐标相差超过 1 px | 检查尺寸、最后 touchmove 和坐标；不 Verify |
 | invalid PE logical clock | Init、first-touch、轨迹和 now 不一致 | 核对毫秒单位/主机时钟；不要绕过新鲜度 |
 | PE self-check mismatch | Pack/Unpack 或 schema 内部回归 | 停止并运行 protocol/PE oracle |
@@ -187,15 +192,16 @@ go test -count=1 -race \
 | `staticcheck` 不在 PATH | 本机未安装组织工具 | 使用 CI 固定 `v0.7.0` 或按组织流程安装；项目验证记录已通过 |
 | `govulncheck` 不在 PATH/查询失败 | 工具或漏洞库网络不可用 | 使用 CI 固定 `v1.1.4`；区分扫描基础设施失败与发现漏洞 |
 | PR 没有 Go CI | 变更路径未命中或工作流未触发 | 检查 `.github/workflows/ali-slider-go-ci.yml` paths；可 workflow_dispatch |
-| 覆盖率变化 | 并发分支命中、commit/命令/缓存不同 | 使用 `-count=1` 和单一 coverprofile，记录 commit；当前重复运行为 `83.1–83.2%`，均超过 `>=80%` 门槛 |
+| 覆盖率变化 | 并发分支命中、commit/命令/缓存不同 | 使用 `-count=1` 和单一 coverprofile，记录 commit；当前统一结果为 `81.9%`，超过 `>=80%` 门槛 |
 | `go build ./...` 没有目标文件 | 该命令只验证包 | 使用 `make build-linux` 生成 `dist/ali-slider-go-linux-amd64` |
 | Linux 二进制不是 static | 未设置 CGO 或构建参数改变 | 使用 Makefile/CI 命令，并用 `file` 断言 `statically linked` |
+| 裸 Linux 服务在 `deviceSession` 或 PE 阶段报 Node 不可用 | 只部署了静态 Go ELF，未迁移逐挑战运行时 | 安装固定 Node 24.14.1，并设置 `ALI_SLIDER_PE_KEY_NODE` 为绝对路径；或使用已带 Node 的 Docker 镜像 |
 | Actions 没有 Windows ZIP | quality/race/Windows job 失败、运行来自 PR 或 artifact 已过期 | 打开同一 run 的 `windows-package`；只在 main push/手动运行上传，保留 30 天 |
 | Windows 显示未知发布者 | EXE 未做 Authenticode 商业签名 | 从可信仓库下载并核对 SHA-256；不要关闭 Defender 或绕过组织策略 |
 | Windows 提示应用无法运行 | 系统低于 Windows 10 / Windows Server 2016、使用 32 位 Windows 或非原生架构 | 当前包要求 Windows 10 / Windows Server 2016 或更高版本的 AMD64/x64；不要把它标成所有 Windows 通用包 |
 | 双击后只有控制台，没有桌面窗口 | 程序是控制台 HTTP 服务；测试 UI 在浏览器中 | 完整解压后运行 `start.bat`，等待 console 的 ready 日志，再手工打开 `http://127.0.0.1:8000/`；换端口时同步修改 URL |
 | 容器端口不可达 | 应用默认监听容器回环 | 容器内设 `ALI_SLIDER_HOST=0.0.0.0`，宿主只发布到 `127.0.0.1` |
-| 无法在容器内 exec shell/curl | runtime 是 scratch | 从宿主做 health；不要为调试把生产镜像改成 root/full OS |
+| 仍按旧说明假设容器是 scratch | 当前镜像已切到 Node 24.14.1 Alpine，以承载逐挑战设备/PE 运行时 | 继续从宿主做 health；容器内 shell 不是公开管理接口，镜像扫描需覆盖 Node/Alpine |
 | artifact 重启后丢失 | 容器未挂持久卷 | 将 `/app/var/artifacts` 挂受控卷并保持 UID 65532 权限 |
 
 已验证的离线门禁包括 Go `1.26.5` 全量 test/race/vet/staticcheck/govulncheck、Linux AMD64 静态构建及 Docker 非 root `/health` smoke。在线验收不属于 CI；2026-08-07 的历史 200 轮 Client 批次已经完成，普通排障不得自动重跑。
@@ -229,6 +235,6 @@ go test -count=1 -race \
 | `pkg/slider/client.go:203`、`:213` | library 暴露 Purge，并在 Close 前等待活跃 Solve/Prime/Purge。 | caller lifecycle → safe resource cleanup |
 | `internal/artifact/store.go:121`；`cmd/server/main.go:147` | Store 只清理受管过期文件；服务已按小时调度。 | failure artifact → retention → scheduled Purge |
 | `.github/workflows/ali-slider-go-ci.yml` · `quality` / `race` / `windows-package` | Linux quality、Darwin race 与 Windows 原生 package 都固定 `CGO_ENABLED=0`；只有全部通过才上传便携 ZIP。 | source change → cross-platform gates → verified ZIP |
-| `Dockerfile:19`、`:26` | 运行镜像为 scratch、非 root，因此无 shell且需要正确卷权限。 | static binary → minimal runtime |
+| `Dockerfile`；`internal/pe/keys.go`、`runtime.go`、`device_runtime.go` | 运行镜像固定携带 Node 24.14.1，Go 服务保持非 root；逐挑战设备/PE 执行不依赖宿主 PATH。 | static Go binary + Node runtime → bounded script cache + per-challenge VMs |
 | `internal/device/rpc.go:119`、`:130`；`internal/device/session_test.go:130`、`:146`、`:150`、`:165` | Device schema 只在 Log1 解码对象，Log2/3 接受非对象成功结果。 | raw response → action gate → stable session |
 | `pkg/slider/online_acceptance_test.go:37`、`:49`、`:98`、`:128`、`:147`、`:165`、`:168`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 2026-08-07 的历史 Client harness 以 200/32/应用层零重试运行并达到当时成功率与完整链 P95 门槛；不经过 HTTP Handler，不能作为当前 HTTP 限流证据，最终 one-shot 加固后也未在线重跑。 | dated authorization → aggregate Client metrics → bounded historical conclusion |

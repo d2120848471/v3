@@ -1,9 +1,11 @@
 package challenge
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"image/png"
 	"math"
 	"net/http"
 	"strings"
@@ -13,12 +15,17 @@ import (
 	"github.com/d2120848471/v3/ali-slider-go/internal/artifact"
 	"github.com/d2120848471/v3/ali-slider-go/internal/device"
 	"github.com/d2120848471/v3/ali-slider-go/internal/pe"
+	"github.com/d2120848471/v3/ali-slider-go/internal/protocol"
 	"github.com/d2120848471/v3/ali-slider-go/internal/runtimekit"
 	"github.com/d2120848471/v3/ali-slider-go/internal/track"
 	"github.com/d2120848471/v3/ali-slider-go/internal/vision"
 )
 
-const defaultRegion = "cn"
+const (
+	defaultRegion       = "cn"
+	sliderRenderedWidth = 300
+	sliderHandleWidth   = 40
+)
 
 // FailureKind 是编排层稳定、可脱敏映射的失败类别。
 type FailureKind string
@@ -85,6 +92,34 @@ type TransportGetter func(proxy string) (http.RoundTripper, bool, error)
 // DeviceLeaseFunc 允许公共 Client 接入预热池。release 必须并发安全且可重复调用。
 type DeviceLeaseFunc func(context.Context, DevicePoolKey, *device.Client) (*device.Session, func(), error)
 
+// DeviceSession 是 Solver 实际需要的最小设备会话合同。纯 Go Session 与保持
+// 同一 FeiLin VM 的 Node Session 都可实现它。
+type DeviceSession interface {
+	InitToken() (string, error)
+	PEDeviceConfig() (protocol.DeviceConfig, error)
+	TargetFirstTouchAgeMS() (int, error)
+	Complete(context.Context, string, []device.InteractionEvent, int) (device.Result, error)
+	Close()
+}
+
+// DeviceOpenFunc 为生产链注入动态 SDK 设备会话；nil 时使用纯 Go 兼容实现。
+type DeviceOpenFunc func(context.Context, http.RoundTripper, device.Profile, SolveRequest) (DeviceSession, func(), error)
+
+type peVerifyArgProfileProvider interface {
+	PEVerifyArgProfile() (string, string, error)
+}
+
+type peSDKSourceProvider interface {
+	PESDKSource() ([]byte, error)
+}
+
+// PEKeyResolver 缓存公开 SDK/PE 脚本与运行画像，并用当前分片逐挑战原生生成
+// data；离线测试可注入无 Node、无网络的实现。
+type PEKeyResolver interface {
+	Resolve(context.Context, http.RoundTripper, device.Profile, string) (pe.RuntimeProfile, error)
+	Build(context.Context, http.RoundTripper, device.Profile, string, pe.RuntimeInput) (pe.Result, error)
+}
+
 // SolverOptions 固定进程级资源边界。FixedProfile 非 nil 时，HTTP、设备与 PE
 // 全程共享同一份只读画像，这是设备会话预热命中的必要条件。
 type SolverOptions struct {
@@ -102,6 +137,8 @@ type SolverOptions struct {
 	Artifacts         *artifact.Store
 	FixedProfile      *device.Profile
 	LeaseDevice       DeviceLeaseFunc
+	OpenDevice        DeviceOpenFunc
+	PEKeys            PEKeyResolver
 }
 
 // Solver 执行 Device → Init → Assets → Vision → PE → Device Complete → Verify。
@@ -131,6 +168,9 @@ func NewSolver(options SolverOptions) (*Solver, error) {
 	}
 	if options.GetTransport == nil {
 		return nil, errors.New("solver transport getter is required")
+	}
+	if options.PEKeys == nil {
+		options.PEKeys = pe.NewKeyResolver("")
 	}
 	return &Solver{options: options}, nil
 }
@@ -195,10 +235,10 @@ func (solver *Solver) Solve(parent context.Context, request SolveRequest) (outco
 
 	currentStage = "deviceSession"
 	deviceStarted := time.Now()
-	session, release, err := solver.openDeviceSession(ctx, setup)
+	session, release, err := solver.openDeviceSession(ctx, setup, request)
 	timings[currentStage] = elapsedMilliseconds(deviceStarted)
 	if err != nil {
-		return outcome, classifiedStageFailure(ctx, currentStage, "设备会话初始化失败", err)
+		return outcome, peRuntimeFailure(ctx, currentStage, "设备会话初始化失败", err, true)
 	}
 	if release == nil {
 		session.Close()
@@ -223,6 +263,17 @@ func (solver *Solver) Solve(parent context.Context, request SolveRequest) (outco
 	timings[currentStage] = elapsedMilliseconds(challengeStarted)
 	if err != nil {
 		return outcome, classifiedStageFailure(ctx, currentStage, "验证码初始化失败", err)
+	}
+	if err := checkStageContext(ctx, currentStage); err != nil {
+		return outcome, err
+	}
+
+	currentStage = "resolvePEKey"
+	resolveStarted := time.Now()
+	_, err = solver.options.PEKeys.Resolve(ctx, setup.transport, setup.profile, challengeValue.StaticPath)
+	timings[currentStage] = elapsedMilliseconds(resolveStarted)
+	if err != nil {
+		return outcome, peKeyFailure(ctx, currentStage, err)
 	}
 	if err := checkStageContext(ctx, currentStage); err != nil {
 		return outcome, err
@@ -269,28 +320,68 @@ func (solver *Solver) Solve(parent context.Context, request SolveRequest) (outco
 		var firstTouchAge int
 		firstTouchAge, err = session.TargetFirstTouchAgeMS()
 		if err == nil {
-			expectedX := estimate.XPos
-			var build pe.Result
-			build, err = (pe.Builder{Profile: setup.profile, Sources: solver.options.Sources}).Build(ctx, pe.Input{
-				SceneID: request.SceneID, CertifyID: challengeValue.CertifyID, StaticPath: challengeValue.StaticPath,
-				ExpectedXPos: &expectedX, InitBeginTimeMS: challengeValue.InitStartedMS,
-				FirstTouchAgeMS: firstTouchAge, Track: trackValue,
-			})
+			var deviceConfig protocol.DeviceConfig
+			deviceConfig, err = session.PEDeviceConfig()
 			if err == nil {
-				timings[currentStage] = elapsedMilliseconds(buildStarted)
-				return solver.completeAndVerify(ctx, request, setup, session, challengeValue, estimate, build, timings, &currentStage, &artifactReason)
+				verifyAccessSec, verifySalt := "", ""
+				if provider, ok := session.(peVerifyArgProfileProvider); ok {
+					verifyAccessSec, verifySalt, err = provider.PEVerifyArgProfile()
+				}
+				var sessionSDK []byte
+				if err == nil {
+					if provider, ok := session.(peSDKSourceProvider); ok {
+						sessionSDK, err = provider.PESDKSource()
+					}
+				}
+				var backgroundWidth, backgroundHeight, puzzleWidth, puzzleHeight int
+				if err == nil {
+					backgroundWidth, backgroundHeight, err = pngDimensions(assets.Background)
+				}
+				if err == nil {
+					puzzleWidth, puzzleHeight, err = pngDimensions(assets.Shadow)
+				}
+				if err == nil {
+					expectedX := estimate.XPos
+					var build pe.Result
+					build, err = solver.options.PEKeys.Build(ctx, setup.transport, setup.profile, challengeValue.StaticPath, pe.RuntimeInput{
+						SceneID: request.SceneID, CertifyID: challengeValue.CertifyID,
+						DeviceToken: initToken, CaptchaType: challengeValue.CaptchaType,
+						Image: challengeValue.ImagePath, PuzzleImage: challengeValue.PuzzleImagePath,
+						DeviceConfig: deviceConfig, VerifyAccessSec: verifyAccessSec, VerifySalt: verifySalt,
+						Dimensions: pe.RuntimeDimensions{
+							ImageWidth: backgroundWidth, ImageHeight: backgroundHeight,
+							PuzzleWidth: puzzleWidth, PuzzleHeight: puzzleHeight,
+							RenderedWidth: sliderRenderedWidth, HandleWidth: sliderHandleWidth,
+						},
+						Track: trackValue, ExpectedXPos: &expectedX,
+						InitBeginTimeMS: challengeValue.InitStartedMS, FirstTouchAgeMS: firstTouchAge,
+						SDKSource: sessionSDK,
+					})
+					if err == nil {
+						timings[currentStage] = elapsedMilliseconds(buildStarted)
+						return solver.completeAndVerify(ctx, request, setup, session, challengeValue, estimate, build, timings, &currentStage, &artifactReason)
+					}
+				}
 			}
 		}
 	}
 	timings[currentStage] = elapsedMilliseconds(buildStarted)
-	return outcome, stageFailure(ctx, FailureProtocol, currentStage, "Verify 数据构造失败", err)
+	return outcome, peRuntimeFailure(ctx, currentStage, "Verify 数据构造失败", err, false)
+}
+
+func pngDimensions(value []byte) (int, int, error) {
+	config, err := png.DecodeConfig(bytes.NewReader(value))
+	if err != nil || config.Width < 1 || config.Height < 1 {
+		return 0, 0, errors.New("asset PNG dimensions are invalid")
+	}
+	return config.Width, config.Height, nil
 }
 
 func (solver *Solver) completeAndVerify(
 	ctx context.Context,
 	request SolveRequest,
 	setup setupState,
-	session *device.Session,
+	session DeviceSession,
 	challengeValue CaptchaChallenge,
 	estimate vision.Estimate,
 	build pe.Result,
@@ -322,7 +413,7 @@ func (solver *Solver) completeAndVerify(
 	deviceResult, err := session.Complete(ctx, plan.Arguments[0].Value, interactions, postDelay)
 	timings[*currentStage] = elapsedMilliseconds(completeStarted)
 	if err != nil {
-		return outcome, classifiedStageFailure(ctx, *currentStage, "设备 Verify token 刷新失败", err)
+		return outcome, peRuntimeFailure(ctx, *currentStage, "设备 Verify token 刷新失败", err, true)
 	}
 	if deviceResult.VerifyToken == "" || deviceResult.GetterArgumentCount != 1 || deviceResult.InteractionEventCount != len(interactions) || strings.Join(deviceResult.RequestActions, ",") != "Log1,Log2,Log3,Log2" {
 		return outcome, fail(FailureProtocol, *currentStage, "设备完成态合同不一致", nil)
@@ -399,7 +490,20 @@ func (solver *Solver) setup(ctx context.Context, request SolveRequest) (setupSta
 	}, nil
 }
 
-func (solver *Solver) openDeviceSession(ctx context.Context, setup setupState) (*device.Session, func(), error) {
+func (solver *Solver) openDeviceSession(ctx context.Context, setup setupState, request SolveRequest) (DeviceSession, func(), error) {
+	if solver.options.OpenDevice != nil {
+		session, release, err := solver.options.OpenDevice(ctx, setup.transport, setup.profile, request)
+		if err != nil {
+			return nil, nil, err
+		}
+		if session == nil || release == nil {
+			if session != nil {
+				session.Close()
+			}
+			return nil, nil, errors.New("device runtime opener returned an incomplete lease")
+		}
+		return session, release, nil
+	}
 	if solver.options.LeaseDevice != nil {
 		return solver.options.LeaseDevice(ctx, setup.deviceKey, setup.deviceClient)
 	}
@@ -429,14 +533,37 @@ func validateSolveRequest(request SolveRequest) error {
 }
 
 func newTimingMap() map[string]int {
-	result := make(map[string]int, 12)
+	result := make(map[string]int, 13)
 	for _, name := range []string{
-		"setup", "deviceSession", "init", "downloadAssets", "downloadBackground", "downloadShadow",
+		"setup", "deviceSession", "init", "resolvePEKey", "downloadAssets", "downloadBackground", "downloadShadow",
 		"vision", "buildVerifyData", "completeDevice", "verify", "clientCleanup", "total",
 	} {
 		result[name] = 0
 	}
 	return result
+}
+
+func peKeyFailure(ctx context.Context, stage string, cause error) error {
+	return peRuntimeFailure(ctx, stage, "动态 PE 分片解析失败", cause, false)
+}
+
+// peRuntimeFailure 先识别本地 Node/公开脚本的稳定错误类型，再按调用阶段处理
+// 旧纯 Go 会话的普通错误。这样服务器缺 Node 不会被误报成上游协议变化。
+func peRuntimeFailure(ctx context.Context, stage, message string, cause error, classifyFallback bool) error {
+	if ctx != nil && ctx.Err() != nil {
+		return contextFailure(stage, ctx.Err())
+	}
+	switch {
+	case errors.Is(cause, pe.ErrKeyNetwork):
+		return fail(FailureNetwork, stage, message, cause)
+	case errors.Is(cause, pe.ErrKeyRuntime):
+		return fail(FailureInternal, stage, message, cause)
+	default:
+		if classifyFallback {
+			return classifiedStageFailure(ctx, stage, message, cause)
+		}
+		return fail(FailureProtocol, stage, message, cause)
+	}
 }
 
 func cloneTimings(value map[string]int) map[string]int {

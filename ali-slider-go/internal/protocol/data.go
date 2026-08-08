@@ -38,7 +38,9 @@ type TrackList struct {
 	KS        string `json:"ks"`
 	FI        string `json:"fi"`
 	StartTime any    `json:"startTime"`
-	SI        string `json:"si"`
+	// SI 在旧版 SDK 中存在；当前 SDK 已删除。omitempty 让调用方按运行时
+	// 采集到的 Track schema 精确选择 10 字段或历史 11 字段格式。
+	SI string `json:"si,omitempty"`
 }
 
 type DataPayload struct {
@@ -213,7 +215,9 @@ func decodePayload(text string) (DataPayload, error) {
 		return DataPayload{}, fmt.Errorf("data JSON has trailing content")
 	}
 	var trackRaw map[string]json.RawMessage
-	if err := json.Unmarshal(raw["TrackList"], &trackRaw); err != nil || !exactKeys(trackRaw, "mc", "tc", "mu", "te", "mp", "tmv", "mm", "ks", "fi", "startTime", "si") {
+	if err := json.Unmarshal(raw["TrackList"], &trackRaw); err != nil ||
+		(!exactKeys(trackRaw, "mc", "tc", "mu", "te", "mp", "tmv", "mm", "ks", "fi", "startTime") &&
+			!exactKeys(trackRaw, "mc", "tc", "mu", "te", "mp", "tmv", "mm", "ks", "fi", "startTime", "si")) {
 		return DataPayload{}, fmt.Errorf("TrackList schema is invalid")
 	}
 	decoder = json.NewDecoder(strings.NewReader(text))

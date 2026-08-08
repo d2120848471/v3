@@ -1,12 +1,12 @@
 # Windows AMD64 便携包
 
-GitHub Actions 在 Linux quality 与 Darwin race 门禁全部通过后，使用 Windows 2025 runner 原生测试、构建、解压并启动最终包。产物 `ali-slider-go-windows-amd64.zip` 支持 Windows 10 / Windows Server 2016 或更高版本的 AMD64/x64 机器，解压即可运行，不需要安装 Go、Python、Node.js、OpenCV、VC++ Runtime 或第三方 DLL。
+GitHub Actions 在 Linux quality 与 Darwin race 门禁全部通过后，使用 Windows 2025 runner 原生测试、构建、解压并启动最终包。产物 `ali-slider-go-windows-amd64.zip` 支持 Windows 10 / Windows Server 2016 或更高版本的 AMD64/x64 机器，已内置 Node.js `24.14.1`，解压即可运行，不需要另装 Go、Python、Node.js、OpenCV 或 VC++ Runtime。
 
 平台下限依据 Go 1.26 的官方 [Minimum Requirements](https://go.dev/wiki/MinimumRequirements)。
 
 > 本程序是本机控制台 HTTP 服务，不是桌面图形应用，但内置浏览器 API 测试页。当前包只支持 Windows AMD64/x64。默认启动会访问外部 Device RPC 做会话预热；测试页手工求解还会访问 Captcha RPC 和图片 CDN。仅限自有系统或获得明确授权的测试环境。
 
-测试页需要现代 Edge、Chrome 或 Firefox，不支持 Internet Explorer。没有现代浏览器时，EXE 服务和 PowerShell/API 仍可使用，不需要 Go、Python、Node.js 或 VC++ Runtime。
+测试页需要现代 Edge、Chrome 或 Firefox，不支持 Internet Explorer。没有现代浏览器时，Go 服务和 PowerShell/API 仍可使用；包内 `node.exe` 由服务在每轮设备/动态 PE 执行时调用，不会打开窗口或提供浏览器功能。
 
 ## 下载并启动
 
@@ -33,6 +33,8 @@ GitHub Actions 在 Linux quality 与 Darwin race 门禁全部通过后，使用 
 ```text
 ali-slider-go-windows-amd64.zip
 ├── ali-slider-go.exe
+├── node.exe
+├── NODE-LICENSE.txt
 ├── start.bat
 ├── README-Windows.txt
 ├── BUILD-INFO.txt
@@ -40,12 +42,13 @@ ali-slider-go-windows-amd64.zip
 ```
 
 - `ali-slider-go.exe` 是 `CGO_ENABLED=0` 的 Windows AMD64 console PE；默认触摸轨迹已经嵌入 EXE。
-- `start.bat` 先切换到自身目录，再提供回环地址、端口与 `var\artifacts` 路径的安全默认值；异常退出时保留窗口显示错误。
+- `node.exe` 固定为 Node `24.14.1`，用于逐挑战设备 SDK/FeiLin 和动态 PE 运行时；公开脚本/画像缓存 5 分钟，但 token/data 不跨轮复用；`NODE-LICENSE.txt` 是对应发行版许可证。
+- `start.bat` 先切换到自身目录，再提供回环地址、端口、`var\artifacts` 路径与包内 Node 的安全默认值；缺少任一 EXE 都会在启动前停止，异常退出时保留窗口显示错误。
 - `README-Windows.txt` 是可脱离仓库阅读的最终用户说明；打包时写为 UTF-8 BOM，便于 Windows Server 2016 旧记事本正确识别中文。
 - `BUILD-INFO.txt` 记录完整 commit、ref、Go 版本、目标平台和 UTC 构建时间，不包含 Secret 或 runner 用户路径。
 - `SHA256SUMS.txt` 保存包内文件校验值。
 
-包内没有源码、测试 fixture、Git 元数据、日志、凭据或运行 artifact。下载后的 ZIP 可以直接转发给使用者；使用者不需要 GitHub 账号。
+包内没有项目源码、测试 fixture、Git 元数据、日志、凭据或运行 artifact。除 Go 服务外只带固定 Node 运行时及其许可证；下载后的 ZIP 可以直接转发给使用者，使用者不需要 GitHub 账号。
 
 ## 调用与配置
 
@@ -132,8 +135,8 @@ Unix 构建强制 Artifact 目录/文件为 `0700/0600`。Windows 的 Go `FileMo
 
 1. 依赖 Linux quality 与 Darwin race 成功；
 2. 在 `windows-2025` 原生运行 `go vet` 和全量 `go test`；
-3. 使用 Go module 固定的 Go `1.26.5`、`CGO_ENABLED=0` 和 `GOARCH=amd64` 构建；
-4. 生成构建信息、UTF-8 BOM 中文说明、包内 SHA-256 和明确文件白名单；
+3. 使用 Go module 固定的 Go `1.26.5`、`CGO_ENABLED=0` 和 `GOARCH=amd64` 构建，并用固定 action 安装 Node `24.14.1`；
+4. 把 `node.exe` 和发行版 `LICENSE` 纳入包，生成构建信息、UTF-8 BOM 中文说明、包内 SHA-256 和明确文件白名单；
 5. 解压到含中文及空格的临时路径；
 6. 通过最终 `start.bat` 启动 EXE，验证脚本参数转发、内嵌测试页及其安全头、`/health`、OpenAPI 3.0.3、deprecated GET query 合同、跨源浏览器 POST/GET `403 ApiOriginError` 和非法 JSON/query `400`；跨源 GET 的 bad prefix 与 POST 的 `[]` 作为 400 后备门禁，即使 origin gate 回归也不会进入真实 Solver；
 7. smoke 强制 `--device-prewarm=0`，不会发送 Device、Init、图片或 Verify 请求；
@@ -158,5 +161,5 @@ macOS/Linux 交叉构建只能证明 Windows 测试二进制可编译。发布�
 | `internal/server/testpage.go`、`internal/server/web/test.html` | API 测试页、样式和脚本编译进同一 EXE，只能同源手工 POST，不生成敏感 query，不增加 ZIP 文件或运行时依赖。 | embedded page → browser GET `/` → explicit same-origin POST |
 | `internal/server/server.go` · `decodeQueryRequest` / `checkSolveOrigin`；`internal/server/server_test.go` · `TestLegacyGETQueryCompatibility` / `TestSolveParameterSourcesStaySeparated` / `TestBrowserOriginBoundaryPreservesLegacyClients` | 旧 GET query 仅做协议兼容，与 POST 分离参数源且共用跨源/Solver 边界。 | legacy URL → query validation → same Solve side effects |
 | `internal/artifact/store.go` · `ensureDirectory`；`store_test.go` | Unix 精确 mode 与 Windows ACL 语义分离，其他路径/竞态/配额保护保持。 | platform filesystem → safe directory → bounded artifact |
-| `.github/workflows/ali-slider-go-ci.yml` · `windows-package` | 只有跨平台门禁和 Windows 原生 package smoke 成功后才上传可分发 ZIP。 | commit → quality/race → native Windows test → ZIP |
-| `packaging/windows/start.bat` | 双击入口固定工作目录、提供回环监听默认值，并保留 console 诊断和 Ctrl+C。 | extracted package → local server → controlled shutdown |
+| `.github/workflows/ali-slider-go-ci.yml` · `windows-package` | 只有跨平台门禁、固定 Node 运行时组装和 Windows 原生 package smoke 成功后才上传可分发 ZIP。 | commit → quality/race → Go PE + Node/license → native Windows smoke → ZIP |
+| `packaging/windows/start.bat` | 双击入口固定工作目录、提供回环监听和包内 Node 的安全默认值，并保留 console 诊断和 Ctrl+C。 | extracted package → pinned Node + local server → controlled shutdown |

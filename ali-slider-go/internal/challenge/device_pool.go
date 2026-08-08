@@ -67,8 +67,11 @@ func (key DevicePoolKey) validate() error {
 // DeviceSessionOpener 与 (*device.Client).Open 的方法值完全一致，调用方无需额外适配层。
 type DeviceSessionOpener func(context.Context) (*device.Session, error)
 
+// RuntimeDeviceSessionOpener 支持保持动态 SDK VM 的设备会话。
+type RuntimeDeviceSessionOpener func(context.Context) (DeviceSession, error)
+
 type preparedDeviceSession struct {
-	session   *device.Session
+	session   DeviceSession
 	createdAt time.Time
 }
 
@@ -81,9 +84,9 @@ type DeviceSessionPool struct {
 	capacity int
 	maxAge   time.Duration
 	key      DevicePoolKey
-	open     DeviceSessionOpener
+	open     RuntimeDeviceSessionOpener
 	ready    []preparedDeviceSession
-	leased   map[*device.Session]struct{}
+	leased   map[DeviceSession]struct{}
 	pending  int
 	waiters  int
 	closed   bool
@@ -94,8 +97,9 @@ type DeviceSessionPool struct {
 	tasks     sync.WaitGroup
 	closeOnce sync.Once
 
-	now          func() time.Time
-	closeSession func(*device.Session)
+	now                 func() time.Time
+	closeSession        func(*device.Session)
+	closeRuntimeSession func(DeviceSession)
 	// beforeReservedCommit 仅用于精确验证“冷建完成→提交池状态”的 Close 窗口。
 	beforeReservedCommit func()
 }
@@ -103,6 +107,25 @@ type DeviceSessionPool struct {
 // NewDeviceSessionPool 创建固定 key 的有界池。capacity=0 显式禁用预热；
 // maxAge=0 使用 20s 默认值。启用时可直接传入 client.Open。
 func NewDeviceSessionPool(capacity int, maxAge time.Duration, key DevicePoolKey, open DeviceSessionOpener) (*DeviceSessionPool, error) {
+	var runtimeOpen RuntimeDeviceSessionOpener
+	if open != nil {
+		runtimeOpen = func(ctx context.Context) (DeviceSession, error) {
+			session, err := open(ctx)
+			if session == nil {
+				return nil, err
+			}
+			return session, err
+		}
+	}
+	return newRuntimeDeviceSessionPool(capacity, maxAge, key, runtimeOpen)
+}
+
+// NewRuntimeDeviceSessionPool 创建可保存动态 SDK VM 会话的同语义预热池。
+func NewRuntimeDeviceSessionPool(capacity int, maxAge time.Duration, key DevicePoolKey, open RuntimeDeviceSessionOpener) (*DeviceSessionPool, error) {
+	return newRuntimeDeviceSessionPool(capacity, maxAge, key, open)
+}
+
+func newRuntimeDeviceSessionPool(capacity int, maxAge time.Duration, key DevicePoolKey, open RuntimeDeviceSessionOpener) (*DeviceSessionPool, error) {
 	if capacity < 0 || capacity > maxDeviceSessionCapacity {
 		return nil, fmt.Errorf("device session capacity must be within 0..%d", maxDeviceSessionCapacity)
 	}
@@ -123,9 +146,10 @@ func NewDeviceSessionPool(capacity int, maxAge time.Duration, key DevicePoolKey,
 	lifecycle, cancel := context.WithCancel(context.Background())
 	return &DeviceSessionPool{
 		capacity: capacity, maxAge: maxAge, key: key, open: open,
-		ready: make([]preparedDeviceSession, 0, capacity), leased: make(map[*device.Session]struct{}, capacity),
+		ready: make([]preparedDeviceSession, 0, capacity), leased: make(map[DeviceSession]struct{}, capacity),
 		notify: make(chan struct{}), lifecycle: lifecycle, cancel: cancel,
 		now: time.Now, closeSession: func(session *device.Session) { session.Close() },
+		closeRuntimeSession: func(session DeviceSession) { session.Close() },
 	}, nil
 }
 
@@ -188,6 +212,30 @@ func (pool *DeviceSessionPool) Prime(ctx context.Context) error {
 // 构建完成，避免与投机补货同时再冷建一整批。
 // 调用方必须且只需调用一次 release；它先关闭消费的会话，再按需异步补一个。
 func (pool *DeviceSessionPool) Lease(ctx context.Context, key DevicePoolKey, open DeviceSessionOpener) (*device.Session, func(), error) {
+	if open == nil {
+		return nil, nil, errors.New("device session opener is required")
+	}
+	runtimeOpen := func(ctx context.Context) (DeviceSession, error) {
+		session, err := open(ctx)
+		if session == nil {
+			return nil, err
+		}
+		return session, err
+	}
+	session, release, err := pool.LeaseRuntime(ctx, key, runtimeOpen)
+	if err != nil || session == nil {
+		return nil, release, err
+	}
+	goSession, ok := session.(*device.Session)
+	if !ok {
+		release()
+		return nil, nil, errors.New("device session pool returned an incompatible session")
+	}
+	return goSession, release, nil
+}
+
+// LeaseRuntime 与 Lease 共享同一套容量、过期、等待和补货规则。
+func (pool *DeviceSessionPool) LeaseRuntime(ctx context.Context, key DevicePoolKey, open RuntimeDeviceSessionOpener) (DeviceSession, func(), error) {
 	if ctx == nil {
 		return nil, nil, errors.New("device session context is nil")
 	}
@@ -223,7 +271,7 @@ func (pool *DeviceSessionPool) Lease(ctx context.Context, key DevicePoolKey, ope
 		}
 
 		now := pool.now()
-		expired := make([]*device.Session, 0)
+		expired := make([]DeviceSession, 0)
 		stateChanged := false
 		for len(pool.ready) > 0 {
 			entry := pool.ready[0]
@@ -312,10 +360,10 @@ func (pool *DeviceSessionPool) Close() {
 		pool.mu.Unlock()
 
 		for _, entry := range ready {
-			pool.closeSession(entry.session)
+			pool.closeOne(entry.session)
 		}
 		for session := range leased {
-			pool.closeSession(session)
+			pool.closeOne(session)
 		}
 		pool.tasks.Wait()
 	})
@@ -344,7 +392,7 @@ func (pool *DeviceSessionPool) refillToCapacityLocked() {
 	}
 }
 
-func (pool *DeviceSessionPool) runOpen(ctx context.Context, open DeviceSessionOpener, result chan<- error) {
+func (pool *DeviceSessionPool) runOpen(ctx context.Context, open RuntimeDeviceSessionOpener, result chan<- error) {
 	defer pool.tasks.Done()
 	session, err := open(ctx)
 	if err == nil && session == nil {
@@ -364,14 +412,14 @@ func (pool *DeviceSessionPool) runOpen(ctx context.Context, open DeviceSessionOp
 	pool.mu.Unlock()
 
 	if !store && session != nil {
-		pool.closeSession(session)
+		pool.closeOne(session)
 	}
 	if result != nil {
 		result <- err
 	}
 }
 
-func (pool *DeviceSessionPool) leaseReservedCold(ctx, lifecycle context.Context, open DeviceSessionOpener) (*device.Session, func(), error) {
+func (pool *DeviceSessionPool) leaseReservedCold(ctx, lifecycle context.Context, open RuntimeDeviceSessionOpener) (DeviceSession, func(), error) {
 	leaseContext, cancel := linkedDevicePoolContext(ctx, lifecycle)
 	session, err := open(leaseContext)
 	if err == nil && session == nil {
@@ -404,7 +452,7 @@ func (pool *DeviceSessionPool) leaseReservedCold(ctx, lifecycle context.Context,
 
 	if closed {
 		if session != nil {
-			pool.closeSession(session)
+			pool.closeOne(session)
 		}
 		if callerContextErr != nil {
 			return nil, nil, callerContextErr
@@ -413,7 +461,7 @@ func (pool *DeviceSessionPool) leaseReservedCold(ctx, lifecycle context.Context,
 	}
 	if err != nil {
 		if session != nil {
-			pool.closeSession(session)
+			pool.closeOne(session)
 		}
 		return nil, nil, err
 	}
@@ -424,13 +472,21 @@ func (pool *DeviceSessionPool) leaseReservedCold(ctx, lifecycle context.Context,
 	return session, func() { once.Do(session.Close) }, nil
 }
 
-func (pool *DeviceSessionPool) closeSessions(sessions []*device.Session) {
+func (pool *DeviceSessionPool) closeOne(session DeviceSession) {
+	if goSession, ok := session.(*device.Session); ok {
+		pool.closeSession(goSession)
+		return
+	}
+	pool.closeRuntimeSession(session)
+}
+
+func (pool *DeviceSessionPool) closeSessions(sessions []DeviceSession) {
 	for _, session := range sessions {
-		pool.closeSession(session)
+		pool.closeOne(session)
 	}
 }
 
-func leaseColdDeviceSession(ctx context.Context, open DeviceSessionOpener) (*device.Session, func(), error) {
+func leaseColdDeviceSession(ctx context.Context, open RuntimeDeviceSessionOpener) (DeviceSession, func(), error) {
 	session, err := open(ctx)
 	if err != nil {
 		if session != nil {
@@ -449,7 +505,7 @@ func leaseColdDeviceSession(ctx context.Context, open DeviceSessionOpener) (*dev
 	return session, func() { once.Do(session.Close) }, nil
 }
 
-func (pool *DeviceSessionPool) pooledRelease(session *device.Session) func() {
+func (pool *DeviceSessionPool) pooledRelease(session DeviceSession) func() {
 	var once sync.Once
 	return func() {
 		once.Do(func() {
@@ -466,7 +522,7 @@ func (pool *DeviceSessionPool) pooledRelease(session *device.Session) func() {
 				return
 			}
 			defer pool.tasks.Done()
-			pool.closeSession(session)
+			pool.closeOne(session)
 			pool.mu.Lock()
 			pool.refillToCapacityLocked()
 			pool.mu.Unlock()

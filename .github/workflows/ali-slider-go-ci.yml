@@ -166,6 +166,12 @@ jobs:
           check-latest: false
           cache: false
 
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.14.1
+          check-latest: false
+          package-manager-cache: false
+
       - name: Verify and test on Windows
         run: |
           go mod verify
@@ -195,6 +201,15 @@ jobs:
             "packaging/windows/start.bat" `
             (Join-Path $packageDir "start.bat")
 
+          $nodeSource = (Get-Command node.exe -ErrorAction Stop).Source
+          $nodeDirectory = Split-Path -Parent $nodeSource
+          $nodeLicenseSource = Join-Path $nodeDirectory "LICENSE"
+          if (-not (Test-Path -LiteralPath $nodeLicenseSource -PathType Leaf)) {
+            throw "Node distribution LICENSE was not found"
+          }
+          Copy-Item $nodeSource (Join-Path $packageDir "node.exe")
+          Copy-Item $nodeLicenseSource (Join-Path $packageDir "NODE-LICENSE.txt")
+
           $utf8 = [System.Text.UTF8Encoding]::new($false)
           $utf8WithBOM = [System.Text.UTF8Encoding]::new($true)
           $readme = Get-Content `
@@ -215,6 +230,7 @@ jobs:
             "goos=windows"
             "goarch=amd64"
             "cgo=0"
+            "node=$(node --version)"
             "builtAtUTC=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
           )
           [IO.File]::WriteAllLines(
@@ -226,7 +242,9 @@ jobs:
           $checksumNames = @(
             "ali-slider-go.exe"
             "BUILD-INFO.txt"
+            "NODE-LICENSE.txt"
             "README-Windows.txt"
+            "node.exe"
             "start.bat"
           ) | Sort-Object
           $checksumLines = foreach ($name in $checksumNames) {
@@ -261,8 +279,10 @@ jobs:
           $expected = @(
             "ali-slider-go.exe"
             "BUILD-INFO.txt"
+            "NODE-LICENSE.txt"
             "README-Windows.txt"
             "SHA256SUMS.txt"
+            "node.exe"
             "start.bat"
           ) | Sort-Object
           $actual = Get-ChildItem -Path $verifyDir -File |
@@ -278,6 +298,11 @@ jobs:
           $header = [IO.File]::ReadAllBytes($exe)
           if ($header.Length -lt 2 -or $header[0] -ne 0x4d -or $header[1] -ne 0x5a) {
             throw "Packaged executable is not a PE file"
+          }
+          $nodeExe = Join-Path $verifyDir "node.exe"
+          $nodeHeader = [IO.File]::ReadAllBytes($nodeExe)
+          if ($nodeHeader.Length -lt 2 -or $nodeHeader[0] -ne 0x4d -or $nodeHeader[1] -ne 0x5a) {
+            throw "Packaged Node runtime is not a PE file"
           }
           $readmeBytes = [IO.File]::ReadAllBytes((Join-Path $verifyDir "README-Windows.txt"))
           if ($readmeBytes.Length -lt 3 -or

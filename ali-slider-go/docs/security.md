@@ -130,6 +130,20 @@ Init 只能提供相对路径，不能指定完整 URL。下载器：
 - 两图并发下载，首个错误立即取消同伴并 drain 结果；
 - 视觉层在完整解码前校验 PNG/IHDR/边长/总像素/shadow alpha。
 
+### 动态设备与 PE 运行时边界
+
+Init 返回的动态 PE 不能依赖有限硬编码表，也不能用随机 `arg` 或近似 Go payload 替代当前脚本。生产链会把真实单轮状态交给两个受控 Node VM，因此边界如下：
+
+- `StaticPath` 必须匹配版本号、三位分片号和 16 位小写十六进制摘要的固定格式；据此只构造 `g.alicdn.com/captcha-frontend/dynamicJS/...` URL。
+- Go 下载公开 SDK 时只允许 `o.alicdn.com`/`g.alicdn.com`，下载 PE 时只允许 `g.alicdn.com`；请求和每次重定向都要求 HTTPS、默认端口、无 userinfo/query/fragment，单脚本上限 2 MiB，并沿用本轮 transport/代理路由。
+- Device VM 接收本轮画像、prefix/region 和公开 SDK，允许访问 `https://g.alicdn.com` 与 `https://*.aliyuncs.com`；每个初始 URL和最多 3 跳重定向都重新检查协议、默认端口、userinfo 与 hostname。它从 Log1/2/3 保持到 Complete，接收 PE 实际 getter 参数/事件并产出同 session Verify token。
+- PE VM 接收真实 `SceneId`、`CertifyId`、DeviceToken、DeviceConfig、图片路径、尺寸、轨迹和逻辑时钟，用当前公开 PE 原生生成 `data`；该 VM 不提供 script/XHR 网络。Go 随后独立解包并验证 session、schema、坐标、getter 参数、事件计数和时钟边界。
+- 公开 SDK/PE 源码及结构画像只按精确 `StaticPath` 缓存 5 分钟；DeviceToken、`CertifyId`、DeviceConfig、轨迹、`data` 不进入分钟级缓存。预热 Device VM 默认最多空闲 20 秒、一次性消费。
+- 临时目录由进程独占创建，桥和脚本以 `0600` 写入；子进程工作目录固定，输出有 64 KiB 上限，PE 执行有 10 秒上限，退出/释放后删除临时目录。直连子进程环境清空；HTTP(S) 代理只注入必要的代理变量，因此代理凭据会进入该子进程内存；SOCKS 则由本机 allowlist CONNECT relay 复用 Go dialer，Node 不接收 SOCKS 凭据。
+- 路径、脚本、schema、token、session 或算法漂移直接停止且不 Verify，绝不回退随机值或静态伪造结果。
+
+Node `vm` 不是操作系统级沙箱；Device VM 还具有受限网络能力。本设计依赖严格 HTTPS allowlist/逐跳重定向校验、PE VM 禁网、有限输入输出、短生命周期和低权限服务账号缩小边界。Docker 固定以 UID/GID `65532` 运行，裸机部署也不得用 root/Administrator 常驻服务。公开脚本供应链异常仍应被视为运行时风险。
+
 ## 8. 唯一 Verify
 
 完整链的不变量：
@@ -148,12 +162,12 @@ Init 只能提供相对路径，不能指定完整 URL。下载器：
 - 生产 module 零第三方 Go 依赖。
 - `go.mod`、CI 和 Docker 使用 Go 1.26.5；本地 `govulncheck` 在该工具链下未发现可达漏洞。
 - Linux AMD64 二进制使用 `CGO_ENABLED=0`、`-trimpath`、stripped 静态构建。
-- Windows AMD64 便携版使用 `CGO_ENABLED=0` 的单一 console PE；测试页同样内嵌于 EXE，不依赖 Go、Python、Node、VC++ Runtime、CDN 或第三方 DLL。Windows 原生 CI 负责 test、解压启动和本地 HTTP smoke。
-- 官方 GitHub actions 使用完整 commit SHA 固定；普通 CI 权限保持 `contents: read`。Windows ZIP 包含 commit/build 信息和 SHA-256。
+- 动态设备/PE 逐挑战执行固定使用 Node `24.14.1`；裸二进制部署必须提供受控 Node 路径，Docker 与 Windows 便携包直接携带该版本。
+- Windows AMD64 便携版包含 `CGO_ENABLED=0` 的 Go console PE、`node.exe` 和对应 `NODE-LICENSE.txt`；测试页仍内嵌于 Go EXE，不加载外部前端依赖。Windows 原生 CI 负责 test、文件白名单、哈希、解压启动和本地 HTTP smoke。
+- 官方 GitHub actions 使用完整 commit SHA 固定；普通 CI 权限保持 `contents: read`。Windows ZIP 包含 commit/build/Node 版本信息和所有包内文件的 SHA-256。
 - 当前 Windows EXE 没有 Authenticode 代码签名；SmartScreen 可能提示未知发布者。SHA-256 不替代发布者签名，不得要求用户关闭 Defender。
-- 容器运行层为 `scratch`，只含 CA 证书、二进制和私有 artifact 目录；使用 UID/GID 65532。
-- Linux AMD64 Docker 镜像构建及关闭预热后的非 root `/health` smoke 已验证通过。
-- CI 中项目测试和分析设为 `GOPROXY=off`，不访问真实业务目标。工具下载和漏洞库查询仍需要供应链网络；这不是完全 air-gap job。
+- 容器运行层固定为官方 Node `24.14.1` Alpine 镜像，Go 服务仍使用 UID/GID `65532`；运行层不再是 `scratch`，镜像面和更新策略必须按 Node/Alpine 一并维护。
+- CI 中项目测试和分析设为 `GOPROXY=off`，不访问真实业务目标。工具/Node 下载和漏洞库查询仍需要供应链网络；显式在线公开脚本/设备探针与挑战验收均不属于普通 CI。
 
 ## 10. 上线前检查清单
 
@@ -163,7 +177,8 @@ Init 只能提供相对路径，不能指定完整 URL。下载器：
 - [ ] 反向代理、APM、客户端日志不收集正文。
 - [ ] 测试页只部署在符合本 API 信任模型的网络边界；使用者已知页面显示值可能敏感，未启用浏览器/代理正文采集。
 - [ ] Artifact 目录不在 Web root，权限、配额、保留期和磁盘告警已验证。
-- [x] 当前源码快照的全量 unit/mock/race/vet/staticcheck/govulncheck/coverage 门禁通过；统一覆盖率重复运行为 `83.1–83.2%`，稳定超过 `>=80%` 门槛，发布 commit 仍须 CI 重跑。
+- [ ] Node `24.14.1` 来源、路径和低权限运行账号已验证；Docker/Windows 产物中的运行时及许可证/哈希完整。
+- [x] 当前源码快照的全量 unit/mock/race/vet/staticcheck/govulncheck/coverage 门禁通过；统一覆盖率为 `81.9%`，超过 `>=80%` 门槛，发布 commit 仍须 CI 重跑。
 - [x] Linux AMD64 静态构建与容器非 root `/health` smoke 通过。
 - [ ] Windows AMD64 原生测试、最终 ZIP smoke、SHA-256 与 Artifact 下载已在发布 commit 的 CI 中通过并归档。
 - [x] 纯计算 P99 与 2026-08-07 历史候选批次 200 轮、32 并发、应用层零重试的 Client 完整求解链 P95/成功率报告已生成并达到当时冻结门槛；该批未经过 HTTP Handler，且先于最终 one-shot 加固。

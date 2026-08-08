@@ -108,7 +108,7 @@ func TestBuildMatchesPythonOracleSemantics(t *testing.T) {
 		SceneID: "scene-id", CertifyID: "0123456789abcdef",
 		Dimensions: Dimensions{RenderedWidth: 300, HandleWidth: 40}, Track: oracleTrack(),
 		StaticPath: "3.29.0/pe.091.00665af58b020d81.js", ExpectedXPos: &expectedX,
-		InitBeginTimeMS: 1_999_999_994_250, FirstTouchAgeMS: 700,
+		InitBeginTimeMS: 1_999_999_994_250, FirstTouchAgeMS: 700, IncludeScreenInfo: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -141,17 +141,17 @@ func TestBuildMatchesPythonOracleSemantics(t *testing.T) {
 	}
 }
 
-func TestBuildUnknownArgUsesInjectedEntropyAndDefaults(t *testing.T) {
-	argumentBytes := []byte{1, 2, 3, 4}
+func TestBuildResolvedArgIsDeterministicAndUsesDefaults(t *testing.T) {
 	prefixBytes := make([]byte, 15)
 	for index := range prefixBytes {
 		prefixBytes[index] = byte(index)
 	}
-	entropy := &byteEntropy{data: append(append([]byte(nil), argumentBytes...), prefixBytes...)}
+	entropy := &byteEntropy{data: prefixBytes}
+	const argumentKey = "dmmlums5zuewlgt7"
 	result, err := builderWithEntropy(entropy, 10_000).Build(context.Background(), Input{
 		SceneID: "same", CertifyID: "same", Track: []track.Event{
 			{X: 0, DT: 0}, {X: 3, DT: 1}, {X: 3, DT: 1},
-		}, StaticPath: "unknown", InitBeginTimeMS: 5_000,
+		}, StaticPath: "3.29.0/pe.058.77d5c01b1737016e", ArgumentKey: argumentKey, InitBeginTimeMS: 5_000,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -160,10 +160,16 @@ func TestBuildUnknownArgUsesInjectedEntropyAndDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// CertifyID 是四字节，未知 arg 先消费同长度 CSPRNG。
-	wantArg := base64.StdEncoding.EncodeToString(argumentBytes)
+	transformed, err := protocol.Transform64([]byte("same"), argumentKey, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantArg := base64.StdEncoding.EncodeToString(transformed)
 	if decoded.Payload.Arg != wantArg {
 		t.Fatalf("unknown arg=%q", decoded.Payload.Arg)
+	}
+	if len(result.TrackKeys) != 10 || decoded.Payload.TrackList.SI != "" || strings.Contains(decoded.JSONText, `"si"`) {
+		t.Fatalf("current TrackList schema=%v json=%s", result.TrackKeys, decoded.JSONText)
 	}
 	if result.TargetFirstTouchAgeMS != defaultFirstTouchAgeMS || !result.DeviceGetterPlans[0].Arguments[0].EqualsSceneID {
 		t.Fatalf("defaults/getter: %+v", result)
@@ -177,9 +183,8 @@ func TestKnownArgumentTable(t *testing.T) {
 	if len(argKeys) != 21 {
 		t.Fatalf("arg key count=%d", len(argKeys))
 	}
-	failing := &byteEntropy{err: errors.New("entropy must not be used")}
 	for path := range argKeys {
-		argument, err := buildArgument("certify", path+".js", failing)
+		argument, err := buildArgument("certify", path+".js", "")
 		if err != nil || argument == "" {
 			t.Fatalf("known path %s: %q %v", path, argument, err)
 		}
@@ -225,16 +230,19 @@ func TestTrackAndRoundingValidation(t *testing.T) {
 	if _, _, err := normalizeTrack(tooLong); err == nil {
 		t.Fatal("513-event track accepted")
 	}
-	if _, err := buildTrackList([]eventRecord{{kind: "touchstart", text: "x"}, {kind: "touchmove", text: "x"}, {kind: "touchend", text: "x", x: -1, y: 1}}, device.ScreenProfile{}, 1, 1); err == nil {
+	if _, err := buildTrackList([]eventRecord{{kind: "touchstart", text: "x"}, {kind: "touchmove", text: "x"}, {kind: "touchend", text: "x", x: -1, y: 1}}, device.ScreenProfile{}, 1, 1, false); err == nil {
 		t.Fatal("negative RAF x accepted")
 	}
-	if _, err := buildTrackList([]eventRecord{{kind: "touchstart", text: "x"}, {kind: "touchmove", text: "x"}, {kind: "touchend", text: "x", x: 1, y: -1}}, device.ScreenProfile{}, 1, 1); err == nil {
+	if _, err := buildTrackList([]eventRecord{{kind: "touchstart", text: "x"}, {kind: "touchmove", text: "x"}, {kind: "touchend", text: "x", x: 1, y: -1}}, device.ScreenProfile{}, 1, 1, false); err == nil {
 		t.Fatal("negative RAF y accepted")
 	}
 }
 
 func TestBuilderErrors(t *testing.T) {
-	validInput := Input{SceneID: "s", CertifyID: "c", Track: oracleTrack(), InitBeginTimeMS: 5_000}
+	validInput := Input{
+		SceneID: "s", CertifyID: "c", Track: oracleTrack(), InitBeginTimeMS: 5_000,
+		StaticPath: "3.29.0/pe.091.00665af58b020d81",
+	}
 	validBuilder := builderWithEntropy(&byteEntropy{data: make([]byte, 100)}, 10_000)
 	//lint:ignore SA1012 此处故意传 nil，验证公共边界拒绝空 context。
 	if _, err := validBuilder.Build(nil, validInput); err == nil {
@@ -261,7 +269,9 @@ func TestBuilderErrors(t *testing.T) {
 		}
 	}
 	oldClockBuilder := builderWithEntropy(&byteEntropy{data: make([]byte, 100)}, 1)
-	if _, err := oldClockBuilder.Build(context.Background(), Input{SceneID: "s", CertifyID: "c", Track: oracleTrack()}); err == nil {
+	if _, err := oldClockBuilder.Build(context.Background(), Input{
+		SceneID: "s", CertifyID: "c", Track: oracleTrack(), StaticPath: "3.29.0/pe.091.00665af58b020d81",
+	}); err == nil {
 		t.Fatal("invalid logical clock accepted")
 	}
 	mismatch := 100
@@ -284,19 +294,14 @@ func TestBuilderErrors(t *testing.T) {
 	}
 	failingBuilder := builderWithEntropy(&byteEntropy{err: errors.New("entropy failure")}, 10_000)
 	if _, err := failingBuilder.Build(context.Background(), validInput); err == nil {
-		t.Fatal("unknown arg entropy failure ignored")
-	}
-	known := validInput
-	known.StaticPath = "3.29.0/pe.091.00665af58b020d81"
-	if _, err := failingBuilder.Build(context.Background(), known); err == nil {
 		t.Fatal("prefix entropy failure ignored")
 	}
 }
 
 func TestHelpersRejectEntropyFailureAndUnicodeLength(t *testing.T) {
 	failure := &byteEntropy{err: errors.New("boom")}
-	if _, err := buildArgument("c", "unknown", failure); err == nil {
-		t.Fatal("argument entropy failure ignored")
+	if _, err := buildArgument("c", "unknown", ""); !errors.Is(err, ErrUnsupportedPE) {
+		t.Fatalf("unknown argument path: %v", err)
 	}
 	if _, err := dataPrefix(failure); err == nil {
 		t.Fatal("prefix entropy failure ignored")

@@ -394,6 +394,19 @@ func (session *Session) InitialResult() (Result, error) {
 	return cloneResult(session.initial), nil
 }
 
+// PEDeviceConfig 返回本轮 Log1 解出的配置副本，供同一挑战的动态 PE VM 使用。
+// 它只在进程内传递，不得记录或跨会话缓存。
+func (session *Session) PEDeviceConfig() (protocol.DeviceConfig, error) {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.closed || !session.initialized || session.completed {
+		return protocol.DeviceConfig{}, errors.New("device session cannot provide PE config")
+	}
+	value := session.config
+	value.ExtraSegments = append([]string(nil), session.config.ExtraSegments...)
+	return value, nil
+}
+
 // TargetFirstTouchAgeMS 在本会话内首次生成后保持不变。
 func (session *Session) TargetFirstTouchAgeMS() (int, error) {
 	session.mu.Lock()

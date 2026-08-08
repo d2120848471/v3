@@ -2,7 +2,7 @@ Ali Slider Go Windows AMD64 便携版
 ==================================
 
 本程序是运行在本机的控制台 HTTP 服务，不是桌面图形应用，但内置浏览器 API 测试页。
-解压后可直接运行，无需安装 Go、Python、Node.js、OpenCV、VC++ Runtime 或第三方 DLL。
+包内已带 Node.js 24.14.1；解压后可直接运行，无需另装 Go、Python、Node.js、OpenCV 或 VC++ Runtime。
 系统要求：Windows 10 / Windows Server 2016 或更高版本，AMD64/x64 处理器。
 测试页需要现代 Edge、Chrome 或 Firefox，不支持 Internet Explorer。没有现代浏览器时，EXE 和 PowerShell/API 仍可使用。
 
@@ -12,7 +12,7 @@ Ali Slider Go Windows AMD64 便携版
 1. 仅限自有系统或获得明确授权的测试环境。
 2. 默认只监听 127.0.0.1:8000，不要改成 0.0.0.0 后直接暴露到公网或共享网络。
 3. 服务没有应用内鉴权，也不会按本机在途请求数主动返回 429；只能在受控机器和网络中运行。
-4. 默认启动会预热 32 个设备会话并访问外部 Device RPC。真实求解还需要访问 Captcha RPC 和图片 CDN。
+4. 默认启动会用包内 node.exe 预热 32 个设备 VM，并访问外部 Device RPC。真实求解还会逐挑战调用 node.exe 执行当前动态 PE，并访问 Captcha RPC、公开脚本和图片 CDN。公开 SDK/PE 源码及画像缓存 5 分钟，token、CertifyId、轨迹和 data 不跨轮复用。
 5. 失败或低置信样本可能写入 var\artifacts。请解压到当前用户的私有可写目录，不要放在 Web root、公共共享盘、多人共享目录或公开同步目录。
 6. Windows 文件权限继承解压目录的 NTFS ACL。不要把 var\artifacts、日志、token、certifyId、代理密码或完整响应发送给无关人员。
 7. 旧 GET query 会立即执行真实求解，不是 health 或只读页面。禁止在 URL 放入 AaduaneId 或含账号密码的 proxy。
@@ -123,7 +123,9 @@ Get-FileHash .\ali-slider-go.exe -Algorithm SHA256
 --------
 
 ali-slider-go.exe     Windows AMD64 控制台 HTTP 服务
+node.exe              Node.js 24.14.1，逐挑战设备与动态 PE 运行时
+NODE-LICENSE.txt      Node.js 发行版许可证
 start.bat             双击启动入口
 README-Windows.txt    本说明
-BUILD-INFO.txt        构建 commit、Go 版本和目标平台
+BUILD-INFO.txt        构建 commit、Go/Node 版本和目标平台
 SHA256SUMS.txt        包内文件完整性校验值

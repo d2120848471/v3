@@ -16,7 +16,7 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     && mkdir -p /runtime/var/artifacts \
     && chmod 0700 /runtime/var/artifacts
 
-FROM scratch
+FROM node:24.14.1-alpine
 
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/ali-slider-go /app/ali-slider-go
@@ -26,3 +26,4 @@ WORKDIR /app
 USER 65532:65532
 EXPOSE 8000
 ENTRYPOINT ["/app/ali-slider-go"]
+CMD []

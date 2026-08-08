@@ -1,16 +1,16 @@
 # 性能测试与容量口径
 
-> **验收结论**：Mac ARM64 纯计算 200 样本 nearest-rank `P99=57.05075ms`，满足 `<=100ms`。2026-08-07 唯一授权候选批次恰好 200 个新挑战、并发 32、每个 job 一次 Solve、应用层零重试，严格成功 `196/200`；Client 完整求解链墙钟 `P95=984ms`，满足 `<=1000ms`。本批 `P99=1018ms`、`max=1555ms`，因此 1 秒只可描述 P95，不能描述 P99 或全部调用；该 harness 不经过 HTTP Handler，不是 HTTP 端到端基准。该批先于最终传输 one-shot 加固，最终源码未获授权在线重跑。当前 HTTP Handler 不设本地 admission 或在途硬上限；64 并发直通仅验证合同，生产形态下无界增长的 goroutine、内存、超时堆积和长时间资源稳定性尚未压测。
+> **当前结论**：2026-08-08 恢复同挑战 Node Device VM 和当前动态 PE 后，单个新挑战以一次 Solve、零重试得到 `T001`，墙钟约 `1579ms`。样本数为 1，只证明功能恢复，不能计算当前 P95/P99 或成功率。原 Mac ARM64 纯 Go 200 样本 `P99=57.05075ms` 和 2026-08-07 Client `196/200`、`P95=984ms` 都属于旧的纯 Go/近似 PE 路径；它们保留为历史基线，不再视为当前生产路径的性能验收。当前 HTTP 端到端、Node VM 资源峰值和长时间稳定性仍待正式授权测量。
 
 ## 性能目标
 
 | 维度 | 冻结口径 | 性质 | 当前状态 |
 |---|---:|---|---|
-| 纯 Go 本地计算 P99 | `<=100 ms` | 硬门槛 | `57.05075ms`，通过 |
-| 热态直连 Client 完整求解链 P95 | `<=1000 ms` | 优化目标 | `984ms`，通过 |
+| 生产 Vision/Track/动态 PE 本地阶段 P99 | `<=100 ms` | 原硬门槛，需按新架构复核 | 未测；旧纯 Go oracle 路径 `57.05075ms` 不适用 |
+| 热态直连 Client 完整求解链 P95 | `<=1000 ms` | 优化目标 | 当前未测；单次功能 smoke `1579ms` 不是 P95 |
 | HTTP 同时在途挑战 | 无本地硬上限 | 服务合同 | 64 个并发合法请求全部进入 Solver；不是生产容量结论 |
 | Client 每 route/host 连接与预热预算 | `1..32` | 兼容配置边界 | `MaxConcurrency` 只约束出站 Transport 与预热资源，不是 HTTP admission |
-| 授权在线成功率 | `>=190/200` | 正确性门槛 | `196/200`（`98%`），通过 |
+| 授权在线成功率 | `>=190/200` | 正确性门槛 | 当前未测；`1/1 T001` 只作功能 smoke，历史旧路径为 `196/200` |
 
 `P95 <=1000 ms` 不表示每个请求都必须低于 1 秒。设备 RPC、Captcha Init/Verify、TLS、CDN、DNS 和代理均可能产生不可控尾延迟；报告必须同时给出分位数、失败分类和网络环境。
 
@@ -21,14 +21,15 @@
 | Key | 边界 | 主要内容 |
 |---|---|---|
 | `setup` | 请求校验后到客户端准备完成 | 画像选择、route/transport、设备与 Captcha client 构造 |
-| `deviceSession` | Lease/Open 开始到首枚 token 可用 | 预热命中，或冷建 Log1/2/3 |
+| `deviceSession` | Lease/Open 开始到首枚 token 可用 | 预热 Node VM 命中，或冷建同一 FeiLin VM 的 Log1/2/3 |
 | `init` | Captcha Init 请求往返 | InitCaptchaV3 |
+| `resolvePEKey` | Init 后到当前 PE 结构画像可用 | 5 分钟缓存命中，或公开 SDK/PE 下载与画像采样 |
 | `downloadAssets` | 两图下载整体墙钟 | 背景图和 shadow 并行下载 |
 | `downloadBackground` | 单图下载 | 背景图 |
 | `downloadShadow` | 单图下载 | shadow |
 | `vision` | 两张 PNG 到识别结果 | PNG 解码、缺口定位、置信度和几何 |
-| `buildVerifyData` | 轨迹到 PE data | 轨迹缩放、逻辑时钟、PE、Pack/Unpack 自检 |
-| `completeDevice` | 设备完成态 | getter/event、Verify token 和最终 Log2 |
+| `buildVerifyData` | 轨迹到 PE data | 启动当前动态 PE VM、逻辑时钟、原生 data/getter/events、Go Pack/Unpack 合同自检 |
+| `completeDevice` | 设备完成态 | 同一 FeiLin VM 事件回放/getter、Verify token 和最终 Log2 |
 | `verify` | Captcha Verify 请求往返 | 唯一一次 VerifyCaptchaV3 |
 | `clientCleanup` | release 开始到返回 | 关闭已消费会话并触发有界补货 |
 | `total` | `challenge.Solver.Solve` 墙钟 | 上述完整 Solver 生命周期 |
@@ -42,13 +43,13 @@
 | 指标 | 起点与终点 | 包含 | 不包含 |
 |---|---|---|---|
 | 视觉算法 | PNG bytes 进入 `vision.Solve` 到返回 | 解码、图像操作、fallback、坐标 | 轨迹、PE、网络 |
-| 纯计算链 | 已取得两张 PNG 到 PE/Data 构建与自检完成 | vision、track、PE data、协议编码/加密/自检 | Device Complete、Captcha Verify、其他网络与图片下载 |
+| 生产本地构建链 | 已取得两张 PNG 到动态 PE/Data 自检完成 | vision、track、Node PE VM、协议解包/合同自检 | Device Complete、Captcha Verify、其他网络与图片下载 |
 | Solver total | `challenge.Solver.Solve` 进入到清理完成 | 本地计算与全部上游等待 | HTTP parse/write 和客户端网络 |
 | 完整请求 | 负载发生器发出 HTTP 到读完 response | 服务 HTTP、Solver、上游等待 | 负载发生器准备数据的时间 |
 | 吞吐 | 窗口内完成响应数 / 墙钟秒数 | 成功、业务失败、技术失败分别计数 | 不能只统计成功响应 |
 | 在途并发 | 合法请求进入 `Solve` 到 Solver 返回 | Solver 运行及上游等待 | 跨源边界、JSON/query/字段校验在 Solver 前拒绝的请求；外层代理在到达本进程前拒绝的请求 |
 
-`internal/challenge/performance_test.go` 提供显式启用的 200 样本逐次纯计算 P99 门禁；普通 CI 跳过时钟硬断言。最终源码快照的 Mac ARM64 结果为 `P50=50.577458ms`、`P95=55.711708ms`、`P99=57.05075ms`、`max=60.337542ms`，达到硬门槛。它只使用固定困难 fixture，不包含任何网络阶段；扩展数据集和多轮重复仍可用于稳定性画像，但不能抹掉或夸大本次结论。
+`internal/challenge/performance_test.go` 仍提供显式启用的 200 样本纯 Go oracle/视觉回归。历史 Mac ARM64 结果为 `P50=50.577458ms`、`P95=55.711708ms`、`P99=57.05075ms`、`max=60.337542ms`；但该测试使用 fake PE resolver/旧本地 builder，不包含当前逐挑战 Node PE VM，因此只能继续作为视觉/纯 Go 回归，不能证明当前生产 `buildVerifyData` 的 P99。
 
 ## 统计定义
 
@@ -70,7 +71,7 @@ P(q) 的零基下标 = ceil(q × N) - 1
 - P95 是升序第 190 个样本。
 - P99 是升序第 198 个样本。
 
-本项目的纯计算门禁和唯一授权候选批次都使用 200 个逐次样本及 nearest-rank 口径。扩大到至少 10,000 个样本并重复多轮可作为性能稳定性画像，但不是把当前已通过结果改写成“未测”的理由；任何报告都禁止从平均值推算 P99。
+历史纯计算门禁和授权候选批次都使用 200 个逐次样本及 nearest-rank 口径。架构改变后必须对当前 Node production path 重新采样；任何报告都禁止从旧实现、单个 smoke 或平均值推算当前 P95/P99。
 
 ## 正式基准环境
 
@@ -126,7 +127,7 @@ GOMAXPROCS=16 go test ./internal/vision \
 
 预热失败会记录 warning，成功库存仍保留，后续请求可冷建兜底。不得把 Prime 失败隐藏为性能成功。
 
-## 纯计算 P99 方法
+## 历史纯 Go oracle P99 方法
 
 仓库内的开发期冒烟入口为：
 
@@ -136,7 +137,7 @@ ALI_SLIDER_PERF=1 GOMAXPROCS=16 \
   -run '^TestPureComputeP99$'
 ```
 
-该测试仅在声明的 `darwin/arm64` 基线执行，顺序采集 200 次 `Vision → Track → PE/Data`，按 nearest-rank 输出 P50/P95/P99/max，并断言 P99 不超过 100ms。最终验证结果为 `P99=57.05075ms`，判定通过；其他平台看到 `SKIP` 仍不能记作该平台通过。
+该测试仅在声明的 `darwin/arm64` 基线执行，顺序采集 200 次 `Vision → Track → fake/纯 Go PE/Data`，按 nearest-rank 输出 P50/P95/P99/max。历史结果 `P99=57.05075ms`；它不包含当前 Node PE VM，其他平台 `SKIP` 或该历史 PASS 都不能记作当前生产路径通过。
 
 扩展稳定性画像可按以下流程：
 
@@ -149,7 +150,7 @@ ALI_SLIDER_PERF=1 GOMAXPROCS=16 \
 7. 至少重复 5 轮；任一正式轮次 P99 超过 100 ms，则硬门槛失败。
 8. race detector 单独用于正确性，不把插桩后的耗时作为性能数据。
 
-当前 200 样本结果用于冻结的 Mac ARM64 纯计算硬门槛；扩展数据集和重复轮次用于评估跨样本、跨温度及跨机器稳定性。
+当前架构需新增包含 Node PE VM 的同口径 200 样本门禁；在此之前，旧 200 样本只用于纯 Go/视觉回归趋势。
 
 ## Mock Solver/HTTP 分层容量方法
 
@@ -164,9 +165,13 @@ ALI_SLIDER_PERF=1 GOMAXPROCS=16 \
 - 记录完成吞吐、P50/P95/P99/max、错误分类、goroutine、RSS 和 GC；外层代理 429 与第三方上游 429 分开归因。
 - 在 `-race` 下复跑状态正确性，但性能数字来自无 race 插桩版本。
 
-离线 `TestSolverOffline32ConcurrentSuccess` 证明状态隔离；唯一授权候选 Client harness 又以 32 并发完成 200 轮并形成短批次延迟报告。热构建缓存下，32 并发 Mock 五次包测试用时 `0.166–0.193s`，命令 wall `0.43–0.46s`，maxRSS `155.2–177.6MiB`；最终源码的 `200×32=6,400` 次完整离线 Solve 以 `32.27s`/maxRSS `242.2MiB` 通过。这是短时、含 Go 驱动进程的正向筛查，不是生产内存预算或绝对泄漏证明；生产形态的 GC、goroutine 峰值、持续吞吐和长时间稳定性仍待测。
+离线 `TestSolverOffline32ConcurrentSuccess` 证明状态隔离；历史 Client harness 以 32 并发完成 200 轮。热构建缓存下的 Mock 与 `200×32=6,400` 次离线 Solve 都使用 fake PE runtime，不启动 production Node VM；这些数字只证明 Go 编排和池状态，不是当前 Node 进程的吞吐、RSS 或泄漏证明。生产形态的 Node/Go RSS、GC、goroutine/进程峰值、持续吞吐和长时间稳定性仍待测。
 
 取消本地 HTTP admission 后，Handler goroutine 与已进入的 Solve 数可随来流增长；Transport 连接数和预热库存有界，并不能把 HTTP 在途数变成有界。当前尚未验证生产流量下请求堆积、上游连接等待、超时风暴、RSS/GC 峰值或进程耗尽边界，因此 64 并发回归不得写成“服务支持无界并发”或生产容量结论。需要保护生产实例时，应在外层反向代理、负载均衡或 API 网关配置容量与速率策略，并把其 429 单独统计。
+
+## 2026-08-08 当前功能 smoke
+
+当前修复快照只执行 1 个新挑战、并发 1、一次 Solve、零重试：严格成功 `1/1`，墙钟 `1579ms`。该数字证明 `T001` 功能合同，不是当前均值、P50、P95 或 P99；不得与 1 秒 P95 目标直接比较，也不得据此估算并发容量。
 
 ## 2026-08-07 授权在线历史批次
 
@@ -189,7 +194,7 @@ ALI_SLIDER_PERF=1 GOMAXPROCS=16 \
 | success wall P95 | `989ms` |
 | batch wall | 约 `6.16s` |
 
-成功率 `196/200 >=190/200`，Client 完整求解链墙钟 `P95=984ms <=1000ms`，两项冻结目标通过。`P99=1018ms` 明确高于 1 秒；项目没有 P99 小于 1 秒的目标或结论。本批 harness 不经过 HTTP Handler。
+当时的成功率 `196/200 >=190/200`，Client 完整求解链墙钟 `P95=984ms <=1000ms`，两项冻结目标通过。`P99=1018ms` 明确高于 1 秒；本批 harness 不经过 HTTP Handler，并使用后来证明缺失当前动态设备/PE 边界的实现，所以这些分位数只能作为历史对照。
 
 ## 优化优先级
 

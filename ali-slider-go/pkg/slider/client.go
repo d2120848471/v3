@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -13,6 +14,7 @@ import (
 	"github.com/d2120848471/v3/ali-slider-go/internal/challenge"
 	"github.com/d2120848471/v3/ali-slider-go/internal/config"
 	"github.com/d2120848471/v3/ali-slider-go/internal/device"
+	"github.com/d2120848471/v3/ali-slider-go/internal/pe"
 	"github.com/d2120848471/v3/ali-slider-go/internal/runtimekit"
 )
 
@@ -38,6 +40,7 @@ type ClientOptions struct {
 	AssetMaxPixels        int64
 	DevicePrewarmCapacity int
 	DeviceSessionMaxAge   time.Duration
+	PEKeyNodeBinary       string
 
 	defaultsResolved bool
 }
@@ -55,6 +58,7 @@ func DefaultClientOptions() ClientOptions {
 		AssetMaxBytes: defaults.AssetMaxBytes, AssetMaxDimension: defaults.AssetMaxDimension,
 		AssetMaxPixels: 16 << 20, DevicePrewarmCapacity: defaults.DevicePrewarmCapacity,
 		DeviceSessionMaxAge: challenge.DefaultDeviceSessionMaxAge,
+		PEKeyNodeBinary:     defaults.PEKeyNodeBinary,
 		defaultsResolved:    true,
 	}
 }
@@ -64,7 +68,7 @@ type challengeSolver interface {
 }
 
 // Client 可被多个 goroutine 并发复用。每次 Solve 仍持有独立挑战、设备与
-// Verify 尝试位；共享的只有连接池、密码学熵、只读画像和可选预热池。
+// Verify 尝试位；共享连接池、密码学熵、只读画像、公开 PE 脚本/画像缓存和可选预热池。
 type Client struct {
 	options    ClientOptions
 	solver     challengeSolver
@@ -79,7 +83,8 @@ type Client struct {
 	closeDone chan struct{}
 }
 
-// NewClient 创建纯 Go Client，不发外部请求。需要启动预热时显式调用 Prime。
+// NewClient 创建 Go Client，不发外部请求或启动子进程。需要启动预热时显式调用 Prime；
+// Node 设备运行时按挑战启动；公开 SDK/PE 源码和结构画像在进程内复用五分钟。
 func NewClient(options ClientOptions) (*Client, error) {
 	if !options.defaultsResolved {
 		options = fillClientDefaults(options)
@@ -103,9 +108,9 @@ func NewClient(options ClientOptions) (*Client, error) {
 		Entropy: sources.Entropy,
 	}
 
+	peRuntime := pe.NewKeyResolver(options.PEKeyNodeBinary)
 	var fixedProfile *device.Profile
 	var devicePool *challenge.DeviceSessionPool
-	var leaseDevice challenge.DeviceLeaseFunc
 	if options.DevicePrewarmCapacity > 0 {
 		profile, profileErr := device.GenerateProfile(sources.Entropy)
 		if profileErr != nil {
@@ -114,22 +119,46 @@ func NewClient(options ClientOptions) (*Client, error) {
 		}
 		fixedProfile = &profile
 		deviceOptions := productionDeviceOptions(options, profile, sources)
-		deviceClient, clientErr := device.NewClient(deviceOptions, directTransport)
-		if clientErr != nil {
-			transports.CloseIdleConnections()
-			return nil, clientErr
+		poolOpen := func(ctx context.Context) (challenge.DeviceSession, error) {
+			return peRuntime.OpenDevice(ctx, directTransport, profile, pe.DeviceRuntimeOptions{
+				Prefix: options.DefaultPrefix, Region: "cn", Timeout: options.Timeout,
+				GatherCostMin: options.GatherCostMin, GatherCostMax: options.GatherCostMax,
+				FirstTouchAgeMin: options.FirstTouchAgeMin, FirstTouchAgeMax: options.FirstTouchAgeMax,
+				Sources: sources,
+			})
 		}
-		devicePool, err = challenge.NewDeviceSessionPool(
+		devicePool, err = challenge.NewRuntimeDeviceSessionPool(
 			options.DevicePrewarmCapacity, options.DeviceSessionMaxAge,
-			challenge.DevicePoolKeyFrom(deviceOptions, ""), deviceClient.Open,
+			challenge.DevicePoolKeyFrom(deviceOptions, ""), poolOpen,
 		)
 		if err != nil {
 			transports.CloseIdleConnections()
 			return nil, err
 		}
-		leaseDevice = func(ctx context.Context, key challenge.DevicePoolKey, client *device.Client) (*device.Session, func(), error) {
-			return devicePool.Lease(ctx, key, client.Open)
+	}
+	openDevice := func(ctx context.Context, transport http.RoundTripper, profile device.Profile, request challenge.SolveRequest) (challenge.DeviceSession, func(), error) {
+		opener := func(openContext context.Context) (challenge.DeviceSession, error) {
+			return peRuntime.OpenDevice(openContext, transport, profile, pe.DeviceRuntimeOptions{
+				Prefix: request.Prefix, Region: "cn", Proxy: request.Proxy, Timeout: options.Timeout,
+				GatherCostMin: options.GatherCostMin, GatherCostMax: options.GatherCostMax,
+				FirstTouchAgeMin: options.FirstTouchAgeMin, FirstTouchAgeMax: options.FirstTouchAgeMax,
+				Sources: sources,
+			})
 		}
+		deviceOptions := productionDeviceOptions(options, profile, sources)
+		deviceOptions.Prefix = request.Prefix
+		if devicePool != nil {
+			return devicePool.LeaseRuntime(ctx, challenge.DevicePoolKeyFrom(deviceOptions, request.Proxy), opener)
+		}
+		session, openErr := opener(ctx)
+		if openErr != nil || session == nil {
+			if session != nil {
+				session.Close()
+			}
+			return nil, nil, openErr
+		}
+		var releaseOnce sync.Once
+		return session, func() { releaseOnce.Do(session.Close) }, nil
 	}
 
 	getTransport := func(proxy string) (http.RoundTripper, bool, error) {
@@ -142,7 +171,8 @@ func NewClient(options ClientOptions) (*Client, error) {
 		FirstTouchAgeMin: options.FirstTouchAgeMin, FirstTouchAgeMax: options.FirstTouchAgeMax,
 		AssetMaxBytes: options.AssetMaxBytes, AssetMaxDimension: options.AssetMaxDimension,
 		AssetMaxPixels: options.AssetMaxPixels, Sources: sources, GetTransport: getTransport,
-		Artifacts: &store, FixedProfile: fixedProfile, LeaseDevice: leaseDevice,
+		Artifacts: &store, FixedProfile: fixedProfile, OpenDevice: openDevice,
+		PEKeys: peRuntime,
 	})
 	if err != nil {
 		if devicePool != nil {
@@ -288,6 +318,9 @@ func fillClientDefaults(options ClientOptions) ClientOptions {
 	if options.DeviceSessionMaxAge == 0 {
 		options.DeviceSessionMaxAge = defaults.DeviceSessionMaxAge
 	}
+	if options.PEKeyNodeBinary == "" {
+		options.PEKeyNodeBinary = defaults.PEKeyNodeBinary
+	}
 	return options
 }
 
@@ -315,6 +348,9 @@ func validateClientOptions(options ClientOptions) error {
 	}
 	if options.DevicePrewarmCapacity < 0 || options.DevicePrewarmCapacity > options.MaxConcurrency || options.DeviceSessionMaxAge <= 0 {
 		return errors.New("device prewarm settings are invalid")
+	}
+	if options.PEKeyNodeBinary == "" || len(options.PEKeyNodeBinary) > 4_096 || strings.ContainsRune(options.PEKeyNodeBinary, 0) || !utf8.ValidString(options.PEKeyNodeBinary) {
+		return errors.New("PE runtime Node binary must contain 1..4096 valid UTF-8 bytes")
 	}
 	return nil
 }

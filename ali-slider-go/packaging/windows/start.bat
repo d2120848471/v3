@@ -11,6 +11,13 @@ if not exist "ali-slider-go.exe" (
   exit /b 1
 )
 
+if not exist "node.exe" (
+  echo 错误：当前目录没有设备与动态 PE 运行所需的 node.exe。
+  echo 请重新下载并完整解压便携包。
+  pause
+  exit /b 1
+)
+
 echo Ali Slider Go 正在启动。
 echo 默认 API 测试页：http://127.0.0.1:8000/
 echo 默认本机 API：http://127.0.0.1:8000/api/slider
@@ -24,6 +31,7 @@ echo.
   --host=127.0.0.1 ^
   --port=8000 ^
   "--artifact-dir=%~dp0var\artifacts" ^
+  "--pe-key-node=%~dp0node.exe" ^
   %*
 
 set "exit_code=%ERRORLEVEL%"

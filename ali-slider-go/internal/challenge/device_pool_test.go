@@ -10,7 +10,20 @@ import (
 	"time"
 
 	"github.com/d2120848471/v3/ali-slider-go/internal/device"
+	"github.com/d2120848471/v3/ali-slider-go/internal/protocol"
 )
+
+type poolRuntimeSession struct{ closes *atomic.Int32 }
+
+func (*poolRuntimeSession) InitToken() (string, error) { return "token", nil }
+func (*poolRuntimeSession) PEDeviceConfig() (protocol.DeviceConfig, error) {
+	return protocol.DeviceConfig{Key: "0123456789abcdef", SessionID: "session"}, nil
+}
+func (*poolRuntimeSession) TargetFirstTouchAgeMS() (int, error) { return 700, nil }
+func (*poolRuntimeSession) Complete(context.Context, string, []device.InteractionEvent, int) (device.Result, error) {
+	return device.Result{}, nil
+}
+func (session *poolRuntimeSession) Close() { session.closes.Add(1) }
 
 type poolTestOpener struct {
 	calls     atomic.Int32
@@ -1012,5 +1025,44 @@ func TestNilDeviceSessionPoolFallsBackToColdOpen(t *testing.T) {
 	pool.Close()
 	if opener.calls.Load() != 1 {
 		t.Fatalf("nil pool cold calls=%d", opener.calls.Load())
+	}
+}
+
+func TestRuntimeDeviceSessionPoolPreservesInterfaceSessionLifecycle(t *testing.T) {
+	key := poolTestKey("", "runtime-profile")
+	var opens atomic.Int32
+	var closes atomic.Int32
+	opener := func(context.Context) (DeviceSession, error) {
+		opens.Add(1)
+		return &poolRuntimeSession{closes: &closes}, nil
+	}
+	pool, err := NewRuntimeDeviceSessionPool(1, time.Second, key, opener)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.Prime(context.Background()); err != nil {
+		pool.Close()
+		t.Fatal(err)
+	}
+	session, release, err := pool.LeaseRuntime(context.Background(), key, func(context.Context) (DeviceSession, error) {
+		return nil, errors.New("unexpected cold open")
+	})
+	if err != nil {
+		pool.Close()
+		t.Fatal(err)
+	}
+	if _, ok := session.(*poolRuntimeSession); !ok {
+		pool.Close()
+		t.Fatalf("runtime session type=%T", session)
+	}
+	release()
+	release()
+	waitForPool(t, "runtime refill", func() bool {
+		ready, pending, leased, _ := poolCounts(pool)
+		return ready == 1 && pending == 0 && leased == 0 && opens.Load() == 2
+	})
+	pool.Close()
+	if closes.Load() != 2 {
+		t.Fatalf("runtime session closes=%d, want 2", closes.Load())
 	}
 }

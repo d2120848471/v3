@@ -1,21 +1,21 @@
 # Ali Slider Go
 
-`ali-slider-go` 是原 Python 实现的独立纯 Go 重写：单一静态二进制内完成设备会话、Captcha Init、图片下载、缺口识别、轨迹/PE 数据构造和唯一一次 Verify。旧 Python 实现已从当前工作树删除；审计或回滚时可从 Git 历史提交 `0509bfd` 恢复。Go module 内只保留不含可执行 Python 的脱敏静态回归 fixture。
+`ali-slider-go` 是原 Python 实现的 Go 重写：Go 主进程负责编排、RPC、图片下载、缺口识别、轨迹和唯一一次 Verify；Node.js 24 在每轮挑战中执行当前公开 SDK/动态 PE。设备侧从 Init 到 Complete 保持同一个 FeiLin VM，PE 侧按本轮 `StaticPath`、`CertifyId`、轨迹、时钟和 DeviceConfig 原生生成 `data`。公开 SDK/PE 源码及结构画像缓存 5 分钟，挑战级 token、`CertifyId`、轨迹和 `data` 不跨轮复用。旧 Python 实现已从当前工作树删除；审计或回滚时可从 Git 历史提交 `0509bfd` 恢复。
 
 > 仅限自有系统或获得明确授权的测试环境。服务没有应用内鉴权，默认只监听 `127.0.0.1:8000`；不要把未加保护的端口暴露到公网。
 
 ## 已实现能力
 
-- 严格纯 Go：服务端求解、自动化测试、Linux/Windows 构建和容器不依赖 Python、Node.js、浏览器、OpenCV、GoCV、CGo、第三方动态库或子进程；内嵌测试页只需系统现有的现代浏览器。
+- Go 主链不依赖 Python、浏览器、OpenCV、GoCV 或 CGo。Node.js 24 是设备指纹与动态 PE 的逐挑战运行时；Docker 镜像和 Windows 便携包均携带固定版本 `24.14.1`。
 - 对外只提供 reusable Go library 和四个 HTTP 路径：`GET /` 内嵌 API 测试页、`GET|POST /api/slider`、`GET /health`、`GET /openapi.json`；Solve 的 GET 仅作为已废弃的旧 Python query 兼容入口。
 - 每个 `CertifyId` 最多尝试一次 Verify；网络结果未知也不重试。
 - 通过浏览器跨源与输入校验的 GET/POST Solve 请求直接进入 Solver；HTTP 层不设置本地 admission gate，也不因在途请求数主动返回 `429` 或 `Retry-After`。
-- HTTP(S)、SOCKS4、SOCKS5、SOCKS5H 代理；同一轮设备、Init、图片与 Verify 固定同一路由。
-- 双图并发下载、纯 Go 视觉、PE/DeviceToken、可选设备会话预热和共享连接池。
+- HTTP(S)、SOCKS4、SOCKS5、SOCKS5H 代理；同一轮 Node 设备会话、Init、公开脚本、图片与 Verify 固定同一路由。
+- 双图并发下载、纯 Go 视觉、动态 PE 原生执行、PE/DeviceToken 合同自检、可选设备会话预热和共享连接池。
 - 失败/低置信图片与脱敏指标私有落盘；服务启动时及每小时清理，library 调用方负责定期调用 `PurgeArtifacts`，默认保留 7 天；成功路径不落图。
 - 普通文本日志只记录事件、trace、状态和耗时，不记录 token、`CertifyId`、代理凭据或原始正文。
 
-当前验证快照：全项目统一覆盖率在重复运行中为 `83.1–83.2%`，稳定高于 `>=80%` 门槛；protocol `91.4%`（含 fuzz seeds），vision `91.9%`，PE `95.1%`。Go 1.26.5 下 race、vet、staticcheck、govulncheck、Linux AMD64 静态交叉构建及 Docker 非 root `/health` smoke 均通过。Device Log1/2/3 在线探针通过，耗时约 `0.53s`；Mac ARM64 纯计算 200 样本 nearest-rank `P50=50.577458ms`、`P95=55.711708ms`、`P99=57.05075ms`、`max=60.337542ms`，满足 `P99<=100ms` 硬门槛。
+当前验证快照：全项目统一语句覆盖率 `81.9%`，高于 `>=80%` 门槛；protocol `91.4%`（含 fuzz seeds），vision `91.9%`，PE `80.9%`。Go 1.26.5 下全量 test/race、vet、staticcheck、govulncheck、Linux AMD64/ARM64 与 Windows AMD64 交叉构建及 Docker 非 root `/health` smoke 均通过。当前公开 SDK/PE 的完整 Device 组件探针约 `0.85s` 通过，完成态为 142 个指纹字段、4 个请求。Mac ARM64 纯 Go/视觉 200 样本 `P99=57.05075ms` 及 2026-08-07 在线批次都属于旧近似 PE 路径，只保留为历史基线；当前 Node 生产链的正式成功率和性能仍需重新授权测量。
 
 2026-08-07 唯一授权候选批次已按冻结上限一次性完成：harness 直接调用 `pkg/slider.Client.Solve`，恰好处理 200 个新挑战、并发 32、每个 job 一次 Solve、应用层零重试；严格成功 `196`、业务失败 `3`、`VisionError=1`、网络错误 `0`，成功率 `98%`。Client 完整求解链墙钟 `P50=816ms`、`P95=984ms`、`P99=1018ms`、`max=1555ms`，成功样本墙钟 `P95=989ms`，整批约 `6.16s`。该候选批次达到 `>=190/200` 和 Client 完整链 `P95<=1000ms`；1 秒是 P95 目标，不是 P99 或最大耗时保证。该批不经过 HTTP Handler，不能作为 HTTP 端到端 P95 证据。
 
@@ -27,11 +27,11 @@
 
 不安装开发环境即可使用：在 GitHub **Actions** 的 `ali-slider-go-ci` 最新成功运行中下载 `ali-slider-go-windows-amd64.zip`，完整解压后双击 `start.bat`，等待 `event=listen status=ready`。
 
-这是本机控制台 HTTP 服务，不是桌面 GUI；服务内置浏览器 API 测试页。包内包含独立 EXE、中文说明、构建信息和 SHA-256；支持 Windows 10 / Windows Server 2016 或更高版本的 AMD64/x64 机器，默认监听 `127.0.0.1:8000`。测试页需现代 Edge、Chrome 或 Firefox；没有现代浏览器时 EXE 和 PowerShell/API 仍可用。完整下载、运行、SmartScreen 和 NTFS ACL 说明见 [Windows AMD64 便携包](docs/windows.md)。
+这是本机控制台 HTTP 服务，不是桌面 GUI；服务内置浏览器 API 测试页。包内包含 Go 服务 EXE、Node 24.14.1 运行时及许可证、中文说明、构建信息和 SHA-256；支持 Windows 10 / Windows Server 2016 或更高版本的 AMD64/x64 机器，默认监听 `127.0.0.1:8000`。测试页需现代 Edge、Chrome 或 Firefox；没有现代浏览器时 EXE 和 PowerShell/API 仍可用。完整下载、运行、SmartScreen 和 NTFS ACL 说明见 [Windows AMD64 便携包](docs/windows.md)。
 
 ### 源码运行
 
-要求 Go `1.26.5` 或更高的兼容补丁版本。
+要求 Go `1.26.5` 或更高的兼容补丁版本，以及 Node.js `24.14.1`。每轮求解都会使用 Node；若使用 Docker 或 Windows 便携包，无需另行安装。
 
 ```bash
 cd ali-slider-go
@@ -117,7 +117,7 @@ func main() {
 }
 ```
 
-`Client` 可并发复用；每次 `Solve` 的挑战、token、图片、轨迹和 Verify 状态独立。`Close` 会拒绝新工作、等待正在执行的调用返回，再关闭设备会话与连接池。
+`Client` 可并发复用；每次 `Solve` 的挑战、token、图片、轨迹、PE data 和 Verify 状态独立。`Close` 会拒绝新工作、等待正在执行的调用返回，再关闭 Node 设备会话与连接池。
 
 ## 配置
 
@@ -129,12 +129,15 @@ go run ./cmd/server \
   --port=8000 \
   --max-concurrency=32 \
   --timeout=25s \
-  --device-prewarm=32
+  --device-prewarm=32 \
+  --pe-key-node=node
 ```
 
 `--max-concurrency` 是兼容旧配置名，只限定 Client 每个 route/host 的出站连接数，并作为设备会话预热资源预算；它不限制 HTTP 在途请求数，也不会触发本地 `429`。`--device-prewarm` 必须位于 `0..max-concurrency`。
 
-预热会把设备 Log1/2/3 移出请求关键路径，但启动时会产生对应外部请求，并固定进程画像；设置 `--device-prewarm=0` 可完全关闭。所有参数、环境变量与边界见 [docs/configuration.md](docs/configuration.md)。
+预热会提前建立含 Node/FeiLin VM 的设备 Log1/2/3 会话，但启动时会产生对应外部请求，并固定进程画像。预热会话默认最多空闲 20 秒且一次性消费，不会把 DeviceToken 缓存几分钟；设置 `--device-prewarm=0` 可完全关闭。所有参数、环境变量与边界见 [docs/configuration.md](docs/configuration.md)。
+
+`--pe-key-node` 是为兼容既有配置保留的名称，实际指向整个设备/PE Node 运行时。服务通过同一路由访问严格 HTTPS 白名单内的公开 SDK/PE；公开源码及精确 `StaticPath` 结构画像缓存 5 分钟。每轮仍新建或租用短龄设备 VM，并用本轮 `CertifyId`、DeviceConfig、轨迹和时钟运行当前 PE，因此不是把设备或 `data` 写死。
 
 ## Docker
 
@@ -153,7 +156,7 @@ docker run --rm \
   ali-slider-go:local
 ```
 
-镜像使用非 root UID/GID `65532`、`scratch` 运行层、Go 1.26.5 构建层和静态二进制。当前 Linux AMD64 镜像构建及关闭预热后的非 root `/health` smoke 已验证通过；复现方式见 [docs/testing.md](docs/testing.md)。
+镜像使用非 root UID/GID `65532`、Node `24.14.1` Alpine 运行层、Go 1.26.5 构建层和 `CGO_ENABLED=0` 的 Go 二进制。Node 运行层保证每轮设备/PE 执行不会因宿主缺少运行时而失败；复现方式见 [docs/testing.md](docs/testing.md)。
 
 ## 质量门禁
 
@@ -182,7 +185,7 @@ ali-slider-go/
 ├── internal/server/       HTTP、内嵌测试页、OpenAPI、输入校验、trace 与 timeout
 ├── internal/challenge/    完整编排、Captcha RPC、下载、transport、预热池
 ├── internal/device/       画像、指纹、Log1/2/3、DeviceToken 会话
-├── internal/pe/           纯 Go PE data 构造与自检
+├── internal/pe/           动态 PE/设备 Node 运行时、脚本缓存与独立合同自检
 ├── internal/protocol/     编码、签名、AES、token、data codec
 ├── internal/vision/       PNG 安全解码与缺口识别
 ├── internal/track/        嵌入轨迹、缩放与扰动
@@ -210,9 +213,10 @@ ali-slider-go/
 
 ## 验收边界
 
-- 纯本地计算硬门槛：Mac ARM64、200 样本 nearest-rank `P99=57.05075ms`，已满足 `P99<=100ms`；benchmark 均值不能替代该分位数结果。
-- 热态、直连、无排队 Client 完整求解链：候选批次墙钟 `P95=984ms`，达到 `P95<=1000ms`；`P99=1018ms`、`max=1555ms`，不得声称所有调用或 P99 均小于 1 秒，也不得改写成 HTTP 端到端 P95 已通过。
-- 2026-08-07 授权在线候选批次：恰好 200 个新挑战、并发 32、每个 job 一次 Solve、应用层零重试，严格成功 `196/200`，成功率 `98%`，门槛通过；one-shot 加固后的最终源码未获授权再跑第二批。
-- 普通单测、CI、Docker 构建都不得运行该在线批次。
+- 历史纯 Go/视觉计算基线：Mac ARM64、200 样本 nearest-rank `P99=57.05075ms`，当时满足 `P99<=100ms`；该测试不包含当前逐挑战 Node PE VM，不能作为当前生产链性能结论。
+- 历史热态、直连、无排队 Client 完整链：2026-08-07 旧近似 PE 路径墙钟 `P95=984ms`、`P99=1018ms`、`max=1555ms`；不得改写成当前架构或 HTTP 端到端 P95 已通过。
+- 2026-08-07 历史授权候选批次：恰好 200 个新挑战、并发 32、每个 job 一次 Solve、应用层零重试，严格成功 `196/200`。这些数字属于后来证明缺少动态 Device/PE 边界的实现，只保留作对照。
+- 2026-08-08 针对当前动态 PE 修复快照执行了 1 个新挑战、一次 Solve、零重试，得到 `T001`、`VerifyResult=true` 和非空 token；该单次 smoke 只证明当前 Device/PE 合同恢复，不构成成功率或性能报告。
+- 普通单测、CI、Docker 构建都不得运行挑战批次；公开 CDN/Device 组件探针也必须用独立环境变量显式启用。
 
-2026-08-07 的短批次已证明冻结的成功率和 Client 完整链 P95 目标；同等 32 路 Client harness 的 RSS、GC、goroutine 峰值及长时间稳定性压测仍未完成，不得从约 6.16 秒的批次或离线 Mock 测试外推长期容量，也不得把并发 32 解释为 HTTP admission 上限。
+2026-08-07 的短批次只证明旧实现当时达到冻结的成功率和 Client 完整链 P95 目标；当前 Node Device/PE 架构仍缺正式成功率、P95/P99、RSS、GC、goroutine/进程峰值及长时间稳定性报告。不得从历史约 6.16 秒批次或离线 Mock 外推当前容量，也不得把并发 32 解释为 HTTP admission 上限。

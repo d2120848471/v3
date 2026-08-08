@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/d2120848471/v3/ali-slider-go/internal/artifact"
+	"github.com/d2120848471/v3/ali-slider-go/internal/device"
+	"github.com/d2120848471/v3/ali-slider-go/internal/pe"
 	"github.com/d2120848471/v3/ali-slider-go/internal/protocol"
 	"github.com/d2120848471/v3/ali-slider-go/internal/runtimekit"
 )
@@ -79,6 +81,7 @@ type solverTransport struct {
 	initMalformed   bool
 	verifyMalformed bool
 	deviceMalformed bool
+	staticPath      string
 }
 
 func newSolverTransport(t *testing.T, fixture string) *solverTransport {
@@ -134,10 +137,14 @@ func (transport *solverTransport) RoundTrip(request *http.Request) (*http.Respon
 		if transport.initMalformed {
 			return solverResponse(request, http.StatusOK, []byte(`{"Success":`)), nil
 		}
+		staticPath := transport.staticPath
+		if staticPath == "" {
+			staticPath = "3.29.0/pe.091.00665af58b020d81.js"
+		}
 		return solverJSONResponse(request, map[string]any{
 			"Success": true, "Code": "Success", "CertifyId": identifier,
 			"Image": "fixtures/back.png", "PuzzleImage": "fixtures/shadow.png",
-			"StaticPath": "3.29.0/pe.091.00665af58b020d81.js", "CaptchaType": "slider",
+			"StaticPath": staticPath, "CaptchaType": "slider",
 		})
 	case "VerifyCaptchaV3":
 		transport.mu.Lock()
@@ -211,7 +218,16 @@ func newIntegrationSolver(t *testing.T, transport *solverTransport, minimumConfi
 }
 
 func newIntegrationSolverWithTimeout(t *testing.T, transport *solverTransport, minimumConfidence float64, timeout time.Duration) (*Solver, string) {
+	return newIntegrationSolverWithPEKeys(t, transport, minimumConfidence, timeout, nil)
+}
+
+func newIntegrationSolverWithPEKeys(t *testing.T, transport *solverTransport, minimumConfidence float64, timeout time.Duration, peKeys PEKeyResolver) (*Solver, string) {
 	t.Helper()
+	if peKeys == nil {
+		peKeys = &staticPEKeyResolver{profile: pe.RuntimeProfile{
+			ArgumentKey: "0kd8i0mclivjow32", IncludeScreenInfo: true,
+		}}
+	}
 	artifactDirectory := filepath.Join(t.TempDir(), "artifacts")
 	sources := runtimekit.Sources{Clock: transport.clock, Entropy: &byteEntropy{}}
 	store := &artifact.Store{Directory: artifactDirectory, Retention: 7 * 24 * time.Hour, Entropy: sources.Entropy, Now: transport.clock.Now}
@@ -219,13 +235,61 @@ func newIntegrationSolverWithTimeout(t *testing.T, transport *solverTransport, m
 		Timeout: timeout, MinimumConfidence: minimumConfidence,
 		GatherCostMin: 180, GatherCostMax: 260, FirstTouchAgeMin: 650, FirstTouchAgeMax: 850,
 		AssetMaxBytes: 8 << 20, AssetMaxDimension: 16_384, AssetMaxPixels: 16 << 20,
-		Sources: sources, Artifacts: store,
+		Sources: sources, Artifacts: store, PEKeys: peKeys,
 		GetTransport: func(string) (http.RoundTripper, bool, error) { return transport, false, nil },
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return solver, artifactDirectory
+}
+
+type staticPEKeyResolver struct {
+	mu      sync.Mutex
+	profile pe.RuntimeProfile
+	err     error
+	paths   []string
+}
+
+func (resolver *staticPEKeyResolver) Resolve(_ context.Context, _ http.RoundTripper, _ device.Profile, staticPath string) (pe.RuntimeProfile, error) {
+	resolver.mu.Lock()
+	resolver.paths = append(resolver.paths, staticPath)
+	resolver.mu.Unlock()
+	return resolver.profile, resolver.err
+}
+
+func (resolver *staticPEKeyResolver) Build(_ context.Context, _ http.RoundTripper, _ device.Profile, _ string, input pe.RuntimeInput) (pe.Result, error) {
+	if resolver.err != nil {
+		return pe.Result{}, resolver.err
+	}
+	if len(input.Track) < 3 || input.DeviceConfig.SessionID == "" {
+		return pe.Result{}, errors.New("invalid fixture PE runtime input")
+	}
+	elapsed := input.FirstTouchAgeMS
+	interactions := make([]pe.InteractionEvent, len(input.Track))
+	for index, event := range input.Track {
+		elapsed += event.DT
+		interactions[index] = pe.InteractionEvent{
+			Type: "mousemove", X: float64(94 + event.X), Y: float64(548 + event.Y),
+			TimeStamp: float64(elapsed), IsTrusted: true,
+		}
+	}
+	slidePos := input.Track[len(input.Track)-1].X
+	trackStart := input.InitBeginTimeMS - int64(elapsed) - 750
+	argument := pe.GetterArgument{
+		ValueType: "string", Length: len(input.CertifyID), Value: input.CertifyID,
+		EqualsCertifyID: true, EqualsSceneID: input.CertifyID == input.SceneID,
+	}
+	return pe.Result{
+		Data: "fixture-native-data", TrackEventCount: len(input.Track),
+		XPos: *input.ExpectedXPos, SlidePos: slidePos,
+		TrackStartTimeMS: trackStart, VerifyTimeMS: trackStart + int64(elapsed),
+		DeviceGetterPlans: []pe.GetterPlan{{
+			Owner: "z_um", DerivedAtMS: float64(elapsed), ArgumentCount: 1,
+			Arguments: []pe.GetterArgument{argument},
+		}},
+		InteractionEvents: interactions,
+	}, nil
 }
 
 func TestSolverOfflineCompleteSuccess(t *testing.T) {
@@ -238,7 +302,7 @@ func TestSolverOfflineCompleteSuccess(t *testing.T) {
 	if !outcome.OK || !outcome.VerifyResult || outcome.VerifyCode != "T001" || outcome.SecurityToken == "" || outcome.CertifyID == "" {
 		t.Fatalf("outcome=%+v", outcome)
 	}
-	for _, stage := range []string{"setup", "deviceSession", "init", "downloadAssets", "vision", "buildVerifyData", "completeDevice", "verify", "clientCleanup", "total"} {
+	for _, stage := range []string{"setup", "deviceSession", "init", "resolvePEKey", "downloadAssets", "vision", "buildVerifyData", "completeDevice", "verify", "clientCleanup", "total"} {
 		if _, ok := outcome.TimingsMS[stage]; !ok {
 			t.Errorf("missing timing %q", stage)
 		}
@@ -252,6 +316,58 @@ func TestSolverOfflineCompleteSuccess(t *testing.T) {
 	}
 	if entries, err := os.ReadDir(artifactDirectory); !errors.Is(err, os.ErrNotExist) && (err != nil || len(entries) != 0) {
 		t.Fatalf("success wrote artifacts: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestSolverUsesResolvedDynamicPEKey(t *testing.T) {
+	transport := newSolverTransport(t, "gap")
+	transport.staticPath = "3.29.0/pe.058.77d5c01b1737016e.js"
+	resolver := &staticPEKeyResolver{profile: pe.RuntimeProfile{ArgumentKey: "dmmlums5zuewlgt7"}}
+	solver, _ := newIntegrationSolverWithPEKeys(t, transport, 0.45, 5*time.Second, resolver)
+	outcome, err := solver.Solve(context.Background(), SolveRequest{SceneID: "scene", Prefix: "prefix1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !outcome.OK || outcome.VerifyCode != "T001" {
+		t.Fatalf("outcome=%+v", outcome)
+	}
+	resolver.mu.Lock()
+	paths := append([]string(nil), resolver.paths...)
+	resolver.mu.Unlock()
+	if len(paths) != 1 || paths[0] != transport.staticPath {
+		t.Fatalf("resolved paths=%v", paths)
+	}
+}
+
+func TestSolverClassifiesPEKeyFailuresBeforeAssetsAndVerify(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		kind FailureKind
+	}{
+		{name: "network", err: pe.ErrKeyNetwork, kind: FailureNetwork},
+		{name: "runtime", err: pe.ErrKeyRuntime, kind: FailureInternal},
+		{name: "unsupported", err: pe.ErrUnsupportedPE, kind: FailureProtocol},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			transport := newSolverTransport(t, "gap")
+			transport.staticPath = "3.29.0/pe.058.77d5c01b1737016e.js"
+			resolver := &staticPEKeyResolver{err: test.err}
+			solver, _ := newIntegrationSolverWithPEKeys(t, transport, 0.45, 5*time.Second, resolver)
+			_, err := solver.Solve(context.Background(), SolveRequest{SceneID: "scene", Prefix: "prefix1"})
+			var failure *Failure
+			if !errors.As(err, &failure) || failure.Kind != test.kind || failure.Stage != "resolvePEKey" {
+				t.Fatalf("error=%v", err)
+			}
+			transport.mu.Lock()
+			verifyCount := transport.verifyCount
+			actions := append([]string(nil), transport.deviceActions...)
+			transport.mu.Unlock()
+			if verifyCount != 0 || strings.Join(actions, ",") != "Log1,Log2,Log3" {
+				t.Fatalf("verify=%d actions=%v", verifyCount, actions)
+			}
+		})
 	}
 }
 

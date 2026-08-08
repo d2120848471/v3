@@ -1,6 +1,6 @@
 # 测试与质量门禁
 
-> **当前结论**：Go `1.26.5` 下，全量 test、race、vet、staticcheck、govulncheck、Linux AMD64 静态构建及 Docker 非 root `/health` smoke 已验证通过；统一覆盖率重复运行为 `83.1–83.2%`，稳定高于 `>=80%` 门槛，protocol/vision/PE 分别为 `91.4%/91.9%/95.1%`。Device Log1/2/3 在线探针约 `0.53s` 通过。Mac ARM64 纯计算 200 样本 `P99=57.05075ms`，达到 `<=100ms`；2026-08-07 唯一授权候选批次恰好 200 轮、并发 32、每个 job 一次 Solve、应用层零重试，严格成功 `196/200`，Client 完整求解链墙钟 `P95=984ms`，达到成功率和 P95 两项冻结门槛。1 秒只约束 P95；本批 `P99=1018ms`、`max=1555ms`，且不经过 HTTP Handler。该批先于传输 one-shot 加固，最终源码未获授权再跑第二批。离线 6,400 次 Solve 压力已通过；HTTP 64 并发直通与 OpenAPI 无本地 429 已回归，生产形态的无界在途资源风险和长时间稳定性仍未完成压测。
+> **当前结论**：Go `1.26.5` 下，全量 test/race、vet、staticcheck、govulncheck、Linux AMD64/ARM64 与 Windows AMD64 交叉构建及 Docker 非 root `/health` smoke 已验证通过；统一覆盖率为 `81.9%`，高于 `>=80%` 门槛，protocol/vision/PE 分别为 `91.4%/91.9%/80.9%`。当前公开 SDK/PE 的完整 Device 组件探针约 `0.85s` 通过，完成态为 142 个指纹字段、4 个请求；修复后的唯一真实挑战以一次 Solve、零重试返回 `1/1 T001`，约 `1579ms`。Mac ARM64 纯 Go 200 样本与 2026-08-07 `196/200`、`P95=984ms` 在线批次属于旧近似 PE 路径，只保留为历史基线，不能外推为当前 Node 生产链的性能或成功率。离线 6,400 次 Solve 压力也使用 fake PE runtime；HTTP 64 并发直通与 OpenAPI 无本地 429 已回归，但生产形态的 Node 资源峰值、无界在途风险和长时间稳定性仍未完成压测。
 
 ## 测试原则
 
@@ -16,17 +16,17 @@
 
 | 层级 | 目的 | 主要入口 | 网络策略 | 当前状态 |
 |---|---|---|---|---|
-| L0 单元 | 编码、加密、配置、设备、PE、视觉、轨迹和边界分支 | 各包 `*_test.go` | 禁止真实外网 | 通过 |
+| L0 单元 | 编码、加密、配置、设备、动态 PE/runtime、脚本缓存、视觉、轨迹和边界分支 | 各包 `*_test.go` | 禁止真实外网；Node 用隔离假可执行文件，网络用替身/本地 relay | 通过 |
 | L1 跨语言 oracle | 锁定 Python 与 Go 的协议和困难视觉语义 | `protocol/testdata`、`vision/testdata`、PE oracle | 静态 fixture | 通过 |
 | L2 组件集成 | 验证设备 RPC schema、Captcha RPC、代理、下载、预热池及清理 | `internal/device`、`internal/challenge`、`internal/artifact` | Fake `RoundTripper` | 通过 |
-| L3 完整离线链 | 验证 Device → Init → Assets → Vision → PE → Device Complete → Verify | `solver_test.go` | 单一 Mock transport | 通过 |
+| L3 完整离线链 | 验证 Device → Init → PE profile → Assets → Vision → native PE contract → Device Complete → Verify | `solver_test.go` | 单一 Mock transport / fake PE runtime | 通过 |
 | L4 服务合同 | HTTP 四路径、POST JSON + deprecated GET query、内嵌页/CSP、别名/空值/参数源、状态码、OpenAPI、64 并发直通、无本地主动 429、日志脱敏、启动配置 | `server_test.go`、`cmd/server/main_test.go` | Mock Solver/占用端口 | 通过 |
 | L5 工程门禁 | fmt、vet、test、race、coverage、staticcheck、govulncheck、静态构建与便携包 | `Makefile`、Go CI | Linux quality + Darwin race + Windows 原生 package 均为 `CGO_ENABLED=0`；工具安装/漏洞库可联网 | 发布 commit 由 CI 重跑 |
-| L6 授权在线 | Device 探针及 200 个新挑战、32 并发、每 job 一次 Solve、应用层零重试、成功率和 Client 完整求解链 P95 | `online` build tag 测试 | 显式授权 | 候选批次通过；one-shot 加固后未获授权重跑 |
+| L6 授权在线 | Device/动态 PE 组件探针；受控挑战 acceptance | `online` build tag 测试 | 双重显式开关/授权；普通 CI 永不执行 | 2026-08-08 当前快照 `1/1 T001` 功能 smoke；2026-08-07 历史 `196/200` 性能批次不可外推到当前架构 |
 
 ## Go 版本与快速验证
 
-模块、CI 和 Docker 构建层统一固定 Go `1.26.5`。以下命令从 `ali-slider-go` 目录执行：
+模块、CI 和 Docker 构建层统一固定 Go `1.26.5`；完整运行产物固定 Node `24.14.1`。以下命令从 `ali-slider-go` 目录执行：
 
 ```bash
 export CGO_ENABLED=0
@@ -75,10 +75,10 @@ go test -count=1 -cover ./internal/pe
 
 | 指标 | 门槛 | 已验证结果 | 判定 |
 |---|---:|---:|---|
-| 全项目语句覆盖率 | `>= 80%` | `83.1–83.2%` | 重复运行均通过；发布 commit 仍由 CI 重跑 |
+| 全项目语句覆盖率 | `>= 80%` | `81.9%` | 通过；发布 commit 仍由 CI 重跑 |
 | `internal/protocol` | `>= 90%` | `91.4%` | 通过；包含 fuzz seeds |
 | `internal/vision` | `>= 90%` | `91.9%` | 通过 |
-| `internal/pe` | 纳入全项目门禁 | `95.1%` | 通过 |
+| `internal/pe` | 纳入全项目门禁 | `80.9%` | 通过 |
 
 覆盖率不是线上成功率，也不证明尾延迟。迁移期间源码仍可能变化，因此 1.0.0 发布候选必须由 CI 对最终 commit 重新生成覆盖率证据。
 
@@ -126,6 +126,30 @@ go test -count=1 -v ./internal/vision \
 Device RPC 的 `ResultObject` 在真实服务上并非所有 action 都使用同一 JSON 类型。当前实现先保留原始 JSON，只在 Log1 成功响应中解码对象内的 `DeviceConfig`；Log2/Log3 仅校验成功 Code，允许非对象结果。离线回归显式让 Log1 返回对象、Log2/Log3 返回字符串，防止再次把合法成功响应误判为 schema 错误。
 
 独立在线探针只执行 Device Log1/2/3，不调用 Captcha Init/Verify。它同时要求 `online` build tag 和显式环境开关，普通 test/CI 不会访问真实目标。当前授权探针通过，action 数为 3、指纹字段数为 111，墙钟约 `0.53s`。该结果只证明设备初始化链，不代表完整验证码成功率。
+
+## 动态 PE 与持久 Device VM 组件探针
+
+第一项探针只下载公开 `AliyunCaptcha.js` 和指定 PE 分片，用固定 dummy 输入完成结构画像采样和一次原生 `data` 构造；不调用 Device、Captcha Init 或 Verify，也不包含真实挑战标识。必须同时给出 build tag 和环境开关：
+
+```bash
+ALI_SLIDER_PE_KEY_ONLINE=1 \
+ALI_SLIDER_PE_STATIC_PATH=3.29.0/pe.058.77d5c01b1737016e \
+ALI_SLIDER_PE_EXPECTED_KEY=dmmlums5zuewlgt7 \
+CGO_ENABLED=0 go test -count=1 -tags online \
+  -run '^TestOnlineKeyResolver$' -v ./internal/pe
+```
+
+`ALI_SLIDER_PE_STATIC_PATH` 为空时使用测试内固定分片；`ALI_SLIDER_PE_EXPECTED_KEY` 为空时只要求画像和原生 data 通过 Go 独立复核。
+
+第二项探针执行公开 Device Log1/2/3，在同一 Node FeiLin VM 中保留状态，再用长轨迹运行当前 `.058` PE，并将其 getter/events 交回同一 VM 完成最终 Log2。它不创建 Captcha Init/Verify：
+
+```bash
+ALI_SLIDER_NODE_DEVICE_ONLINE=1 \
+CGO_ENABLED=0 go test -count=1 -tags online \
+  -run '^TestOnlineNodeDeviceRuntime$' -v ./internal/pe
+```
+
+已验证结果为 Init 指纹 111 字段、Complete 后 142 字段、请求序列 4 个。普通 test/CI 不设置上述开关，因此不会访问 CDN/Device 或启动真实 Node bridge。
 
 ## 完整 Solver 离线集成
 
@@ -188,7 +212,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 file dist/ali-slider-go-linux-amd64
 ```
 
-当前验证结果为 Linux x86-64、statically linked、stripped，且全链使用纯 Go。该结果证明构建属性，不证明 Linux 与 Mac 的性能等价。
+当前构建目标仍是 Linux x86-64、statically linked、stripped 的 Go ELF。该结果只证明 Go 二进制属性；每轮真实求解还需要 Node 24.14.1，不能据此声称完整运行产物只有一个文件。
 
 ## Windows 原生便携包
 
@@ -206,7 +230,8 @@ file dist/ali-slider-go-windows-amd64.exe
 
 - 全量 `go vet` 与 `go test -count=1 ./...`，包括 Windows Artifact 保存/Purge；
 - `CGO_ENABLED=0`、AMD64 console PE 构建；
-- 最终 ZIP 五文件白名单与 EXE SHA-256；
+- 固定安装 Node `24.14.1`，把 `node.exe` 与 `NODE-LICENSE.txt` 放入最终 ZIP；
+- 最终 ZIP 七文件白名单与 Go/Node EXE、许可证等全部文件的 SHA-256；
 - 解压到含中文和空格的路径后，通过最终 `start.bat` 启动 EXE 并验证参数转发；
 - 精确检查内嵌 `GET /` 的 HTML marker、同源 POST API 路径、CSP/no-store/nosniff/no-referrer、`/health`、OpenAPI 3.0.3、deprecated GET 合同与非法 JSON/query `400`；
 - 检查启动日志没有 `artifact_purge status=warning`；
@@ -216,7 +241,7 @@ PR 执行完整 Windows 验证但不上传。`main` push 和 `workflow_dispatch`
 
 ## Docker 功能冒烟
 
-Docker 镜像使用 Go `1.26.5` 构建层、`scratch` 运行层、静态二进制和非 root UID/GID `65532`。当前 Linux AMD64 镜像构建及关闭预热后的非 root `/health` smoke 已通过。以下是复现命令；它只访问 `/health`，不会触发设备外部请求：
+Docker 镜像使用 Go `1.26.5` 构建层、Node `24.14.1` Alpine 运行层、静态 Go 二进制和非 root UID/GID `65532`。以下 smoke 关闭预热并只访问 `/health`，不会触发设备或动态 PE 执行：
 
 ```bash
 docker build --platform linux/amd64 -t ali-slider-go:test .
@@ -232,7 +257,7 @@ curl --fail --silent http://127.0.0.1:8000/health
 docker stop ali-slider-go-smoke
 ```
 
-`scratch` 镜像内没有 shell 或 curl，健康检查应从宿主执行。Docker 构建可能需要拉取基础镜像；它不属于“项目测试代码离线执行”的网络范围。
+健康检查仍从宿主执行，避免把调试工具当作应用合同。Node Alpine 运行层包含 shell/Node 生态文件，已不具备历史 `scratch` 的最小文件面；镜像漏洞扫描与基础镜像更新必须覆盖 Node/Alpine。Docker 构建可能需要拉取基础镜像；它不属于“项目测试代码离线执行”的网络范围。
 
 ## 离线 CI
 
@@ -249,9 +274,20 @@ docker stop ali-slider-go-smoke
 
 工具下载和漏洞数据库查询可以联网，但测试步骤设置 `GOPROXY=off`，且不配置真实目标凭据，不访问验证码、设备 RPC、CDN或代理。工作流由相关路径的 pull request/push 触发，也可 `workflow_dispatch` 手动运行。
 
-## 唯一授权候选批次结果
+## 当前修复快照功能 smoke
 
-候选批次已在明确授权下恰好执行一次，参数和结果如下：
+2026-08-08 在确认历史 `d92c7d1` 同机可成功、迁移版持续 `F001` 后，对当前 Device/PE 修复快照只执行 1 个新挑战、并发 1、一次 `Client.Solve`、应用层零重试：
+
+```text
+attempts=1 concurrency=1 success=1 businessFailure=0
+errorsByKind={} wallP50Ms=1579 wallP95Ms=1579 wallP99Ms=1579 wallMaxMs=1579
+```
+
+结果满足严格成功定义：`VerifyCode=T001`、`VerifyResult=true`、token 非空。该样本只证明当前同 VM Device + 原生动态 PE 合同恢复；样本数为 1，不能计算或宣称当前成功率、P95/P99 门槛，且不替代后续正式授权批次。
+
+## 2026-08-07 历史授权候选批次结果
+
+历史候选批次已在明确授权下恰好执行一次，参数和结果如下；它先于本次 Device/PE 动态边界修复，不得外推到当前架构：
 
 | 指标 | 冻结门槛 | 已验证结果 | 判定 |
 |---|---:|---:|---|
@@ -291,8 +327,8 @@ docker stop ali-slider-go-smoke
 | `.github/workflows/ali-slider-go-ci.yml` · `quality` / `race` / `windows-package` | Linux quality、Darwin race 与 Windows 原生 test/build/smoke 均固定 `CGO_ENABLED=0`；只有全部通过才上传便携 ZIP。 | PR/push → cross-platform gates → verified release artifact |
 | `internal/protocol/protocol_test.go:47`、`:125`、`:211` | 协议关键输出由静态 Python oracle 锁定。 | Python fixture → Go primitives → equality |
 | `internal/vision/solver_test.go:17` | edge-decoy 正负 fixture 已通过跨语言静态对照。 | PNG fixture → Go vision → accept/reject assertion |
-| `internal/pe/builder_test.go:96` | PE 对 Python oracle 做完整解包语义对照。 | profile + track → PE build → Pack/Unpack equality |
-| `internal/challenge/solver_test.go` · `TestSolverOfflineCompleteSuccess` / `TestSolverLowConfidenceStopsBeforeVerify` / `TestSolverVerifyNetworkErrorIsSingleAttemptAndSanitized` | 完整离线链覆盖成功、前置零 Verify 和网络错误单次 Verify。 | Device → Init → Vision/PE → guarded Verify |
+| `internal/pe/builder_test.go`、`keys_test.go`、`runtime_test.go`、`device_runtime_test.go` | PE 保留 Python oracle；动态 runtime 的 5 分钟缓存、并发 miss、路径/下载边界、持久 Device VM、native data、SOCKS relay 和关闭生命周期由离线替身锁定。 | profile + StaticPath + challenge input → cached scripts / per-challenge VM → independently verified output |
+| `internal/challenge/solver_test.go` · `TestSolverOfflineCompleteSuccess` / `TestSolverUsesResolvedDynamicPEKey` / `TestSolverClassifiesPEKeyFailuresBeforeAssetsAndVerify` | 完整离线链覆盖动态 runtime 注入、稳定错误分类和 Verify 前停止。 | Device → Init → PE profile → Vision/native PE → guarded Verify |
 | `internal/challenge/device_pool_test.go:138`、`:177`、`:930` | 预热池覆盖有界并行、key 隔离及 Lease/Close 竞态。 | Prime/Lease → bounded ownership → Close |
 | `internal/server/server.go` · `checkSolveOrigin` / `decodeQueryRequest` / `handleSolve`；`internal/server/server_test.go` · `TestLegacyGETQueryCompatibility` / `TestLegacyGETQueryValidationNeverCallsSolver` / `TestSolveParameterSourcesStaySeparated` / `TestConcurrentRequestsAlwaysEnterSolver` / `TestBrowserOriginBoundaryPreservesLegacyClients`；`cmd/server/main_test.go` · `TestHeaderBudgetAcceptsMaximumLegacyQuery` | POST JSON 与 deprecated GET query 的输入、分源、HTTP header 预算和跨源合同有回归；HTTP 无本地 admission，64 个合法并发 POST 全部进入 Solver。 | origin + JSON/query gate → every valid Solve entered → release → 200 |
 | `internal/server/testpage.go`；`internal/server/server_test.go` · `TestEmbeddedAPITestPage` | 页面嵌入二进制，GET 不调用 Solver，nonce/安全头/无外链和无持久化合同均有离线回归。 | embedded source → GET `/` → constrained browser page |
@@ -300,6 +336,6 @@ docker stop ali-slider-go-smoke
 | `internal/device/rpc.go:119`、`:130`；`internal/device/session_test.go:130`、`:146`、`:150`、`:165`；`internal/device/online_session_test.go:17` | Device schema 按 action 解码，离线回归与约 `0.53s` 在线 Log1/2/3 探针通过。 | raw JSON → Log1 DeviceConfig / Log2-3 Code → authorized probe |
 | `internal/challenge/performance_test.go:21`、`:65`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 32 路 Mock 正确性与 6,400 次压力通过；200 样本纯计算 `P99=57.05075ms`，达到硬门槛。 | concurrent mock / repeated stress / local sampler → verified compute and capacity gates |
 | `pkg/slider/online_acceptance_test.go:37`、`:49`、`:98`、`:128`、`:147`、`:165`、`:168`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 候选 200/32/应用层零重试批次严格成功 `196/200`，Client 完整求解链 P95 `984ms`；不经过 HTTP Handler，最终 one-shot 加固后未在线重跑。 | authorized jobs → one Solve each → aggregate summary → bounded acceptance |
-| `Makefile` · `build-linux`；`Dockerfile:14` | 本地和容器均从 `cmd/server` 生成 `CGO_ENABLED=0` 静态二进制。 | Go source → Linux AMD64 binary → scratch image |
-| `Makefile` · `build-windows`；`packaging/windows/start.bat` | Windows 本地交叉构建固定 console 服务，最终用户入口提供回环监听的安全默认值。 | Go source → Windows PE → extracted local API |
+| `Makefile` · `build-linux`；`Dockerfile` | 本地和容器均从 `cmd/server` 生成 `CGO_ENABLED=0` 静态二进制，容器再提供固定 Node 运行层。 | Go source → Linux AMD64 binary + Node runtime → image |
+| `Makefile` · `build-windows`；`packaging/windows/start.bat`；CI `windows-package` | Windows console 服务与 Node 24.14.1/许可证一同打包，双击入口显式选择包内 node.exe。 | Go source + pinned Node → verified ZIP → local API |
 | `internal/vision/solver_test.go:260` | 困难视觉 benchmark 只产生均值和分配，不能提供 P99。 | fixture → repeated Solve → mean only |

@@ -66,14 +66,16 @@ type Dimensions struct {
 }
 
 type Input struct {
-	SceneID         string
-	CertifyID       string
-	Dimensions      Dimensions
-	Track           []track.Event
-	StaticPath      string
-	ExpectedXPos    *int
-	InitBeginTimeMS int64
-	FirstTouchAgeMS int
+	SceneID           string
+	CertifyID         string
+	Dimensions        Dimensions
+	Track             []track.Event
+	StaticPath        string
+	ArgumentKey       string
+	IncludeScreenInfo bool
+	ExpectedXPos      *int
+	InitBeginTimeMS   int64
+	FirstTouchAgeMS   int
 }
 
 type GetterArgument struct {
@@ -199,11 +201,11 @@ func (builder Builder) Build(ctx context.Context, input Input) (Result, error) {
 		return Result{}, fmt.Errorf("PE xPos does not match expected value: %d != %d", xPos, *input.ExpectedXPos)
 	}
 
-	trackList, err := buildTrackList(records, builder.Profile.Screen, trackStart, elapsed)
+	trackList, err := buildTrackList(records, builder.Profile.Screen, trackStart, elapsed, input.IncludeScreenInfo)
 	if err != nil {
 		return Result{}, err
 	}
-	argument, err := buildArgument(input.CertifyID, input.StaticPath, builder.Sources.Entropy)
+	argument, err := buildArgument(input.CertifyID, input.StaticPath, input.ArgumentKey)
 	if err != nil {
 		return Result{}, err
 	}
@@ -236,10 +238,14 @@ func (builder Builder) Build(ctx context.Context, input Input) (Result, error) {
 		ValueType: "string", Length: utf8.RuneCountInString(input.CertifyID), Value: input.CertifyID,
 		EqualsCertifyID: true, EqualsSceneID: input.CertifyID == input.SceneID,
 	}
+	trackKeys := []string{"mc", "tc", "mu", "te", "mp", "tmv", "mm", "ks", "fi", "startTime"}
+	if input.IncludeScreenInfo {
+		trackKeys = append(trackKeys, "si")
+	}
 	return Result{
 		Data: data, TrackEventCount: len(events),
 		PayloadKeys: []string{"TrackList", "TrackStartTime", "VerifyTime", "xPos", "slidePos", "arg"},
-		TrackKeys:   []string{"mc", "tc", "mu", "te", "mp", "tmv", "mm", "ks", "fi", "startTime", "si"},
+		TrackKeys:   trackKeys,
 		XPos:        xPos, SlidePos: slidePos, TrackStartTimeMS: trackStart, VerifyTimeMS: verifyTime,
 		TargetFirstTouchAgeMS: firstAge, FirstTouchAgeMS: float64(firstAge), TouchDurationMS: float64(duration),
 		DeviceGetterPlans:       []GetterPlan{{Owner: "python-compatible.getToken", DerivedAtMS: float64(elapsed), ArgumentCount: 1, Arguments: []GetterArgument{getterArgument}}},
@@ -315,7 +321,7 @@ func formatRecord(x, y int, timestamp int64) string {
 	return strconv.Itoa(x) + "," + strconv.Itoa(y) + "," + strconv.FormatInt(timestamp, 10) + ",1"
 }
 
-func buildTrackList(records []eventRecord, screen device.ScreenProfile, trackStart, elapsed int64) (protocol.TrackList, error) {
+func buildTrackList(records []eventRecord, screen device.ScreenProfile, trackStart, elapsed int64, includeScreenInfo bool) (protocol.TrackList, error) {
 	starts, moves, ends, all := make([]string, 0, 1), make([]string, 0, len(records)-2), make([]string, 0, 1), make([]string, 0, len(records)+1)
 	for _, record := range records {
 		all = append(all, record.text)
@@ -338,31 +344,33 @@ func buildTrackList(records []eventRecord, screen device.ScreenProfile, trackSta
 		return protocol.TrackList{}, fmt.Errorf("RAF y: %w", err)
 	}
 	all = append(all, formatRecord(rafX, rafY, elapsed+16))
-	si := []string{
-		strconv.Itoa(screen.InnerWidth), strconv.Itoa(screen.Width), strconv.Itoa(screen.InnerHeight),
-		strconv.Itoa(screen.InnerWidth), strconv.Itoa(screen.InnerHeight), strconv.Itoa(screen.OuterHeight),
-		strconv.Itoa(screen.Height), "120.00000000000082", strconv.Itoa(screen.OuterWidth),
-	}
-	return protocol.TrackList{
+	trackList := protocol.TrackList{
 		MC: "", TC: strings.Join(starts, "|"), MU: "", TE: strings.Join(ends, "|"), MP: "",
-		TMV: strings.Join(moves, "|"), MM: strings.Join(all, "|"), KS: "", FI: "", StartTime: trackStart, SI: strings.Join(si, ","),
-	}, nil
+		TMV: strings.Join(moves, "|"), MM: strings.Join(all, "|"), KS: "", FI: "", StartTime: trackStart,
+	}
+	if includeScreenInfo {
+		si := []string{
+			strconv.Itoa(screen.InnerWidth), strconv.Itoa(screen.Width), strconv.Itoa(screen.InnerHeight),
+			strconv.Itoa(screen.InnerWidth), strconv.Itoa(screen.InnerHeight), strconv.Itoa(screen.OuterHeight),
+			strconv.Itoa(screen.Height), "120.00000000000082", strconv.Itoa(screen.OuterWidth),
+		}
+		trackList.SI = strings.Join(si, ",")
+	}
+	return trackList, nil
 }
 
-func buildArgument(certifyID, staticPath string, entropy runtimekit.Entropy) (string, error) {
+func buildArgument(certifyID, staticPath, resolvedKey string) (string, error) {
 	path := strings.TrimSuffix(staticPath, ".js")
-	var transformed []byte
-	if key, ok := argKeys[path]; ok {
-		var err error
-		transformed, err = protocol.Transform64([]byte(certifyID), key, false)
-		if err != nil {
-			return "", fmt.Errorf("transform PE arg: %w", err)
-		}
-	} else {
-		transformed = make([]byte, len([]byte(certifyID)))
-		if _, err := io.ReadFull(entropy, transformed); err != nil {
-			return "", fmt.Errorf("generate PE arg: %w", err)
-		}
+	key := resolvedKey
+	if key == "" {
+		key = argKeys[path]
+	}
+	if key == "" {
+		return "", fmt.Errorf("%w: argument key is unavailable", ErrUnsupportedPE)
+	}
+	transformed, err := protocol.Transform64([]byte(certifyID), key, false)
+	if err != nil {
+		return "", fmt.Errorf("transform PE arg: %w", err)
 	}
 	return base64.StdEncoding.EncodeToString(transformed), nil
 }
