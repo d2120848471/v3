@@ -349,11 +349,14 @@ jobs:
               throw "start.bat did not create exactly one packaged executable"
             }
 
-            $openapi = Invoke-RestMethod `
+            $openapiResponse = Invoke-WebRequest `
               -Uri "http://127.0.0.1:18080/openapi.json" `
               -TimeoutSec 2
-            if ($openapi.openapi -ne "3.0.3") {
-              throw "Packaged executable returned unexpected OpenAPI metadata"
+            $openapiDocument = $openapiResponse.Content |
+              ConvertFrom-Json -AsHashtable
+            $openapiVersion = [string]$openapiDocument["openapi"]
+            if ($openapiVersion -ne "3.0.3") {
+              throw "Packaged executable returned OpenAPI version '$openapiVersion'"
             }
 
             $invalid = Invoke-WebRequest `
