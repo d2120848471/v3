@@ -32,6 +32,8 @@ go run ./cmd/server \
 curl --fail --silent http://127.0.0.1:8000/health
 ```
 
+浏览器测试页位于 `http://127.0.0.1:8000/`。页面打开只检查 health；不要在普通排障或 CI 中点击发送真实求解。
+
 处理问题时记录 commit、Go 版本、`X-Trace-ID`、HTTP 状态、客户端墙钟和脱敏后的错误类别/阶段。不要收集请求/响应正文、token、`CertifyId`、RPC key、代理密码或上游原始错误。
 
 ## 启动与生命周期
@@ -55,9 +57,12 @@ curl --fail --silent http://127.0.0.1:8000/health
 
 | 现象 | 含义 | 处理 |
 |---|---|---|
+| 测试页无法打开 | 服务尚未 ready、端口错误或浏览器访问了旧实例 | 先检查 `event=listen status=ready` 和 `/health`；使用启动日志中的实际端口打开根路径 `/` |
+| 测试页可打开，但显示 health 异常 | 页面 HTML 已返回，`/health` fetch 失败或不是 ready | 检查浏览器开发者工具的本机请求、端口和服务进程；不要因此重复提交 Solve |
 | `GET /api/slider` 返回 404 | 合同只允许 POST solve | 改为 `POST`；不要恢复 GET 副作用接口 |
 | `400 ApiRequestError` | JSON、类型、长度、prefix 或 proxy 在 Solver 前失败 | 从 `{}` 开始逐项加入字段；请求体不超过 64 KiB |
 | `400 InvalidRequest` | 公共 Client/Solver 认为请求不合法 | 检查 SceneId、prefix、RPC key 和 proxy 长度 |
+| `403 ApiOriginError` | 浏览器标记该 POST 来自跨源 origin | 从服务自带根页或正确同源页调用；不要放宽 CORS/绕过保护 |
 | 外层网关直接返回 429 | 网关的身份/IP 频率、并发或总量策略生效 | 按该网关合同处理；不要把它归因于应用内活动数闸门 |
 | `500 NetworkError` 且上游记录为 429 | 上游把本轮外部请求作为非 2xx 拒绝 | 用 traceId 与上游受控指标定位；Handler 不透传上游 429 或退避头，同一 `CertifyId` 不得重试 Verify |
 | HTTP 200 但 `ok=false` | 协议完成，Verify 业务拒绝 | 读取 `VerifyCode`、`VerifyResult`；不要当技术成功或自动重试 |
@@ -67,7 +72,7 @@ curl --fail --silent http://127.0.0.1:8000/health
 | `500 UnhandledProtocolError` | 未分类 error 或 panic | 视为缺陷；用本地 Mock 最小复现并映射为稳定脱敏错误 |
 | HTTP 无普通日志 | 自定义宿主给 `server.New` 的 Logger 为 nil | cmd/server 已注入 stdout logger；library 宿主应显式注入安全 Logger |
 
-所有应用生成的 HTTP JSON 响应应有 `Cache-Control: no-store`；`/api/slider` 的 200/400/500 应包含与 body 一致的 `X-Trace-ID`。Handler 不生成本地 429、`Retry-After`、`TooManyChallenges`、活动数或退避字段；外层网关响应遵循网关自己的合同。
+所有应用生成的 HTTP JSON 响应应有 `Cache-Control: no-store`；`/api/slider` 的 200/400/403/500 应包含与 body 一致的 `X-Trace-ID`。测试页响应还应有 HTML Content-Type、随机 nonce CSP、`nosniff`、`no-referrer` 和防 framing 头；缺失时视为构建/路由合同回归。Handler 不生成本地 429、`Retry-After`、`TooManyChallenges`、活动数或退避字段；403 仅是跨源浏览器安全边界，不是 admission。外层网关响应遵循网关自己的合同。
 
 ## Solver 阶段定位
 
@@ -177,13 +182,13 @@ go test -count=1 -race \
 | `staticcheck` 不在 PATH | 本机未安装组织工具 | 使用 CI 固定 `v0.7.0` 或按组织流程安装；项目验证记录已通过 |
 | `govulncheck` 不在 PATH/查询失败 | 工具或漏洞库网络不可用 | 使用 CI 固定 `v1.1.4`；区分扫描基础设施失败与发现漏洞 |
 | PR 没有 Go CI | 变更路径未命中或工作流未触发 | 检查 `.github/workflows/ali-slider-go-ci.yml` paths；可 workflow_dispatch |
-| 覆盖率变化 | commit/命令/缓存不同 | 使用 `-count=1` 和单一 coverprofile，记录 commit；当前基线 `83.0%` |
+| 覆盖率变化 | 并发分支命中、commit/命令/缓存不同 | 使用 `-count=1` 和单一 coverprofile，记录 commit；当前重复运行为 `83.1–83.2%`，均超过 `>=80%` 门槛 |
 | `go build ./...` 没有目标文件 | 该命令只验证包 | 使用 `make build-linux` 生成 `dist/ali-slider-go-linux-amd64` |
 | Linux 二进制不是 static | 未设置 CGO 或构建参数改变 | 使用 Makefile/CI 命令，并用 `file` 断言 `statically linked` |
 | Actions 没有 Windows ZIP | quality/race/Windows job 失败、运行来自 PR 或 artifact 已过期 | 打开同一 run 的 `windows-package`；只在 main push/手动运行上传，保留 30 天 |
 | Windows 显示未知发布者 | EXE 未做 Authenticode 商业签名 | 从可信仓库下载并核对 SHA-256；不要关闭 Defender 或绕过组织策略 |
 | Windows 提示应用无法运行 | 系统低于 Windows 10 / Windows Server 2016、使用 32 位 Windows 或非原生架构 | 当前包要求 Windows 10 / Windows Server 2016 或更高版本的 AMD64/x64；不要把它标成所有 Windows 通用包 |
-| 双击后没有图形窗口 | 误把本地 HTTP 服务当 GUI | 完整解压后运行 `start.bat`，等待 console 的 ready 日志，再访问 `/health` |
+| 双击后只有控制台，没有桌面窗口 | 程序是控制台 HTTP 服务；测试 UI 在浏览器中 | 完整解压后运行 `start.bat`，等待 console 的 ready 日志，再手工打开 `http://127.0.0.1:8000/`；换端口时同步修改 URL |
 | 容器端口不可达 | 应用默认监听容器回环 | 容器内设 `ALI_SLIDER_HOST=0.0.0.0`，宿主只发布到 `127.0.0.1` |
 | 无法在容器内 exec shell/curl | runtime 是 scratch | 从宿主做 health；不要为调试把生产镜像改成 root/full OS |
 | artifact 重启后丢失 | 容器未挂持久卷 | 将 `/app/var/artifacts` 挂受控卷并保持 UID 65532 权限 |
@@ -211,9 +216,10 @@ go test -count=1 -race \
 | Evidence | Finding | Path |
 |---|---|---|
 | `cmd/server/main.go:36`、`:49`、`:55`、`:60`、`:93`、`:111`、`:147` | 启动器已实现配置、Prime、启动/每小时清理和优雅关闭。 | config → Client → HTTP → lifecycle |
-| `internal/server/server.go` · `handleSolve`；`internal/server/server_test.go` · `TestConcurrentRequestsAlwaysEnterSolver` | 合法 POST 经解码后均直接进入 Solver；Handler 不按活动数拒绝，也不生成本地 429 或退避字段。 | method/body → validation → timeout context → Solve or stable error |
+| `internal/server/server.go` · `browserOriginProtection` / `handleSolve`；`internal/server/server_test.go` · `TestBrowserOriginBoundaryPreservesLegacyClients` / `TestConcurrentRequestsAlwaysEnterSolver` | 通过跨源和 body 校验的 POST 均直接进入 Solver；Handler 不按活动数拒绝，也不生成本地 429 或退避字段。 | method/body → origin/body validation → timeout context → Solve or stable error |
+| `internal/server/testpage.go` · `writeTestPage`；`internal/server/server_test.go` · `TestEmbeddedAPITestPage` | 根路径只允许 GET，返回带严格页面安全头的内嵌测试台且不触发 Solver。 | start → browser GET `/` → health / explicit solve |
 | `internal/challenge/solver.go:107`、`:149`、`:289` | 完整 Solver 已按阶段执行并只在前置门禁后 Verify。 | setup → device/init/assets/vision/PE → Verify |
-| `internal/challenge/solver_test.go:268`、`:286` | 低置信零 Verify、网络未知单次 Verify 有计数测试。 | failure branch → counted transport calls |
+| `internal/challenge/solver_test.go` · `TestSolverLowConfidenceStopsBeforeVerify` / `TestSolverVerifyNetworkErrorIsSingleAttemptAndSanitized` | 低置信零 Verify、网络未知单次 Verify 有计数测试。 | failure branch → counted transport calls |
 | `internal/challenge/device_pool.go:190`、`:299` | 预热池按完整 key Lease，Close 有界清理后台任务。 | Prime/Lease → release/refill → Close |
 | `pkg/slider/client.go:203`、`:213` | library 暴露 Purge，并在 Close 前等待活跃 Solve/Prime/Purge。 | caller lifecycle → safe resource cleanup |
 | `internal/artifact/store.go:121`；`cmd/server/main.go:147` | Store 只清理受管过期文件；服务已按小时调度。 | failure artifact → retention → scheduled Purge |

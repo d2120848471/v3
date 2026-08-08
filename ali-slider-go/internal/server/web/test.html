@@ -1,0 +1,756 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Ali Slider Go · API 测试台</title>
+  <style nonce="__ALI_SLIDER_CSP_NONCE__">
+    :root {
+      color-scheme: dark;
+      --background: #07111f;
+      --surface: rgba(13, 28, 47, 0.88);
+      --surface-strong: #10233b;
+      --line: rgba(148, 174, 204, 0.19);
+      --text: #f2f7fc;
+      --muted: #9fb2c8;
+      --accent: #39d6b4;
+      --accent-strong: #13b995;
+      --blue: #64a8ff;
+      --warning: #ffc66d;
+      --danger: #ff7e87;
+      --success: #53dfa2;
+      --shadow: 0 24px 70px rgba(0, 0, 0, 0.28);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      min-height: 100vh;
+      margin: 0;
+      background:
+        radial-gradient(circle at 12% 8%, rgba(44, 130, 202, 0.18), transparent 34rem),
+        radial-gradient(circle at 88% 12%, rgba(20, 185, 149, 0.12), transparent 30rem),
+        var(--background);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.5;
+    }
+
+    a { color: var(--blue); }
+
+    button, input { font: inherit; }
+
+    button:focus-visible,
+    input:focus-visible,
+    pre:focus-visible,
+    a:focus-visible {
+      outline: 3px solid rgba(100, 168, 255, 0.75);
+      outline-offset: 3px;
+    }
+
+    .shell {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 44px 0 32px;
+    }
+
+    .hero {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 24px;
+      margin-bottom: 24px;
+    }
+
+    .eyebrow {
+      margin: 0 0 8px;
+      color: var(--accent);
+      font-size: 0.76rem;
+      font-weight: 800;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3, p { margin-top: 0; }
+
+    h1 {
+      margin-bottom: 10px;
+      font-size: clamp(2rem, 5vw, 3.5rem);
+      line-height: 1.03;
+      letter-spacing: -0.045em;
+    }
+
+    .lead {
+      max-width: 720px;
+      margin-bottom: 0;
+      color: var(--muted);
+      font-size: 1rem;
+    }
+
+    .health {
+      display: inline-flex;
+      flex: 0 0 auto;
+      align-items: center;
+      gap: 9px;
+      min-width: 150px;
+      padding: 10px 14px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(7, 17, 31, 0.72);
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+
+    .health-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--warning);
+      box-shadow: 0 0 0 4px rgba(255, 198, 109, 0.12);
+    }
+
+    .health-dot.good {
+      background: var(--success);
+      box-shadow: 0 0 0 4px rgba(83, 223, 162, 0.12);
+    }
+
+    .health-dot.bad {
+      background: var(--danger);
+      box-shadow: 0 0 0 4px rgba(255, 126, 135, 0.12);
+    }
+
+    .endpoint-bar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 20px;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(7, 17, 31, 0.64);
+      color: var(--muted);
+      font-size: 0.9rem;
+      overflow-wrap: anywhere;
+    }
+
+    .method {
+      padding: 3px 8px;
+      border-radius: 7px;
+      background: rgba(57, 214, 180, 0.13);
+      color: var(--accent);
+      font-weight: 800;
+      letter-spacing: 0.05em;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.08fr);
+      gap: 20px;
+    }
+
+    .card {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(14px);
+    }
+
+    .card-header {
+      padding: 21px 22px 15px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .card-header h2 {
+      margin-bottom: 5px;
+      font-size: 1.08rem;
+    }
+
+    .card-header p {
+      margin-bottom: 0;
+      color: var(--muted);
+      font-size: 0.86rem;
+    }
+
+    .card-body { padding: 22px; }
+
+    .fields {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .field.full { grid-column: 1 / -1; }
+
+    label {
+      display: block;
+      margin-bottom: 7px;
+      color: #dbe8f5;
+      font-size: 0.87rem;
+      font-weight: 700;
+    }
+
+    input[type="text"],
+    input[type="password"],
+    input[type="number"] {
+      width: 100%;
+      min-height: 44px;
+      border: 1px solid rgba(148, 174, 204, 0.27);
+      border-radius: 10px;
+      background: rgba(5, 14, 26, 0.72);
+      color: var(--text);
+      padding: 10px 12px;
+    }
+
+    input::placeholder { color: #6f849b; }
+
+    input:invalid { border-color: var(--danger); }
+
+    .hint {
+      display: block;
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 0.76rem;
+    }
+
+    .notice {
+      margin: 18px 0;
+      padding: 12px 13px;
+      border: 1px solid rgba(255, 198, 109, 0.26);
+      border-radius: 11px;
+      background: rgba(255, 198, 109, 0.07);
+      color: #f4d9a9;
+      font-size: 0.82rem;
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    button {
+      min-height: 42px;
+      border: 1px solid transparent;
+      border-radius: 10px;
+      padding: 9px 15px;
+      cursor: pointer;
+      font-weight: 750;
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.5;
+    }
+
+    .primary {
+      background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+      color: #04130f;
+    }
+
+    .secondary {
+      border-color: var(--line);
+      background: rgba(148, 174, 204, 0.08);
+      color: var(--text);
+    }
+
+    .danger {
+      border-color: rgba(255, 126, 135, 0.3);
+      background: rgba(255, 126, 135, 0.09);
+      color: #ffb2b8;
+    }
+
+    .result-banner {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 14px;
+      margin-bottom: 16px;
+      padding: 13px 14px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: rgba(5, 14, 26, 0.58);
+    }
+
+    .result-banner strong { display: block; }
+
+    .result-banner span {
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 9px;
+      margin-bottom: 17px;
+    }
+
+    .metric {
+      min-width: 0;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(5, 14, 26, 0.5);
+    }
+
+    .metric span {
+      display: block;
+      margin-bottom: 3px;
+      color: var(--muted);
+      font-size: 0.72rem;
+    }
+
+    .metric strong {
+      display: block;
+      overflow: hidden;
+      color: #e7f1fb;
+      font-size: 0.82rem;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .section-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 17px 0 8px;
+    }
+
+    .section-title h3 {
+      margin: 0;
+      font-size: 0.87rem;
+    }
+
+    .reveal {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--muted);
+      font-size: 0.78rem;
+      font-weight: 500;
+    }
+
+    .reveal input { accent-color: var(--accent); }
+
+    pre {
+      min-height: 104px;
+      max-height: 310px;
+      margin: 0;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: #050d18;
+      color: #d9e9f8;
+      padding: 14px;
+      font: 0.79rem/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      tab-size: 2;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .footer {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      margin-top: 20px;
+      color: var(--muted);
+      font-size: 0.78rem;
+    }
+
+    .footer p { margin: 0; }
+
+    @media (max-width: 860px) {
+      .hero { display: block; }
+      .health { margin-top: 18px; }
+      .grid { grid-template-columns: 1fr; }
+      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 560px) {
+      .shell { width: min(100% - 20px, 1180px); padding-top: 26px; }
+      .fields { grid-template-columns: 1fr; }
+      .field.full { grid-column: auto; }
+      .card-header, .card-body { padding-left: 16px; padding-right: 16px; }
+      .footer { display: block; }
+      .footer p + p { margin-top: 7px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Ali Slider Go</p>
+        <h1>API 测试台</h1>
+        <p class="lead">手工发送一次真实滑块求解请求，查看 HTTP 状态、端到端耗时、追踪 ID 和完整阶段结果。</p>
+      </div>
+      <div class="health" role="status" aria-live="polite">
+        <span class="health-dot" id="health-dot" aria-hidden="true"></span>
+        <span id="health-text">正在检查服务</span>
+      </div>
+    </header>
+
+    <div class="endpoint-bar" aria-label="当前 API 地址">
+      <span class="method">POST</span>
+      <span id="endpoint">/api/slider</span>
+    </div>
+
+    <main class="grid" id="api-test-console">
+      <section class="card" aria-labelledby="request-title">
+        <div class="card-header">
+          <h2 id="request-title">请求参数</h2>
+          <p>字段全部可留空；服务会使用当前启动配置的默认 Scene ID 和 prefix。</p>
+        </div>
+        <div class="card-body">
+          <form id="solve-form" autocomplete="off">
+            <div class="fields">
+              <div class="field">
+                <label for="scene-id">SceneId</label>
+                <input id="scene-id" type="text" aria-describedby="scene-id-hint" placeholder="留空使用服务默认值" spellcheck="false">
+                <span class="hint" id="scene-id-hint">最多 64 个 Unicode 字符</span>
+              </div>
+              <div class="field">
+                <label for="prefix">prefix</label>
+                <input id="prefix" type="text" maxlength="32" pattern="[A-Za-z0-9]{1,32}" aria-describedby="prefix-hint" placeholder="留空使用服务默认值" spellcheck="false">
+                <span class="hint" id="prefix-hint">非空时只能包含 ASCII 字母和数字</span>
+              </div>
+              <div class="field">
+                <label for="rpc-key">AaduaneId</label>
+                <input id="rpc-key" type="password" aria-describedby="rpc-key-hint" placeholder="可选 RPC key id" autocomplete="off" spellcheck="false">
+                <span class="hint" id="rpc-key-hint">最多 128 个 Unicode 字符；敏感输入，不会写入浏览器存储</span>
+              </div>
+              <div class="field">
+                <label for="proxy">proxy</label>
+                <input id="proxy" type="password" aria-describedby="proxy-hint" placeholder="可选，例如 http://127.0.0.1:7890" autocomplete="off" spellcheck="false">
+                <span class="hint" id="proxy-hint">支持 HTTP(S)、SOCKS4、SOCKS5、SOCKS5H</span>
+              </div>
+              <div class="field full">
+                <label for="client-timeout">页面等待上限（秒）</label>
+                <input id="client-timeout" type="number" min="1" max="305" value="30" inputmode="numeric" aria-describedby="client-timeout-hint">
+                <span class="hint" id="client-timeout-hint">页面超时只取消当前浏览器请求，不会自动重试；服务端仍执行自己的 timeout。</span>
+              </div>
+            </div>
+
+            <div class="notice">
+              点击发送会访问真实 Device、Captcha、图片 CDN 和 Verify 上游。取消发生在 Verify 发出后时，结果可能未知；本页面绝不自动重试。
+            </div>
+
+            <div class="actions">
+              <button class="primary" id="submit" type="submit">发送一次求解</button>
+              <button class="danger" id="cancel" type="button" disabled>取消请求</button>
+              <button class="secondary" id="clear" type="button">清空</button>
+              <button class="secondary" id="check-health" type="button">检查健康状态</button>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <section class="card" aria-labelledby="result-title">
+        <div class="card-header">
+          <h2 id="result-title">运行结果</h2>
+          <p>HTTP 200 仍需同时检查 ok、VerifyCode 和 VerifyResult。</p>
+        </div>
+        <div class="card-body">
+          <div class="result-banner" id="result-status" role="status" aria-live="polite">
+            <div>
+              <strong id="result-label">尚未发送</strong>
+              <span id="result-detail">填写参数后手工发送一次请求。</span>
+            </div>
+          </div>
+
+          <div class="metrics" aria-label="请求摘要">
+            <div class="metric"><span>HTTP</span><strong id="http-status">—</strong></div>
+            <div class="metric"><span>页面墙钟</span><strong id="wall-time">—</strong></div>
+            <div class="metric"><span>Trace ID</span><strong id="trace-id">—</strong></div>
+            <div class="metric"><span>业务状态</span><strong id="business-status">—</strong></div>
+          </div>
+
+          <div class="section-title">
+            <h3>本次请求 JSON</h3>
+            <label class="reveal" for="reveal-sensitive">
+              <input id="reveal-sensitive" type="checkbox">
+              显示敏感字段
+            </label>
+          </div>
+          <pre id="request-output" tabindex="0" aria-label="本次请求 JSON">{}</pre>
+
+          <div class="section-title">
+            <h3>API 响应</h3>
+          </div>
+          <pre id="response-output" tabindex="0" aria-label="API 响应">尚未发送请求。</pre>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <p>页面不保存历史、Cookie 或遥测；刷新即清除内存中的请求与响应。</p>
+      <p><a href="/openapi.json">OpenAPI 3.0.3</a> · <a href="/health">Health</a></p>
+    </footer>
+  </div>
+
+  <script nonce="__ALI_SLIDER_CSP_NONCE__">
+    "use strict";
+
+    (() => {
+      const form = document.getElementById("solve-form");
+      const submitButton = document.getElementById("submit");
+      const cancelButton = document.getElementById("cancel");
+      const clearButton = document.getElementById("clear");
+      const healthButton = document.getElementById("check-health");
+      const revealSensitive = document.getElementById("reveal-sensitive");
+      const requestOutput = document.getElementById("request-output");
+      const responseOutput = document.getElementById("response-output");
+      const healthDot = document.getElementById("health-dot");
+      const healthText = document.getElementById("health-text");
+      const resultLabel = document.getElementById("result-label");
+      const resultDetail = document.getElementById("result-detail");
+      const httpStatus = document.getElementById("http-status");
+      const wallTime = document.getElementById("wall-time");
+      const traceID = document.getElementById("trace-id");
+      const businessStatus = document.getElementById("business-status");
+
+      let activeController = null;
+      let activeTimer = null;
+      let abortReason = "";
+      let lastRequest = {};
+      let lastResponse = null;
+
+      document.getElementById("endpoint").textContent = `${location.origin}/api/slider`;
+
+      function maskedClone(value) {
+        if (value === null || typeof value !== "object") return value;
+        const clone = JSON.parse(JSON.stringify(value));
+        if (revealSensitive.checked) return clone;
+        const sensitive = new Set(["securitytoken", "certifyid", "aaduaneid", "proxy"]);
+        const walk = (node) => {
+          if (Array.isArray(node)) {
+            node.forEach(walk);
+            return;
+          }
+          if (node === null || typeof node !== "object") return;
+          Object.keys(node).forEach((key) => {
+            if (sensitive.has(key.toLowerCase()) && node[key] !== "") {
+              node[key] = "••••••";
+              return;
+            }
+            walk(node[key]);
+          });
+        };
+        walk(clone);
+        return clone;
+      }
+
+      function renderJSON(target, value) {
+        target.textContent = typeof value === "string" ? value : JSON.stringify(maskedClone(value), null, 2);
+      }
+
+      function renderStoredData() {
+        renderJSON(requestOutput, lastRequest);
+        renderJSON(responseOutput, lastResponse === null ? "尚未发送请求。" : lastResponse);
+      }
+
+      function setBusy(busy) {
+        submitButton.disabled = busy;
+        cancelButton.disabled = !busy;
+        clearButton.disabled = busy;
+      }
+
+      function collectRequest() {
+        const request = {};
+        const fields = [
+          ["scene-id", "SceneId"],
+          ["prefix", "prefix"],
+          ["rpc-key", "AaduaneId"],
+          ["proxy", "proxy"]
+        ];
+        fields.forEach(([id, name]) => {
+          const value = document.getElementById(id).value.trim();
+          if (value !== "") request[name] = value;
+        });
+        return request;
+      }
+
+      function setHealth(state, text) {
+        healthDot.className = `health-dot ${state}`.trim();
+        healthText.textContent = text;
+      }
+
+      async function checkHealth() {
+        healthButton.disabled = true;
+        setHealth("", "正在检查服务");
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 3000);
+        try {
+          const response = await fetch("/health", {
+            cache: "no-store",
+            credentials: "omit",
+            redirect: "error",
+            referrerPolicy: "no-referrer",
+            signal: controller.signal
+          });
+          const body = await response.json();
+          if (response.ok && body.ok === true && body.status === "ready") {
+            setHealth("good", "服务已就绪");
+          } else {
+            setHealth("bad", `健康检查异常 · ${response.status}`);
+          }
+        } catch (_error) {
+          setHealth("bad", "健康检查失败");
+        } finally {
+          clearTimeout(timer);
+          healthButton.disabled = false;
+        }
+      }
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (!form.reportValidity() || activeController !== null) return;
+
+        const request = collectRequest();
+        const body = JSON.stringify(request);
+        if (new TextEncoder().encode(body).length > 65536) {
+          resultLabel.textContent = "请求未发送";
+          resultDetail.textContent = "UTF-8 JSON 超过服务端 65,536 字节上限。";
+          return;
+        }
+
+        const timeoutSeconds = Number(document.getElementById("client-timeout").value);
+        if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > 305) {
+          resultLabel.textContent = "请求未发送";
+          resultDetail.textContent = "页面等待上限必须是 1..305 秒的整数。";
+          return;
+        }
+
+        lastRequest = request;
+        lastResponse = null;
+        renderStoredData();
+        activeController = new AbortController();
+        abortReason = "";
+        activeTimer = setTimeout(() => {
+          abortReason = "timeout";
+          activeController.abort();
+        }, timeoutSeconds * 1000);
+        setBusy(true);
+        resultLabel.textContent = "请求执行中";
+        resultDetail.textContent = "等待真实上游响应；本页面不会自动重试。";
+        httpStatus.textContent = "等待中";
+        wallTime.textContent = "—";
+        traceID.textContent = "—";
+        businessStatus.textContent = "执行中";
+        const started = performance.now();
+
+        try {
+          const response = await fetch("/api/slider", {
+            method: "POST",
+            headers: {
+              "Accept": "application/json",
+              "Content-Type": "application/json"
+            },
+            body,
+            cache: "no-store",
+            credentials: "omit",
+            redirect: "error",
+            referrerPolicy: "no-referrer",
+            signal: activeController.signal
+          });
+          const raw = await response.text();
+          try {
+            lastResponse = JSON.parse(raw);
+          } catch (_error) {
+            lastResponse = raw;
+          }
+
+          const trace = response.headers.get("X-Trace-ID") ||
+            (lastResponse && typeof lastResponse === "object" ? lastResponse.traceId : "") || "—";
+          const completed = lastResponse !== null && typeof lastResponse === "object" && !Array.isArray(lastResponse);
+          const successfulHTTP = response.status === 200;
+          const verified = successfulHTTP && completed && lastResponse.ok === true &&
+            lastResponse.VerifyCode === "T001" && lastResponse.VerifyResult === true &&
+            typeof lastResponse.securityToken === "string" && lastResponse.securityToken.length > 0;
+          const businessFailed = successfulHTTP && completed && lastResponse.ok === false;
+
+          httpStatus.textContent = `${response.status} ${response.statusText}`.trim();
+          traceID.textContent = trace;
+          if (verified) {
+            resultLabel.textContent = "验证成功";
+            resultDetail.textContent = "HTTP 与业务结果均成功。";
+            businessStatus.textContent = "ok=true";
+          } else if (businessFailed) {
+            resultLabel.textContent = "请求完成，验证未通过";
+            resultDetail.textContent = "HTTP 200 不代表业务成功，请检查 VerifyCode 和 VerifyResult。";
+            businessStatus.textContent = "ok=false";
+          } else if (!response.ok) {
+            resultLabel.textContent = "API 返回错误";
+            resultDetail.textContent = "根据 errorType、error 和 traceId 排查。";
+            businessStatus.textContent = completed && lastResponse.errorType ? lastResponse.errorType : "HTTP error";
+          } else {
+            resultLabel.textContent = "响应合同异常";
+            resultDetail.textContent = "HTTP 状态或成功字段与 OpenAPI 合同不一致。";
+            businessStatus.textContent = "unknown";
+          }
+          renderStoredData();
+        } catch (error) {
+          if (error.name === "AbortError") {
+            const timedOut = abortReason === "timeout";
+            resultLabel.textContent = timedOut ? "页面等待超时" : "请求已取消";
+            resultDetail.textContent = "服务端或上游结果可能未知；本页面不会自动重试。";
+            businessStatus.textContent = timedOut ? "client timeout" : "cancelled";
+            lastResponse = {
+              ok: false,
+              errorType: timedOut ? "ClientTimeout" : "ClientCancelled",
+              error: resultDetail.textContent
+            };
+          } else {
+            resultLabel.textContent = "浏览器请求失败";
+            resultDetail.textContent = "请检查服务、端口和本机网络状态。";
+            businessStatus.textContent = "fetch error";
+            lastResponse = {ok: false, errorType: "BrowserError", error: error.message};
+          }
+          httpStatus.textContent = "未收到响应";
+          traceID.textContent = "—";
+          renderStoredData();
+        } finally {
+          clearTimeout(activeTimer);
+          activeTimer = null;
+          activeController = null;
+          wallTime.textContent = `${Math.round(performance.now() - started)} ms`;
+          setBusy(false);
+        }
+      });
+
+      cancelButton.addEventListener("click", () => {
+        if (activeController === null) return;
+        abortReason = "user";
+        activeController.abort();
+      });
+
+      clearButton.addEventListener("click", () => {
+        form.reset();
+        revealSensitive.checked = false;
+        lastRequest = {};
+        lastResponse = null;
+        resultLabel.textContent = "尚未发送";
+        resultDetail.textContent = "填写参数后手工发送一次请求。";
+        httpStatus.textContent = "—";
+        wallTime.textContent = "—";
+        traceID.textContent = "—";
+        businessStatus.textContent = "—";
+        renderStoredData();
+      });
+
+      revealSensitive.addEventListener("change", renderStoredData);
+      healthButton.addEventListener("click", checkHealth);
+      window.addEventListener("beforeunload", () => {
+        if (activeController !== null) activeController.abort();
+      });
+
+      renderStoredData();
+      checkHealth();
+    })();
+  </script>
+</body>
+</html>

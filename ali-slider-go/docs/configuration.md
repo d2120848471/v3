@@ -1,6 +1,6 @@
 # 配置说明
 
-> **当前状态**：`cmd/server` 已将 `internal/config.Parse` 接入公共 Client、HTTP Handler、设备预热、artifact 清理与优雅关闭。本页参数是当前可执行服务的真实合同。HTTP Handler 不设置本地并发准入或主动 429：每个通过 JSON/字段校验的 `POST /api/slider` 都会进入 `Solve`。
+> **当前状态**：`cmd/server` 已将 `internal/config.Parse` 接入公共 Client、HTTP Handler、设备预热、artifact 清理与优雅关闭。本页参数是当前可执行服务的真实合同。HTTP Handler 不设置本地并发准入或主动 429：每个通过浏览器跨源和 JSON/字段校验的 `POST /api/slider` 都会进入 `Solve`。
 
 ## 配置优先级
 
@@ -66,13 +66,15 @@ export ALI_SLIDER_DEVICE_PREWARM=16
 go run ./cmd/server
 ```
 
+浏览器测试页使用当前监听地址的根路径，例如 `http://127.0.0.1:8000/`。它通过相对路径调用同源 `/health` 和 `/api/slider`；修改 `Host`/`Port` 后只需打开新的根地址，不存在独立页面配置。页面等待上限是浏览器单次操作参数，不修改服务端 `Timeout`。
+
 Windows 便携包不需要配置文件。完整解压后双击 `start.bat`；脚本先切换到自身目录，再提供回环地址、端口和包内 Artifact 路径的安全默认值。高级用户可在 `cmd.exe` 追加 flag，后出现的值覆盖脚本默认值：
 
 ```bat
 start.bat --port=8001 --device-prewarm=16
 ```
 
-正常便携版保留默认预热容量 32，以降低后续请求时延。CI 的本地启动 smoke 使用 `--device-prewarm=0`，只验证 HTTP 合同且不发送真实外部请求。完整交付说明见 [Windows AMD64 便携包](./windows.md)。
+正常便携版保留默认预热容量 32，以降低后续请求时延。CI 的本地启动 smoke 使用 `--device-prewarm=0`，只 GET 测试页/health/OpenAPI 并提交必定在 Handler 前失败的非法 JSON，不发送真实外部请求。完整交付说明见 [Windows AMD64 便携包](./windows.md)。
 
 环境变量示例：
 
@@ -125,5 +127,5 @@ export ALI_SLIDER_ARTIFACT_RETENTION=168h
 | `internal/config/config.go:22`、`:125`、`:167` | 单一结构定义服务配置；兼容字段 `MaxConcurrency` 保持 `1..32`，用途明确为 Client 连接与预热资源预算。 | process environment + args → typed resource budget → Validate |
 | `internal/config/config.go:145`、`:150`、`:194` | 只在预热未显式配置时随降低的资源预算收敛；显式值仍必须满足 `0..MaxConcurrency`。 | max-concurrency override → implicit prewarm clamp |
 | `cmd/server/main.go` · `clientOptions` / `run` | 完整配置映射到 Client 和 Handler，显式零值不会被二次默认化吞掉。 | Config → DefaultClientOptions override → NewClient |
-| `internal/server/server.go:41`、`:105`、`:116`；`internal/server/openapi.go:20` | 合法 HTTP 请求直接进入 Solver；服务合同不声明本地主动 429。 | decode valid request → timeout context → Solve |
+| `internal/server/server.go` · `Handler` / `browserOriginProtection` / `handleSolve`；`internal/server/openapi.go` · `openAPIDocument` | 明确浏览器跨源 POST 由 Go 标准库在 Solver 前返回 403；其他通过 origin/body 边界的 HTTP 请求直接进入 Solver，服务合同不声明本地主动 429。 | origin/body gate → timeout context → Solve |
 | `internal/artifact/store.go` · `SaveFailure` / `Purge` | 保留期、组数和总字节硬配额同时执行。 | failure set → purge expired → evict oldest → O_EXCL write |

@@ -6,11 +6,33 @@
 
 | 方法 | 路径 | 用途 | 是否调用 Solver |
 |---|---|---|---|
-| `POST` | `/api/slider` | 执行一轮挑战 | 通过 HTTP 输入校验后调用一次 |
+| `GET` | `/` | 返回内嵌 API 测试页 | 否；页面只自动检查 health，必须手工提交 |
+| `POST` | `/api/slider` | 执行一轮挑战 | 通过浏览器跨源与 HTTP 输入校验后调用一次 |
 | `GET` | `/health` | 进程级就绪检查 | 否 |
 | `GET` | `/openapi.json` | 返回 OpenAPI 3.0.3 JSON | 否 |
 
 其他方法或路径返回 `404`。特别地，`GET /api/slider` 不执行挑战。
+若极低概率的系统密码学随机源失败，`GET /` 返回 `500 text/plain` 且不调用 Solver；OpenAPI 同时声明该失败边界。
+
+## 使用内嵌测试页
+
+服务 ready 后用浏览器打开：
+
+```text
+http://127.0.0.1:8000/
+```
+
+页面内置于 Go EXE，不加载 CDN、字体、框架或第三方脚本，也不需要 Node.js。它固定调用当前 origin 的 `/health` 和 `/api/slider`，不能修改目标 URL，因此换端口后无需配置页面。
+测试页需要支持 `fetch`、`AbortController` 和 `TextEncoder` 的现代 Edge、Chrome 或 Firefox；没有现代浏览器时仍可直接调用 API。
+
+- 页面打开时只执行无副作用的 health 检查，不自动创建挑战。
+- 只有点击“发送一次求解”才会提交一个合法 POST；执行期间按钮禁用，防止双击。页面不自动重试、批量请求或并发压测。
+- 空字段不进入 JSON，实际默认 Scene ID/prefix 由服务启动配置决定。
+- 页面等待上限可设为 `1..305` 秒，并支持手工取消。取消会传播到请求 context，但若 Verify 已发出，上游结果可能未知；不要手工重试结果未知的一轮。
+- RPC key、代理、`securityToken` 和 `certifyId` 默认遮罩。请求和响应只保留在当前页面内存，不写 Cookie、URL、localStorage、sessionStorage 或遥测；刷新或“清空”即移除。
+- 页面用 `textContent` 显示响应；CSP 只允许同源连接，并禁止外部资源、frame、form action、worker 和不带随机 nonce 的脚本/样式。
+
+测试页是本机调试入口，不是鉴权边界。Handler 会根据浏览器 `Origin` / `Sec-Fetch-Site` 拒绝明确的跨源 POST，但这不是账号、权限或完整 CSRF 身份机制；不要把监听地址改成 `0.0.0.0` 后直接暴露到公网。无浏览器头的旧 API 客户端仍保持空 body 和无 Content-Type 兼容性。
 
 ## 提交一轮挑战
 
@@ -119,21 +141,25 @@ curl --fail-with-body \
 |---|---|---|---|
 | `400` | `ApiRequestError` | JSON、类型、长度、prefix 或 proxy 校验失败 | 不调用 |
 | `400` | `InvalidRequest` | Solver 返回稳定的无效请求错误 | 已调用一次 |
+| `403` | `ApiOriginError` | 浏览器 `Origin` / `Sec-Fetch-Site` 明确表明跨源 | 不调用 |
 | `500` | `ProtocolError`、`NetworkError`、`VisionError`、`InternalError` | Solver 返回分类错误 | 已调用一次 |
 | `500` | `UnhandledProtocolError` | 未分类错误或 Solver panic；响应不回显原始错误 | 已调用一次 |
 | `404` | 无固定 `errorType` | 未开放的方法或路径 | 不调用 |
 
-HTTP 层不设置本地 admission gate、不维护并发槽，也不因本机在途请求数主动返回 `429` 或 `Retry-After`。每个通过输入校验的 `POST /api/slider` 都直接进入 Solver；`--max-concurrency` 仅是 Client 每个 route/host 的出站连接与设备预热资源预算，不是 HTTP 并发上限。上游、连接池或机器资源仍可能自然等待或以技术错误结束。
+HTTP 层不设置本地 admission gate、不维护并发槽，也不因本机在途请求数主动返回 `429` 或 `Retry-After`。每个通过浏览器跨源与输入校验的 `POST /api/slider` 都直接进入 Solver；`--max-concurrency` 仅是 Client 每个 route/host 的出站连接与设备预热资源预算，不是 HTTP 并发上限。上游、连接池或机器资源仍可能自然等待或以技术错误结束。
 
-通过输入校验的请求使用服务 `--timeout`。Handler 从请求 `context.Context` 派生 deadline 并传入 Solver；调用方断开或 deadline 到期会取消该 context，超时返回脱敏 `500 NetworkError`。Solver panic 由 Handler 恢复并返回脱敏 `500 UnhandledProtocolError`，不会回显 panic 内容。自定义 Solver 仍必须主动响应 `context.Context`。
+通过跨源和输入校验的请求使用服务 `--timeout`。Handler 从请求 `context.Context` 派生 deadline 并传入 Solver；调用方断开或 deadline 到期会取消该 context，超时返回脱敏 `500 NetworkError`。Solver panic 由 Handler 恢复并返回脱敏 `500 UnhandledProtocolError`，不会回显 panic 内容。自定义 Solver 仍必须主动响应 `context.Context`。
 
 ### 响应头
 
 | 响应 | Header | 说明 |
 |---|---|---|
 | 所有响应 | `Cache-Control: no-store` | 防止包含挑战结果的响应被缓存 |
-| `/api/slider` 的 `200/400/500` | `X-Trace-ID` | 与响应体 `traceId` 一致 |
+| `GET /` | `Content-Security-Policy`、`X-Frame-Options`、`Cross-Origin-Resource-Policy`、`Permissions-Policy` | 页面只运行随机 nonce 的内联资源，只连接同源 API，禁止被 frame 嵌入 |
+| `GET /` | `Content-Type: text/html; charset=utf-8` | 内嵌测试页 |
+| `/api/slider` 的 `200/400/403/500` | `X-Trace-ID` | 与响应体 `traceId` 一致 |
 | JSON 响应 | `Content-Type: application/json; charset=utf-8` | UTF-8 JSON |
+| HTML 与 JSON | `X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer` | 禁止 MIME 猜测且不发送 referrer |
 
 ## 健康检查与 OpenAPI
 
@@ -159,12 +185,12 @@ curl --fail --output openapi.json http://127.0.0.1:8000/openapi.json
 
 | Evidence | Finding | Path |
 |---|---|---|
-| `internal/server/server.go:25` · `SolvePath`、`HealthPath`、`OpenAPIPath`；`:87` · `ServeHTTP` | HTTP 层只开放三个冻结入口；GET solve 走 404。 | method + path → route switch → handler 或 404 |
-| `internal/server/server.go:169` · `decodeRequest`；`:237` · `optionalAliasedText` | 请求体限制为 64 KiB；规范字段优先，未知字段忽略，字符串先 trim 再校验。 | body → JSON object → alias resolution → `slider.Request` |
-| `internal/server/server.go:268` · `normalizeProxy` | HTTP 层校验代理 scheme、主机和端口，并为无 scheme 输入补 `http://`。 | proxy text → `url.Parse` → normalized proxy |
-| `internal/server/server.go:105` · `handleSolve`；`:135` · `callSolver`；`:145` · `solverErrorResponse` | HTTP 输入合法后不经过本地 admission，直接在请求派生的 deadline context 中调用一次 Solver；panic 被恢复，业务完成态仍为 200。 | parse → timeout context → Solve ×1 → result/error mapping |
+| `internal/server/server.go` · `TestPagePath`、`SolvePath`、`HealthPath`、`OpenAPIPath`、`ServeHTTP`；`internal/server/testpage.go` · `writeTestPage` | HTTP 层只开放四个冻结入口；页面 GET 不调用 Solver，GET solve 仍走 404。 | method + path → HTML/JSON handler 或 404 |
+| `internal/server/server.go` · `decodeRequest` / `optionalAliasedText` | 请求体限制为 64 KiB；规范字段优先，未知字段忽略，字符串先 trim 再校验。 | body → JSON object → alias resolution → `slider.Request` |
+| `internal/server/server.go` · `normalizeProxy` | HTTP 层校验代理 scheme、主机和端口，并为无 scheme 输入补 `http://`。 | proxy text → `url.Parse` → normalized proxy |
+| `internal/server/server.go` · `browserOriginProtection` / `handleSolve` / `callSolver` / `solverErrorResponse` | Go 标准库拦截明确跨源浏览器请求并在 Solver 前返回 403；其他 HTTP 输入合法后不经本地 admission，在请求派生的 deadline context 中调用一次 Solver；panic 被恢复。 | origin gate → parse → timeout context → Solve ×1 → result/error mapping |
 | `internal/config/config.go:26` · `MaxConcurrency`；`cmd/server/main.go:124` · `clientOptions`；`pkg/slider/client.go:91` · `NewTransportPool` | 兼容配置名 `MaxConcurrency` 只进入 Client 的每 route/host 连接与预热资源边界，不进入 HTTP Handler。 | config → ClientOptions → transport/prewarm budget；valid POST → Solver |
 | `pkg/slider/types.go:22` · `Result`；`:45` · `ErrorKind` | 成功响应字段与稳定错误类别由 library 合同定义。 | Solver output → server response DTO → JSON |
-| `internal/server/openapi.go:3` · `openAPIDocument`；`:20` · `responses` | 运行时 OpenAPI 描述请求别名、完整 200 字段以及 400/500 错误合同，不声明本地 429。 | GET `/openapi.json` → generated document → JSON |
+| `internal/server/openapi.go` · `openAPIDocument`；`internal/server/server_test.go` · `TestEmbeddedAPITestPage` / `TestBrowserOriginBoundaryPreservesLegacyClients` / `TestOnlyFrozenRoutesAreExposed` | 运行时 OpenAPI 描述 HTML 测试页、请求别名、完整 200 字段及 400/403/500 错误合同；页面安全头、nonce、跨源拒绝和无 Solver 副作用均有回归。 | GET `/` / `/openapi.json` → embedded page / generated contract → same-origin manual POST |
 | `internal/device/rpc.go:119`、`:130` | Device 顶层 Code 统一校验，只有 Log1 解码对象内的 DeviceConfig；Log2/3 接受非对象结果。 | upstream JSON → action-specific schema → session result |
 | `pkg/slider/online_acceptance_test.go:37`、`:49`、`:98`、`:128`、`:147`、`:165`、`:168`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 2026-08-07 候选 200/32/应用层零重试批次严格成功 `196/200`，Client 完整链墙钟 P95 `984ms`；最终 one-shot 加固后未在线重跑。 | public Client → one Solve per job → aggregate Client contract evidence；不经过 HTTP Handler |

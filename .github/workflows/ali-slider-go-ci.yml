@@ -194,11 +194,19 @@ jobs:
           Copy-Item `
             "packaging/windows/start.bat" `
             (Join-Path $packageDir "start.bat")
-          Copy-Item `
-            "packaging/windows/README-Windows.txt" `
-            (Join-Path $packageDir "README-Windows.txt")
 
           $utf8 = [System.Text.UTF8Encoding]::new($false)
+          $utf8WithBOM = [System.Text.UTF8Encoding]::new($true)
+          $readme = Get-Content `
+            -LiteralPath "packaging/windows/README-Windows.txt" `
+            -Encoding utf8 `
+            -Raw
+          [IO.File]::WriteAllText(
+            (Join-Path $packageDir "README-Windows.txt"),
+            $readme,
+            $utf8WithBOM
+          )
+
           $buildInfo = @(
             "project=ali-slider-go"
             "commit=$env:GITHUB_SHA"
@@ -270,6 +278,13 @@ jobs:
           $header = [IO.File]::ReadAllBytes($exe)
           if ($header.Length -lt 2 -or $header[0] -ne 0x4d -or $header[1] -ne 0x5a) {
             throw "Packaged executable is not a PE file"
+          }
+          $readmeBytes = [IO.File]::ReadAllBytes((Join-Path $verifyDir "README-Windows.txt"))
+          if ($readmeBytes.Length -lt 3 -or
+              $readmeBytes[0] -ne 0xef -or
+              $readmeBytes[1] -ne 0xbb -or
+              $readmeBytes[2] -ne 0xbf) {
+            throw "Packaged Windows README is missing the UTF-8 BOM"
           }
 
           $recordedChecksums = @{}
@@ -349,6 +364,26 @@ jobs:
               throw "start.bat did not create exactly one packaged executable"
             }
 
+            $pageResponse = Invoke-WebRequest `
+              -Uri "http://127.0.0.1:18080/" `
+              -TimeoutSec 2
+            $pageContentType = [string]$pageResponse.Headers["Content-Type"]
+            $pageCSP = [string]$pageResponse.Headers["Content-Security-Policy"]
+            if ($pageResponse.StatusCode -ne 200 -or $pageContentType -notmatch "^text/html(?:;|$)") {
+              throw "Packaged API test page returned status $($pageResponse.StatusCode) and Content-Type '$pageContentType'"
+            }
+            if (-not $pageResponse.Content.Contains('id="api-test-console"') -or
+                -not $pageResponse.Content.Contains('fetch("/api/slider"')) {
+              throw "Packaged API test page is missing its stable marker or same-origin solve path"
+            }
+            if ($pageCSP -notmatch "connect-src 'self'" -or
+                $pageCSP -match "unsafe-inline" -or
+                [string]$pageResponse.Headers["Cache-Control"] -ne "no-store" -or
+                [string]$pageResponse.Headers["X-Content-Type-Options"] -ne "nosniff" -or
+                [string]$pageResponse.Headers["Referrer-Policy"] -ne "no-referrer") {
+              throw "Packaged API test page security-header contract failed"
+            }
+
             $openapiResponse = Invoke-WebRequest `
               -Uri "http://127.0.0.1:18080/openapi.json" `
               -TimeoutSec 2
@@ -357,6 +392,31 @@ jobs:
             $openapiVersion = [string]$openapiDocument["openapi"]
             if ($openapiVersion -ne "3.0.3") {
               throw "Packaged executable returned OpenAPI version '$openapiVersion'"
+            }
+            if (-not $openapiDocument["paths"].ContainsKey("/")) {
+              throw "Packaged OpenAPI document is missing the API test page path"
+            }
+            $solveResponses = $openapiDocument["paths"]["/api/slider"]["post"]["responses"]
+            if (-not $solveResponses.ContainsKey("403") -or $solveResponses.ContainsKey("429")) {
+              throw "Packaged OpenAPI solve responses do not match the 403/no-429 contract"
+            }
+
+            $crossOrigin = Invoke-WebRequest `
+              -Method Post `
+              -Uri "http://127.0.0.1:18080/api/slider" `
+              -Headers @{ "Origin" = "https://attacker.example"; "Sec-Fetch-Site" = "cross-site" } `
+              -Body "" `
+              -SkipHttpErrorCheck `
+              -TimeoutSec 2
+            $crossOriginBody = $crossOrigin.Content |
+              ConvertFrom-Json -AsHashtable
+            $crossOriginTraceHeader = [string]$crossOrigin.Headers["X-Trace-ID"]
+            $crossOriginTraceBody = [string]$crossOriginBody["traceId"]
+            if ($crossOrigin.StatusCode -ne 403 -or
+                [string]$crossOriginBody["errorType"] -ne "ApiOriginError" -or
+                [string]::IsNullOrWhiteSpace($crossOriginTraceHeader) -or
+                $crossOriginTraceHeader -ne $crossOriginTraceBody) {
+              throw "Cross-origin browser boundary smoke failed"
             }
 
             $invalid = Invoke-WebRequest `

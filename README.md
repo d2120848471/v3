@@ -1,6 +1,6 @@
 # Ali Slider Go
 
-阿里 V3 滑块协议的纯 Go 实现。生产运行、测试、Linux 构建和容器均不依赖 Python、Node.js、浏览器、OpenCV、GoCV、CGo、动态库或子进程。
+阿里 V3 滑块协议的纯 Go 实现。服务端生产求解、自动化测试、Linux 构建和容器均不依赖 Python、Node.js、浏览器、OpenCV、GoCV、CGo、动态库或子进程；内嵌 API 测试页只需系统现有的现代浏览器。
 
 > 仅用于自有系统或获得明确授权的研究、兼容性验证与测试环境。服务默认只监听 `127.0.0.1:8000`，不应把未加鉴权的端口直接暴露到公网。
 
@@ -16,7 +16,7 @@ go run ./cmd/server
 
 GitHub Actions 会在全部质量门禁通过后生成 `ali-slider-go-windows-amd64.zip`。包内是独立 EXE、双击启动脚本、中文说明、构建信息和 SHA-256；适用于 Windows 10 / Windows Server 2016 或更高版本的 AMD64/x64 机器，接收者无需安装 Go、Python、Node.js 或 VC++ Runtime。
 
-下载：GitHub 仓库 **Actions** → `ali-slider-go-ci` → `main` 最新成功运行 → `ali-slider-go-windows-amd64.zip`。完整解压后双击 `start.bat`，等待 `event=listen status=ready`。这是本机 HTTP 服务，不是桌面 GUI。
+下载：GitHub 仓库 **Actions** → `ali-slider-go-ci` → `main` 最新成功运行 → `ali-slider-go-windows-amd64.zip`。完整解压后双击 `start.bat`，等待 `event=listen status=ready`，再用现代浏览器打开 `http://127.0.0.1:8000/`。程序不是桌面 GUI，但 EXE 内置了无额外 Web 运行时或 CDN 依赖的 API 测试页，可手工填写参数并查看状态、耗时、trace 和脱敏结果。
 
 完整说明见 [Windows AMD64 便携包](./ali-slider-go/docs/windows.md)。
 
@@ -29,7 +29,7 @@ GitHub Actions 会在全部质量门禁通过后生成 `ali-slider-go-windows-am
 - [测试与质量门禁](./ali-slider-go/docs/testing.md)
 - [安全边界](./ali-slider-go/docs/security.md)
 - [Windows AMD64 便携包](./ali-slider-go/docs/windows.md)
-- [最新离线验证证据](./ali-slider-go/docs/evidence/validation-2026-08-08-no-local-admission.md)
+- [2026-08-08 无本地 admission 历史证据](./ali-slider-go/docs/evidence/validation-2026-08-08-no-local-admission.md)
 
 ## 目录
 

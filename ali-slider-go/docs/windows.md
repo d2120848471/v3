@@ -4,7 +4,9 @@ GitHub Actions 在 Linux quality 与 Darwin race 门禁全部通过后，使用 
 
 平台下限依据 Go 1.26 的官方 [Minimum Requirements](https://go.dev/wiki/MinimumRequirements)。
 
-> 本程序是本机 HTTP 服务，不是图形界面。当前包只支持 Windows AMD64/x64。默认启动会访问外部 Device RPC 做会话预热；真实求解还需要访问 Captcha RPC 和图片 CDN。仅限自有系统或获得明确授权的测试环境。
+> 本程序是本机控制台 HTTP 服务，不是桌面图形应用，但内置浏览器 API 测试页。当前包只支持 Windows AMD64/x64。默认启动会访问外部 Device RPC 做会话预热；测试页手工求解还会访问 Captcha RPC 和图片 CDN。仅限自有系统或获得明确授权的测试环境。
+
+测试页需要现代 Edge、Chrome 或 Firefox，不支持 Internet Explorer。没有现代浏览器时，EXE 服务和 PowerShell/API 仍可使用，不需要 Go、Python、Node.js 或 VC++ Runtime。
 
 ## 下载并启动
 
@@ -19,6 +21,7 @@ GitHub Actions 在 Linux quality 与 Darwin race 门禁全部通过后，使用 
 
 | 用途 | 地址 |
 |---|---|
+| API 测试页 | `http://127.0.0.1:8000/` |
 | 健康检查 | `http://127.0.0.1:8000/health` |
 | 求解 API | `http://127.0.0.1:8000/api/slider` |
 | OpenAPI | `http://127.0.0.1:8000/openapi.json` |
@@ -38,7 +41,7 @@ ali-slider-go-windows-amd64.zip
 
 - `ali-slider-go.exe` 是 `CGO_ENABLED=0` 的 Windows AMD64 console PE；默认触摸轨迹已经嵌入 EXE。
 - `start.bat` 先切换到自身目录，再提供回环地址、端口与 `var\artifacts` 路径的安全默认值；异常退出时保留窗口显示错误。
-- `README-Windows.txt` 是可脱离仓库阅读的最终用户说明。
+- `README-Windows.txt` 是可脱离仓库阅读的最终用户说明；打包时写为 UTF-8 BOM，便于 Windows Server 2016 旧记事本正确识别中文。
 - `BUILD-INFO.txt` 记录完整 commit、ref、Go 版本、目标平台和 UTC 构建时间，不包含 Secret 或 runner 用户路径。
 - `SHA256SUMS.txt` 保存包内文件校验值。
 
@@ -46,7 +49,19 @@ ali-slider-go-windows-amd64.zip
 
 ## 调用与配置
 
-默认启动不需要配置。PowerShell 调用示例：
+默认启动不需要配置。最直接的测试方式：
+
+1. 打开 `http://127.0.0.1:8000/`；
+2. 确认页面右上角显示“服务已就绪”；
+3. 参数可全部留空，或按需填写 SceneId、prefix、AaduaneId、proxy；
+4. 点击“发送一次求解”；
+5. 同时检查 HTTP、业务状态、Trace ID、`ok`、`VerifyCode` 和 `VerifyResult`。
+
+页面打开只检查 health，不自动创建挑战。点击提交才访问真实上游；执行中防双击，不自动重试。RPC key、代理、`securityToken` 和 `certifyId` 默认遮罩，但原始值仍存在当前页面内存中；不要截图、复制到公开日志、工单或聊天。刷新或点击“清空”会移除页面内结果。
+
+页面固定同源调用 API。其他网站的跨源请求不会成功：需要预检的浏览器 fetch 可能先被浏览器拦截；若明确跨源的 POST 实际到达服务，则返回 `403 ApiOriginError` 且不进入 Solver。不要为绕过该保护而放宽 CORS。
+
+也可直接使用 PowerShell：
 
 ```powershell
 $body = @{
@@ -69,7 +84,7 @@ Invoke-RestMethod `
 start.bat --port=8001
 ```
 
-此时健康检查、API 和 OpenAPI 地址中的端口也要改为 `8001`；最终以 `event=listen` 日志中的实际监听地址为准。`start.bat` 把额外参数放在内置默认参数之后，因此高级用户可以覆盖 flag。完整配置见 [配置参考](./configuration.md)。不要把 `--host` 改为 `0.0.0.0` 后直接对外暴露：服务没有应用内鉴权或本地 admission gate。
+此时测试页、健康检查、API 和 OpenAPI 地址中的端口也要改为 `8001`；页面内部使用同源相对路径，无需修改其他配置。最终以 `event=listen` 日志中的实际监听地址为准。`start.bat` 把额外参数放在内置默认参数之后，因此高级用户可以覆盖 flag。完整配置见 [配置参考](./configuration.md)。不要把 `--host` 改为 `0.0.0.0` 后直接对外暴露：服务没有应用内鉴权或本地 admission gate。
 
 ## 完整性与 SmartScreen
 
@@ -102,9 +117,9 @@ Unix 构建强制 Artifact 目录/文件为 `0700/0600`。Windows 的 Go `FileMo
 1. 依赖 Linux quality 与 Darwin race 成功；
 2. 在 `windows-2025` 原生运行 `go vet` 和全量 `go test`；
 3. 使用 Go module 固定的 Go `1.26.5`、`CGO_ENABLED=0` 和 `GOARCH=amd64` 构建；
-4. 生成构建信息、包内 SHA-256 和明确文件白名单；
+4. 生成构建信息、UTF-8 BOM 中文说明、包内 SHA-256 和明确文件白名单；
 5. 解压到含中文及空格的临时路径；
-6. 通过最终 `start.bat` 启动 EXE，验证脚本参数转发、`/health`、OpenAPI 3.0.3 和非法 JSON `400`；
+6. 通过最终 `start.bat` 启动 EXE，验证脚本参数转发、内嵌测试页及其安全头、`/health`、OpenAPI 3.0.3、跨源浏览器 POST `403 ApiOriginError` 和非法 JSON `400`；
 7. smoke 强制 `--device-prewarm=0`，不会发送 Device、Init、图片或 Verify 请求；
 8. `main` push 和 `workflow_dispatch` 直传单层 ZIP，PR 只验证不上传；
 9. 官方 actions 使用完整 commit SHA 固定，工作流权限保持 `contents: read`。
@@ -124,6 +139,7 @@ macOS/Linux 交叉构建只能证明 Windows 测试二进制可编译。发布�
 |---|---|---|
 | `go.mod:3`；`Makefile` · `build-windows` | Windows EXE 固定 Go 1.26.5、AMD64、CGO 关闭和 stripped 构建。 | source → pinned Go → PE executable |
 | `internal/track/track.go:21` | 生产运行所需默认轨迹已嵌入 EXE，不需要外置 fixture。 | embedded asset → single executable |
+| `internal/server/testpage.go`、`internal/server/web/test.html` | API 测试页、样式和脚本编译进同一 EXE，只能同源手工提交，不增加 ZIP 文件或运行时依赖。 | embedded page → browser GET `/` → explicit same-origin POST |
 | `internal/artifact/store.go` · `ensureDirectory`；`store_test.go` | Unix 精确 mode 与 Windows ACL 语义分离，其他路径/竞态/配额保护保持。 | platform filesystem → safe directory → bounded artifact |
 | `.github/workflows/ali-slider-go-ci.yml` · `windows-package` | 只有跨平台门禁和 Windows 原生 package smoke 成功后才上传可分发 ZIP。 | commit → quality/race → native Windows test → ZIP |
 | `packaging/windows/start.bat` | 双击入口固定工作目录、提供回环监听默认值，并保留 console 诊断和 Ctrl+C。 | extracted package → local server → controlled shutdown |

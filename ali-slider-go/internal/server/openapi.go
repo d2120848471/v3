@@ -8,6 +8,29 @@ func openAPIDocument() map[string]any {
 			"version": "1.0.0",
 		},
 		"paths": map[string]any{
+			TestPagePath: map[string]any{
+				"get": map[string]any{
+					"summary": "本机 API 测试页",
+					"responses": map[string]any{
+						"200": map[string]any{
+							"description": "内嵌 HTML 测试页",
+							"content": map[string]any{
+								"text/html": map[string]any{
+									"schema": map[string]any{"type": "string"},
+								},
+							},
+						},
+						"500": map[string]any{
+							"description": "随机 nonce 初始化失败",
+							"content": map[string]any{
+								"text/plain": map[string]any{
+									"schema": map[string]any{"type": "string"},
+								},
+							},
+						},
+					},
+				},
+			},
 			SolvePath: map[string]any{
 				"post": map[string]any{
 					"summary": "执行一轮滑块验证",
@@ -23,6 +46,7 @@ func openAPIDocument() map[string]any {
 							successSchema(),
 						),
 						"400": responseSchema("请求参数无效", errorSchema()),
+						"403": responseSchema("浏览器跨源请求被拒绝", errorSchema()),
 						"500": responseSchema("协议或运行错误", errorSchema()),
 					},
 				},

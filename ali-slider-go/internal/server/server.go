@@ -23,11 +23,14 @@ import (
 )
 
 const (
+	TestPagePath    = "/"
 	SolvePath       = "/api/slider"
 	HealthPath      = "/health"
 	OpenAPIPath     = "/openapi.json"
 	maxRequestBytes = int64(64 * 1024)
 )
+
+var browserOriginProtection = http.NewCrossOriginProtection()
 
 // Options 配置 HTTP 层。Solver 是唯一必填项；其余零值使用项目默认值。
 type Options struct {
@@ -84,10 +87,13 @@ func New(options Options) (*Handler, error) {
 	}, nil
 }
 
-// ServeHTTP 仅暴露冻结合同中的三个入口；GET 解题明确返回 404。
+// ServeHTTP 仅暴露冻结合同中的四个入口；GET 解题明确返回 404。
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	switch {
+	case r.Method == http.MethodGet && r.URL.Path == TestPagePath:
+		status := writeTestPage(w)
+		h.logResult("", status, started)
 	case r.Method == http.MethodPost && r.URL.Path == SolvePath:
 		h.handleSolve(w, r, started)
 	case r.Method == http.MethodGet && r.URL.Path == HealthPath:
@@ -105,6 +111,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleSolve(w http.ResponseWriter, r *http.Request, started time.Time) {
 	traceID := newTraceID()
 	headers := map[string]string{"X-Trace-ID": traceID}
+	if browserOriginProtection.Check(r) != nil {
+		h.writeJSON(w, http.StatusForbidden, errorBody("ApiOriginError", "不接受跨源浏览器请求", traceID), headers)
+		h.logResult(traceID, http.StatusForbidden, started)
+		return
+	}
 	request, err := h.decodeRequest(w, r)
 	if err != nil {
 		h.writeJSON(w, http.StatusBadRequest, errorBody("ApiRequestError", err.Error(), traceID), headers)
@@ -319,12 +330,18 @@ func (h *Handler) writeJSON(w http.ResponseWriter, status int, body any, headers
 		payload = []byte(`{"ok":false,"errorType":"InternalError","error":"响应编码失败"}`)
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
+	setPrivateResponseHeaders(w.Header())
 	for name, value := range headers {
 		w.Header().Set(name, value)
 	}
 	w.WriteHeader(status)
 	_, _ = w.Write(payload)
+}
+
+func setPrivateResponseHeaders(header http.Header) {
+	header.Set("Cache-Control", "no-store")
+	header.Set("X-Content-Type-Options", "nosniff")
+	header.Set("Referrer-Policy", "no-referrer")
 }
 
 func (h *Handler) logResult(traceID string, status int, started time.Time) {

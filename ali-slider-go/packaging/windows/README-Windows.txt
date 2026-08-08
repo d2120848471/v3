@@ -1,9 +1,10 @@
 Ali Slider Go Windows AMD64 便携版
 ==================================
 
-本程序是运行在本机的 HTTP 服务，不是图形界面。
+本程序是运行在本机的控制台 HTTP 服务，不是桌面图形应用，但内置浏览器 API 测试页。
 解压后可直接运行，无需安装 Go、Python、Node.js、OpenCV、VC++ Runtime 或第三方 DLL。
 系统要求：Windows 10 / Windows Server 2016 或更高版本，AMD64/x64 处理器。
+测试页需要现代 Edge、Chrome 或 Firefox，不支持 Internet Explorer。没有现代浏览器时，EXE 和 PowerShell/API 仍可使用。
 
 安全边界
 --------
@@ -21,12 +22,24 @@ Ali Slider Go Windows AMD64 便携版
 1. 必须先完整解压 ZIP。不要直接在压缩软件预览窗口中运行。
 2. 双击 start.bat。
 3. 等待控制台出现：event=listen status=ready。
-4. 健康检查：http://127.0.0.1:8000/health
-5. API 地址：http://127.0.0.1:8000/api/slider
-6. OpenAPI：http://127.0.0.1:8000/openapi.json
-7. 停止服务：在服务窗口按 Ctrl+C，然后等待窗口退出。
+4. API 测试页：http://127.0.0.1:8000/
+5. 健康检查：http://127.0.0.1:8000/health
+6. API 地址：http://127.0.0.1:8000/api/slider
+7. OpenAPI：http://127.0.0.1:8000/openapi.json
+8. 停止服务：在服务窗口按 Ctrl+C，然后等待窗口退出。
 
 默认预热失败时，程序会记录 warning 并继续冷启动服务；网络较慢时，ready 最多可能等待约 25 秒。
+
+浏览器测试
+----------
+
+1. 打开 http://127.0.0.1:8000/。
+2. 确认页面显示“服务已就绪”。
+3. 参数可全部留空；点击“发送一次求解”后检查 HTTP、业务状态、ok、VerifyCode 和 VerifyResult。
+4. 页面打开只检查 health，不自动求解；执行期间防双击，也不会自动重试。
+5. RPC key、代理、securityToken 和 certifyId 默认遮罩。不要把完整请求/响应截图、复制到公开日志、工单或聊天。
+6. 页面不保存历史、Cookie 或浏览器存储；刷新或点击“清空”即清除当前结果。
+7. 页面固定同源调用。其他网站的跨源请求不会成功：需要预检的浏览器 fetch 可能先被浏览器拦截；若明确跨源的 POST 实际到达服务，则返回 403 ApiOriginError 且不进入 Solver。不要放宽 CORS 绕过保护。
 
 PowerShell 调用示例
 -------------------
@@ -51,7 +64,7 @@ Invoke-RestMethod `
 
 start.bat --port=8001
 
-此时健康检查和 API 地址中的端口也应改为 8001。启动窗口开头标注的是默认 8000；最终以 event=listen 日志中的实际监听地址为准。
+此时测试页、健康检查、API 和 OpenAPI 地址中的端口也应改为 8001。页面使用同源路径，不需要其他配置。启动窗口开头标注的是默认 8000；最终以 event=listen 日志中的实际监听地址为准。
 
 完整参数可运行：
 
@@ -66,16 +79,19 @@ ali-slider-go.exe --help
 2. 健康检查暂时失败
    等待 status=ready。默认预热会先访问外部 Device RPC；网络慢时启动会延迟。
 
-3. health ready，但 solve 失败
-   /health 只证明本地 HTTP 服务可响应，不检查上游。根据 HTTP 状态、errorType 和 traceId 排查网络或协议问题。
+3. 测试页打不开
+   确认控制台已出现 status=ready，并使用启动日志中的实际端口。若改为 --port=8001，页面地址也是 http://127.0.0.1:8001/。
 
-4. Windows Defender / SmartScreen 提示未知发布者
+4. 页面已打开，但 solve 失败
+   页面打开和 /health 只证明本地 HTTP 服务可响应，不检查上游。根据 HTTP 状态、errorType 和 traceId 排查网络或协议问题。
+
+5. Windows Defender / SmartScreen 提示未知发布者
    当前自动构建未做商业 Authenticode 代码签名。请只从可信仓库取得文件，并核对 SHA256SUMS.txt；不要关闭系统防护或绕过组织安全策略。
 
-5. “此应用无法在你的电脑上运行”
+6. “此应用无法在你的电脑上运行”
    确认系统至少为 Windows 10 / Windows Server 2016，并使用 64 位 Intel/AMD 架构。本包不支持 32 位 Windows；ARM64 也不是本包的原生目标。
 
-6. artifact_purge warning 或无法保存失败样本
+7. artifact_purge warning 或无法保存失败样本
    检查解压目录是否可写，以及当前用户是否具有该目录的 NTFS ACL 权限。不要以管理员身份作为常规解决办法。
 
 完整性校验

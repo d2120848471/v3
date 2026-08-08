@@ -12,6 +12,7 @@ if not exist "ali-slider-go.exe" (
 )
 
 echo Ali Slider Go 正在启动。
+echo 默认 API 测试页：http://127.0.0.1:8000/
 echo 默认本机 API：http://127.0.0.1:8000/api/slider
 echo 默认健康检查：http://127.0.0.1:8000/health
 echo 如追加了 flag，请以启动日志中的实际监听地址为准。

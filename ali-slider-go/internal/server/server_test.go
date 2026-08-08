@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -107,6 +108,9 @@ func TestSolveAliasesUnknownFieldsAndBusinessFailure(t *testing.T) {
 	if response.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("Cache-Control = %q", response.Header().Get("Cache-Control"))
 	}
+	if response.Header().Get("X-Content-Type-Options") != "nosniff" || response.Header().Get("Referrer-Policy") != "no-referrer" {
+		t.Fatalf("security headers missing: %#v", response.Header())
+	}
 }
 
 func TestCanonicalAliasPrecedenceAndDefaults(t *testing.T) {
@@ -205,6 +209,190 @@ func TestRequestBodyLimit(t *testing.T) {
 	}
 }
 
+func TestEmbeddedAPITestPage(t *testing.T) {
+	var calls atomic.Int32
+	handler := newTestHandler(t, solverFunc(func(context.Context, slider.Request) (slider.Result, error) {
+		calls.Add(1)
+		return slider.Result{}, nil
+	}), nil)
+
+	first := performRequest(handler, http.MethodGet, TestPagePath, "")
+	if first.Code != http.StatusOK {
+		t.Fatalf("page status = %d, want 200; body=%s", first.Code, first.Body.String())
+	}
+	if first.Header().Get("Content-Type") != "text/html; charset=utf-8" || first.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("page response headers = %#v", first.Header())
+	}
+	for name, want := range map[string]string{
+		"X-Content-Type-Options":       "nosniff",
+		"Referrer-Policy":              "no-referrer",
+		"X-Frame-Options":              "DENY",
+		"Cross-Origin-Resource-Policy": "same-origin",
+		"Cross-Origin-Opener-Policy":   "same-origin",
+	} {
+		if got := first.Header().Get(name); got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+	if first.Header().Get("Permissions-Policy") == "" {
+		t.Fatal("Permissions-Policy is missing")
+	}
+
+	csp := first.Header().Get("Content-Security-Policy")
+	nonceMatch := regexp.MustCompile(`script-src 'nonce-([0-9a-f]{32})'`).FindStringSubmatch(csp)
+	if len(nonceMatch) != 2 {
+		t.Fatalf("CSP has no 128-bit script nonce: %q", csp)
+	}
+	nonce := nonceMatch[1]
+	for _, directive := range []string{
+		"default-src 'none'", "connect-src 'self'", "script-src-attr 'none'",
+		"style-src 'nonce-" + nonce + "'", "style-src-attr 'none'", "form-action 'none'", "frame-ancestors 'none'",
+	} {
+		if !strings.Contains(csp, directive) {
+			t.Errorf("CSP missing %q: %q", directive, csp)
+		}
+	}
+	for _, forbidden := range []string{"'unsafe-inline'", "'unsafe-eval'"} {
+		if strings.Contains(csp, forbidden) {
+			t.Errorf("CSP contains %q: %q", forbidden, csp)
+		}
+	}
+
+	body := first.Body.String()
+	for _, required := range []string{
+		`id="api-test-console"`, `fetch("/api/slider"`, `fetch("/health"`,
+		`"SceneId"`, `"prefix"`, `"AaduaneId"`, `"proxy"`, `AbortController`, `TextEncoder`,
+		`response.status === 200`, `!Array.isArray(lastResponse)`, `lastResponse.VerifyCode === "T001"`,
+		`lastResponse.VerifyResult === true`, `lastResponse.securityToken.length > 0`,
+	} {
+		if !strings.Contains(body, required) {
+			t.Errorf("page missing %q", required)
+		}
+	}
+	if strings.Count(body, `nonce="`+nonce+`"`) != 2 || strings.Contains(body, testPageNoncePlaceholder) {
+		t.Fatalf("page nonce substitution is incomplete")
+	}
+	if count := strings.Count(body, "fetch("); count != 2 {
+		t.Fatalf("page fetch calls = %d, want only health and manual solve", count)
+	}
+	for _, forbidden := range []string{
+		`<script src=`, `rel="stylesheet"`, "innerHTML", "outerHTML", "insertAdjacentHTML",
+		"localStorage", "sessionStorage", "indexedDB", "caches.", "document.cookie", "navigator.sendBeacon", "serviceWorker",
+		"XMLHttpRequest", "WebSocket", "EventSource", "eval(", "new Function",
+	} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("page contains forbidden browser API/resource %q", forbidden)
+		}
+	}
+
+	second := performRequest(handler, http.MethodGet, TestPagePath, "")
+	secondMatch := regexp.MustCompile(`script-src 'nonce-([0-9a-f]{32})'`).FindStringSubmatch(second.Header().Get("Content-Security-Policy"))
+	if len(secondMatch) != 2 || secondMatch[1] == nonce {
+		t.Fatalf("consecutive page nonces are not unique: first=%q second=%#v", nonce, secondMatch)
+	}
+	for _, method := range []string{http.MethodPost, http.MethodHead} {
+		response := performRequest(handler, method, TestPagePath, `{}`)
+		if response.Code != http.StatusNotFound {
+			t.Errorf("%s page status = %d, want 404", method, response.Code)
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("page routes called Solver %d times", calls.Load())
+	}
+}
+
+func TestEmbeddedAPITestPageNonceFailure(t *testing.T) {
+	original := readTestPageNonce
+	readTestPageNonce = func([]byte) (int, error) { return 0, errors.New("sensitive entropy failure") }
+	t.Cleanup(func() { readTestPageNonce = original })
+
+	var calls atomic.Int32
+	handler := newTestHandler(t, solverFunc(func(context.Context, slider.Request) (slider.Result, error) {
+		calls.Add(1)
+		return slider.Result{}, nil
+	}), nil)
+	response := performRequest(handler, http.MethodGet, TestPagePath, "")
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body=%s", response.Code, response.Body.String())
+	}
+	if response.Header().Get("Content-Type") != "text/plain; charset=utf-8" || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("page failure headers = %#v", response.Header())
+	}
+	if strings.Contains(response.Body.String(), "sensitive entropy failure") {
+		t.Fatalf("page failure leaked cause: %q", response.Body.String())
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("page nonce failure called Solver %d times", calls.Load())
+	}
+}
+
+func TestBrowserOriginBoundaryPreservesLegacyClients(t *testing.T) {
+	var calls atomic.Int32
+	handler := newTestHandler(t, solverFunc(func(context.Context, slider.Request) (slider.Result, error) {
+		calls.Add(1)
+		return slider.Result{}, nil
+	}), nil)
+
+	request := func(origin, fetchSite string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8000"+SolvePath, nil)
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		if fetchSite != "" {
+			req.Header.Set("Sec-Fetch-Site", fetchSite)
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		return response
+	}
+
+	for _, test := range []struct {
+		name      string
+		origin    string
+		fetchSite string
+	}{
+		{name: "cross-site metadata", fetchSite: "cross-site"},
+		{name: "same-site metadata", fetchSite: "same-site"},
+		{name: "foreign origin", origin: "https://attacker.example"},
+		{name: "opaque origin", origin: "null"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := request(test.origin, test.fetchSite)
+			if response.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403; body=%s", response.Code, response.Body.String())
+			}
+			body := decodeObject(t, response)
+			if body["errorType"] != "ApiOriginError" || response.Header().Get("X-Trace-ID") != body["traceId"] {
+				t.Fatalf("cross-site response = %#v headers=%#v", body, response.Header())
+			}
+		})
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("cross-site requests called Solver %d times", calls.Load())
+	}
+
+	for _, test := range []struct {
+		name      string
+		origin    string
+		fetchSite string
+	}{
+		{name: "same-origin page", origin: "http://127.0.0.1:8000", fetchSite: "same-origin"},
+		{name: "user initiated browser request", fetchSite: "none"},
+		{name: "legacy headerless client"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := request(test.origin, test.fetchSite)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("allowed requests called Solver %d times, want 3", calls.Load())
+	}
+}
+
 func TestOnlyFrozenRoutesAreExposed(t *testing.T) {
 	var calls atomic.Int32
 	handler := newTestHandler(t, solverFunc(func(context.Context, slider.Request) (slider.Result, error) {
@@ -231,11 +419,26 @@ func TestOnlyFrozenRoutesAreExposed(t *testing.T) {
 		t.Fatal(err)
 	}
 	paths := document["paths"].(map[string]any)
-	if len(paths) != 3 {
+	if len(paths) != 4 {
 		t.Fatalf("OpenAPI paths = %#v", paths)
+	}
+	page := paths[TestPagePath].(map[string]any)
+	if len(page) != 1 {
+		t.Fatalf("test page methods = %#v", page)
+	}
+	pageContent := page["get"].(map[string]any)["responses"].(map[string]any)["200"].(map[string]any)["content"].(map[string]any)
+	if _, exists := pageContent["text/html"]; !exists {
+		t.Fatalf("test page OpenAPI content = %#v", pageContent)
+	}
+	pageFailureContent := page["get"].(map[string]any)["responses"].(map[string]any)["500"].(map[string]any)["content"].(map[string]any)
+	if _, exists := pageFailureContent["text/plain"]; !exists {
+		t.Fatalf("test page OpenAPI failure content = %#v", pageFailureContent)
 	}
 	solve := paths[SolvePath].(map[string]any)["post"].(map[string]any)
 	responses := solve["responses"].(map[string]any)
+	if _, exists := responses["403"]; !exists {
+		t.Fatal("OpenAPI does not advertise the cross-site browser rejection")
+	}
 	if _, exists := responses["429"]; exists {
 		t.Fatal("OpenAPI still advertises local 429")
 	}

@@ -2,7 +2,7 @@
 
 ## 1. 系统定位
 
-`ali-slider-go` 是独立的纯 Go module，提供可并发复用的 `slider.Client` 和三个 HTTP 端点。生产链不启动 Python、Node.js、浏览器或子进程，不依赖 OpenCV、GoCV、CGo 或动态库。
+`ali-slider-go` 是独立的纯 Go module，提供可并发复用的 `slider.Client` 和四个 HTTP 入口。生产求解链不启动 Python、Node.js、浏览器或子进程，不依赖 OpenCV、GoCV、CGo 或动态库；`GET /` 返回编译进 EXE 的第一方浏览器测试页，不代表服务端启动浏览器。
 
 完整单轮编排已实现：
 
@@ -24,7 +24,8 @@ Device RPC 响应按 action 解码：顶层 Code 统一校验，只有 Log1 将 
 
 ```mermaid
 flowchart LR
-    caller["授权调用方"] --> http["server.Handler<br/>JSON / Trace / Timeout<br/>合法 POST 直接调用"]
+    caller["授权调用方"] --> http["server.Handler<br/>Origin / JSON / Trace / Timeout<br/>合法 POST 直接调用"]
+    page["内嵌 API 测试页<br/>GET / · 手工提交"] --> http
     http --> client["slider.Client"]
 
     subgraph one_request["单轮私有状态"]
@@ -51,7 +52,9 @@ flowchart LR
     failure -.-> verify
 ```
 
-HTTP 层先完成输入校验；合法 `POST /api/slider` 不经过本地 admission gate，直接调用 Solver，也不因本机在途请求数主动返回 `429` 或 `Retry-After`。Handler 和 concrete Client 都会传播超时 context；Solver 必须尊重 context，不使用无界 goroutine 伪造“强制取消”。Client 连接池或预热池的资源预算不等于 HTTP 请求上限。
+HTTP 层先完成浏览器跨源和输入校验；合法 `POST /api/slider` 不经过本地 admission gate，直接调用 Solver，也不因本机在途请求数主动返回 `429` 或 `Retry-After`。Handler 和 concrete Client 都会传播超时 context；Solver 必须尊重 context，不使用无界 goroutine 伪造“强制取消”。Client 连接池或预热池的资源预算不等于 HTTP 请求上限。
+
+内嵌测试页不依赖外部 CDN/框架/字体，只能向同源 `/health` 和 `/api/slider` 发起 fetch。页面打开只检查 health；Solve 必须由用户显式提交，执行期间防双击，不做重试或批量压测。页面 CSP、随机 nonce、默认敏感字段遮罩和无浏览器持久化只保护本页边界，不替代 API 鉴权。
 
 ## 3. 包与层级
 
@@ -59,7 +62,7 @@ HTTP 层先完成输入校验；合法 `POST /api/slider` 不经过本地 admiss
 |---|---|---|
 | 进程入口 | `cmd/server` | 解析配置、先 bind 端口、构造 Client、预热、定时清理、信号关闭 |
 | 公共 library | `pkg/slider` | `Client` / `Request` / `Result` / 稳定错误类别与生命周期 |
-| HTTP 适配 | `internal/server` | 三路由、别名解析、64 KiB 限制、合法 POST 直接调用、deadline、panic 恢复、OpenAPI、脱敏日志 |
+| HTTP 适配 | `internal/server` | 四入口、内嵌测试页、跨源边界、别名解析、64 KiB 限制、合法 POST 直接调用、deadline、panic 恢复、OpenAPI、脱敏日志 |
 | 单轮编排 | `internal/challenge` | Solver 状态机、Captcha RPC、资产下载、路由池、设备预热池 |
 | 设备协议 | `internal/device` | 画像、111 字段、Log1/2/3、DeviceConfig、token 与最终 getter |
 | 纯计算 | `internal/vision` | PNG 边界、多信号匹配、Chamfer 兜底、置信度 |
@@ -119,10 +122,10 @@ Client 的关闭顺序是：禁止新工作 → 等待活动 Solve/Prime/Purge �
 
 ## 6. 超时与错误分类
 
-- Handler 为每个通过输入校验的请求建立 `Options.Timeout` deadline，并保留调用方取消信号。
+- Handler 为每个通过跨源和输入校验的请求建立 `Options.Timeout` deadline，并保留调用方取消信号。
 - concrete Solver 内再建立同一总时限，保护直接 library 调用。
 - Device RPC 可在总 context 内使用更窄的请求超时。
-- HTTP 输入错误返回 `400` 且不调用 Solver；Solver 参数错误返回 `400`，完成态业务结果返回 `200`，技术错误、超时或 panic 返回脱敏 `500`。
+- HTTP 输入错误返回 `400` 且不调用 Solver；明确的浏览器跨源 POST 返回 `403 ApiOriginError` 且不调用 Solver。Solver 参数错误返回 `400`，完成态业务结果返回 `200`，技术错误、超时或 panic 返回脱敏 `500`。
 - 每个 `/api/slider` 响应保留服务端 trace，`X-Trace-ID` 与响应体 `traceId` 一致。
 - `NetworkError` 只表示已标记的 DNS/TLS/HTTP/响应读取/超时失败。
 - HTTP 2xx 中的 JSON/schema、签名、DeviceConfig、时钟和本地不变量失败归入 `ProtocolError`。
@@ -147,7 +150,8 @@ Client 的关闭顺序是：禁止新工作 → 等待活动 Solve/Prime/Purge �
 | `pkg/slider/client.go` · `Client.Solve/Prime/Close` | library 拥有完整 Solver、预热与并发安全关闭生命周期。 | caller → Client → challenge.Solver → Result |
 | `internal/challenge/solver.go` · `Solver.Solve` / `completeAndVerify` | 前置协议阶段通过后只有一个 Verify 调用点。 | Device → Init → Assets → Vision → PE → Complete → Verify |
 | `internal/challenge/rpc.go` · `RPCClient.Init/Verify` | Init 与唯一 Verify 有实例级状态与 CertifyId 绑定。 | Init consumes attempt → issued ID → Verify consumes attempt |
-| `internal/server/server.go:105` · `handleSolve`；`:135` · `callSolver` | HTTP 层先校验；合法请求不经过本地 admission，直接在请求派生的 deadline context 中调用 Solver，并在同一调用栈恢复 panic。 | request → decode → timeout context → Solve → mapped response |
+| `internal/server/server.go` · `browserOriginProtection` / `handleSolve` / `callSolver` | HTTP 层用 Go 标准库先拒绝明确浏览器跨源请求并校验 body；合法请求不经过本地 admission，在请求派生的 deadline context 中调用 Solver，并在同一调用栈恢复 panic。 | request → origin/body gate → timeout context → Solve → mapped response |
+| `internal/server/testpage.go` · `writeTestPage`；`internal/server/web/test.html` | 第一方页面编译进二进制，以随机 nonce CSP 约束为同源手工调用且不持久化结果。 | GET `/` → embedded page → explicit POST `/api/slider` |
 | `internal/config/config.go:26` · `MaxConcurrency`；`pkg/slider/client.go:91` · `NewTransportPool`；`:122` · `NewDeviceSessionPool` | `MaxConcurrency` 是 Client 每 route/host 出站连接与预热资源预算，不是 HTTP 并发阈值。 | config → ClientOptions → transport/prewarm budget；valid POST → Solver |
 | `internal/device/rpc.go:119`、`:130`；`internal/device/online_session_test.go:17` | Device schema 按 action 解码；在线 Log1/2/3 探针约 `0.53s` 通过。 | raw response → schema gate → authorized probe |
 | `internal/challenge/performance_test.go`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 离线 32 路 Mock Solver 链正确性通过；200 样本纯计算 `P99=57.05075ms`。 | fixture → concurrent Solver chain / sorted compute samples → verified gates |

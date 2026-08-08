@@ -2,7 +2,7 @@
 
 ## 1. 默认信任模型
 
-> 服务没有应用内 API 鉴权，也没有基于活动请求数的本地接纳闸门。默认只监听 `127.0.0.1:8000`。显式改为 `0.0.0.0` 时，任何网络可达客户端都可以直接触发 `Solve`、消耗 CPU/内存、Client 连接/预热预算和上游配额，还可以传入代理路由并促使服务对外连接。
+> 服务没有应用内 API 鉴权，也没有基于活动请求数的本地接纳闸门。默认只监听 `127.0.0.1:8000`。显式改为 `0.0.0.0` 时，任何网络可达客户端都可以直接触发 `Solve`、消耗 CPU/内存、Client 连接/预热预算和上游配额，还可以传入代理路由并促使服务对外连接。`GET /` 测试页与 API 使用同一信任边界，不提供账号或权限隔离。
 
 对外暴露前必须由反向代理/API gateway 提供：
 
@@ -16,6 +16,8 @@ Handler 不生成本地 429、`Retry-After`、`TooManyChallenges`、活动数或
 
 `MaxConcurrency` / `--max-concurrency` 是兼容旧名，只作为 Client 每 route/host 的出站连接与设备预热资源预算；它不限制 HTTP 请求进入。启动器在非回环监听时输出一条纯文本安全警告，但警告不是强制控制。
 
+回环监听只缩小网络暴露，不阻止同机不可信进程访问，也不能把浏览器页面当作身份边界。API 不启用宽松 CORS；Handler 还会根据 `Origin` / `Sec-Fetch-Site` 拒绝明确的浏览器跨源 POST，但这只是 drive-by 缓解，不是鉴权或完整 CSRF 保护。无这些浏览器头的旧 API 客户端仍保持兼容；共享机器仍需操作系统用户隔离和外层访问控制。
+
 ## 2. 授权与流量边界
 
 仅允许在自有系统或具有明确书面授权的测试环境使用。使用方负责确认 SceneId、prefix、目标、并发、时间窗和总挑战数均在授权内。
@@ -26,13 +28,28 @@ Handler 不生成本地 429、`Retry-After`、`TooManyChallenges`、活动数或
 
 | 数据 | 分类 | 允许出现 | 禁止出现 |
 |---|---|---|---|
-| `securityToken` | 高敏感运行令牌 | API/library 明确结果字段 | 普通日志、artifact、错误、String/GoString |
-| `CertifyId` | 敏感挑战标识 | API/library 明确结果字段、单轮内存 | 普通日志、artifact metrics、错误 |
+| `securityToken` | 高敏感运行令牌 | API/library 明确结果字段、测试页当前内存 | 普通日志、artifact、错误、String/GoString、浏览器持久化 |
+| `CertifyId` | 敏感挑战标识 | API/library 明确结果字段、单轮/测试页当前内存 | 普通日志、artifact metrics、错误、浏览器持久化 |
 | 代理用户名/密码 | 高敏感凭据 | 单路由 transport 运行时内存 | map 明文 key、日志、格式化输出、artifact |
 | `AaduaneId` / RPC key | 敏感协议材料 | 签名请求内存 | 日志、artifact、String/GoString |
 | 失败图像 | 限制级调试证据 | 私有 artifact 目录 | Git、Web root、普通响应 |
 
 `pkg/slider.Request` / `Result`、内部 Solve DTO、Captcha DTO、DevicePoolKey、TransportPool 都有脱敏 `String/GoString`。这只防止常见 `%v/%#v` 误用，不阻止调用方显式访问字段；业务代码仍必须避免正文日志。
+
+### 内嵌测试页
+
+测试页由 `go:embed` 编译进 EXE，不加载第三方脚本、CSS、字体、图片或遥测。页面打开只执行 `/health`，Solve 必须由用户显式提交；执行期间禁用重复提交，并且超时、取消、HTTP/业务失败都不自动重试。
+
+页面安全控制：
+
+- 每次 `GET /` 生成新的 128-bit 密码学随机 CSP nonce；CSP 只允许同源 connect，禁止无 nonce 脚本/样式、外部资源、frame、form action、worker 和 object；
+- `Cache-Control: no-store`、`nosniff`、`no-referrer`、`X-Frame-Options: DENY`、同源 CORP/COOP 和最小 `Permissions-Policy`；
+- 返回数据只用 `textContent`，不使用 `innerHTML`、`eval` 或动态代码执行；
+- `AaduaneId`、proxy、`securityToken`、`certifyId` 默认遮罩；显示明文需要用户显式勾选；
+- 不使用 Cookie、URL query/hash、localStorage、sessionStorage、IndexedDB、service worker 或 sendBeacon；刷新/清空即移除当前页面状态。
+- Handler 在解码和 Solver 之前拒绝明确跨源的浏览器 POST，同源内嵌页和无浏览器头的旧 API 客户端保持可用。
+
+这些控制减少页面自身泄漏和 DOM 注入风险，不保护被其他本机客户端直接调用的 `/api/slider`。调用方仍不得截图或把完整请求/响应复制到日志、工单或聊天。
 
 ## 4. 日志与错误
 
@@ -46,7 +63,7 @@ traceId, status, elapsedMs
 
 错误边界：
 
-- API 输入错误返回稳定 400 文本；
+- API 输入错误返回稳定 400 JSON 错误；明确浏览器跨源请求返回脱敏 `403 ApiOriginError`；
 - 可识别的协议、网络、视觉和内部错误只返回稳定 Message；
 - 未分类错误或 panic 统一为 `UnhandledProtocolError`，不回显 panic/error cause；
 - HTTP 2xx 中的非法 JSON/schema 计入 Protocol，不污染“网络失败”统计；
@@ -121,7 +138,7 @@ Init 只能提供相对路径，不能指定完整 URL。下载器：
 - 生产 module 零第三方 Go 依赖。
 - `go.mod`、CI 和 Docker 使用 Go 1.26.5；本地 `govulncheck` 在该工具链下未发现可达漏洞。
 - Linux AMD64 二进制使用 `CGO_ENABLED=0`、`-trimpath`、stripped 静态构建。
-- Windows AMD64 便携版使用 `CGO_ENABLED=0` 的单一 console PE；不依赖 Go、Python、VC++ Runtime 或第三方 DLL。Windows 原生 CI 负责 test、解压启动和本地 HTTP smoke。
+- Windows AMD64 便携版使用 `CGO_ENABLED=0` 的单一 console PE；测试页同样内嵌于 EXE，不依赖 Go、Python、Node、VC++ Runtime、CDN 或第三方 DLL。Windows 原生 CI 负责 test、解压启动和本地 HTTP smoke。
 - 官方 GitHub actions 使用完整 commit SHA 固定；普通 CI 权限保持 `contents: read`。Windows ZIP 包含 commit/build 信息和 SHA-256。
 - 当前 Windows EXE 没有 Authenticode 代码签名；SmartScreen 可能提示未知发布者。SHA-256 不替代发布者签名，不得要求用户关闭 Defender。
 - 容器运行层为 `scratch`，只含 CA 证书、二进制和私有 artifact 目录；使用 UID/GID 65532。
@@ -134,8 +151,9 @@ Init 只能提供相对路径，不能指定完整 URL。下载器：
 - [ ] 默认回环监听；如需非回环，外层鉴权、TLS、防火墙以及按身份/IP 的频率、并发和总量限制已就绪。
 - [ ] 代理字段已禁用、限制调用方或配置 allowlist。
 - [ ] 反向代理、APM、客户端日志不收集正文。
+- [ ] 测试页只部署在符合本 API 信任模型的网络边界；使用者已知页面显示值可能敏感，未启用浏览器/代理正文采集。
 - [ ] Artifact 目录不在 Web root，权限、配额、保留期和磁盘告警已验证。
-- [x] 当前源码快照的全量 unit/mock/race/vet/staticcheck/govulncheck/coverage 门禁通过；统一覆盖率 `83.0%`，发布 commit 仍须 CI 重跑。
+- [x] 当前源码快照的全量 unit/mock/race/vet/staticcheck/govulncheck/coverage 门禁通过；统一覆盖率重复运行为 `83.1–83.2%`，稳定超过 `>=80%` 门槛，发布 commit 仍须 CI 重跑。
 - [x] Linux AMD64 静态构建与容器非 root `/health` smoke 通过。
 - [ ] Windows AMD64 原生测试、最终 ZIP smoke、SHA-256 与 Artifact 下载已在发布 commit 的 CI 中通过并归档。
 - [x] 纯计算 P99 与 2026-08-07 历史候选批次 200 轮、32 并发、应用层零重试的 Client 完整求解链 P95/成功率报告已生成并达到当时冻结门槛；该批未经过 HTTP Handler，且先于最终 one-shot 加固。
@@ -145,7 +163,8 @@ Init 只能提供相对路径，不能指定完整 URL。下载器：
 
 | Evidence | Finding | Path |
 |---|---|---|
-| `internal/server/server.go` · `handleSolve`；`internal/server/server_test.go` · `TestConcurrentRequestsAlwaysEnterSolver` | 合法请求完成解码后直接进入 Solver；Handler 没有活动数接纳闸门、本地 429 或退避字段。 | reachable caller → validation → Solve → local and upstream resource consumption |
+| `internal/server/server.go` · `browserOriginProtection` / `handleSolve`；`internal/server/server_test.go` · `TestBrowserOriginBoundaryPreservesLegacyClients` / `TestConcurrentRequestsAlwaysEnterSolver` | 跨源和输入校验合法的请求直接进入 Solver；Handler 没有活动数接纳闸门、本地 429 或退避字段。 | reachable caller → origin/body validation → Solve → local and upstream resource consumption |
+| `internal/server/testpage.go` · `writeTestPage`；`internal/server/server_test.go` · `TestEmbeddedAPITestPage` | 页面使用随机 nonce、同源 CSP、无持久化/外链/危险 DOM API，GET/错误方法不调用 Solver。 | browser GET → constrained page memory → explicit same-origin POST |
 | `internal/server/server.go` · `logResult` / `solverErrorResponse` | 普通日志只有 trace/status/elapsed，未分类错误不回显 cause。 | request/result → stable metadata log |
 | `pkg/slider/types.go` · DTO `String/GoString` | 公开结构的常见格式化不输出 token、ID 或代理凭据。 | DTO → fmt → redacted text |
 | `internal/artifact/store.go` · `SaveFailure` / `Purge` | Unix 强制 POSIX 私有 mode；Windows 继承 NTFS ACL；两者共用受管名称、排他创建、整组回滚、保留期和配额。 | platform directory policy → private bounded set → purge/evict |

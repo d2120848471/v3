@@ -6,16 +6,16 @@
 
 ## 已实现能力
 
-- 严格纯 Go：运行、测试、Linux/Windows 构建和容器不依赖 Python、Node.js、浏览器、OpenCV、GoCV、CGo、第三方动态库或子进程。
-- 对外只提供 reusable Go library、`POST /api/slider`、`GET /health`、`GET /openapi.json`。
+- 严格纯 Go：服务端求解、自动化测试、Linux/Windows 构建和容器不依赖 Python、Node.js、浏览器、OpenCV、GoCV、CGo、第三方动态库或子进程；内嵌测试页只需系统现有的现代浏览器。
+- 对外只提供 reusable Go library、`GET /` 内嵌 API 测试页、`POST /api/slider`、`GET /health`、`GET /openapi.json`。
 - 每个 `CertifyId` 最多尝试一次 Verify；网络结果未知也不重试。
-- 通过输入校验的 `POST /api/slider` 直接进入 Solver；HTTP 层不设置本地 admission gate，也不因在途请求数主动返回 `429` 或 `Retry-After`。
+- 通过浏览器跨源与输入校验的 `POST /api/slider` 直接进入 Solver；HTTP 层不设置本地 admission gate，也不因在途请求数主动返回 `429` 或 `Retry-After`。
 - HTTP(S)、SOCKS4、SOCKS5、SOCKS5H 代理；同一轮设备、Init、图片与 Verify 固定同一路由。
 - 双图并发下载、纯 Go 视觉、PE/DeviceToken、可选设备会话预热和共享连接池。
 - 失败/低置信图片与脱敏指标私有落盘；服务启动时及每小时清理，library 调用方负责定期调用 `PurgeArtifacts`，默认保留 7 天；成功路径不落图。
 - 普通文本日志只记录事件、trace、状态和耗时，不记录 token、`CertifyId`、代理凭据或原始正文。
 
-当前验证快照：全项目统一覆盖率 `83.0%`，protocol `91.4%`（含 fuzz seeds），vision `91.9%`，PE `95.1%`；Go 1.26.5 下 race、vet、staticcheck、govulncheck、Linux AMD64 静态交叉构建及 Docker 非 root `/health` smoke 均通过。Device Log1/2/3 在线探针通过，耗时约 `0.53s`；Mac ARM64 纯计算 200 样本 nearest-rank `P50=50.577458ms`、`P95=55.711708ms`、`P99=57.05075ms`、`max=60.337542ms`，满足 `P99<=100ms` 硬门槛。
+当前验证快照：全项目统一覆盖率在重复运行中为 `83.1–83.2%`，稳定高于 `>=80%` 门槛；protocol `91.4%`（含 fuzz seeds），vision `91.9%`，PE `95.1%`。Go 1.26.5 下 race、vet、staticcheck、govulncheck、Linux AMD64 静态交叉构建及 Docker 非 root `/health` smoke 均通过。Device Log1/2/3 在线探针通过，耗时约 `0.53s`；Mac ARM64 纯计算 200 样本 nearest-rank `P50=50.577458ms`、`P95=55.711708ms`、`P99=57.05075ms`、`max=60.337542ms`，满足 `P99<=100ms` 硬门槛。
 
 2026-08-07 唯一授权候选批次已按冻结上限一次性完成：harness 直接调用 `pkg/slider.Client.Solve`，恰好处理 200 个新挑战、并发 32、每个 job 一次 Solve、应用层零重试；严格成功 `196`、业务失败 `3`、`VisionError=1`、网络错误 `0`，成功率 `98%`。Client 完整求解链墙钟 `P50=816ms`、`P95=984ms`、`P99=1018ms`、`max=1555ms`，成功样本墙钟 `P95=989ms`，整批约 `6.16s`。该候选批次达到 `>=190/200` 和 Client 完整链 `P95<=1000ms`；1 秒是 P95 目标，不是 P99 或最大耗时保证。该批不经过 HTTP Handler，不能作为 HTTP 端到端 P95 证据。
 
@@ -27,7 +27,7 @@
 
 不安装开发环境即可使用：在 GitHub **Actions** 的 `ali-slider-go-ci` 最新成功运行中下载 `ali-slider-go-windows-amd64.zip`，完整解压后双击 `start.bat`，等待 `event=listen status=ready`。
 
-这是本机 HTTP 服务，不是 GUI。包内包含独立 EXE、中文说明、构建信息和 SHA-256；支持 Windows 10 / Windows Server 2016 或更高版本的 AMD64/x64 机器，默认监听 `127.0.0.1:8000`。完整下载、运行、SmartScreen 和 NTFS ACL 说明见 [Windows AMD64 便携包](docs/windows.md)。
+这是本机控制台 HTTP 服务，不是桌面 GUI；服务内置浏览器 API 测试页。包内包含独立 EXE、中文说明、构建信息和 SHA-256；支持 Windows 10 / Windows Server 2016 或更高版本的 AMD64/x64 机器，默认监听 `127.0.0.1:8000`。测试页需现代 Edge、Chrome 或 Firefox；没有现代浏览器时 EXE 和 PowerShell/API 仍可用。完整下载、运行、SmartScreen 和 NTFS ACL 说明见 [Windows AMD64 便携包](docs/windows.md)。
 
 ### 源码运行
 
@@ -40,6 +40,8 @@ go run ./cmd/server
 ```
 
 默认地址：`http://127.0.0.1:8000`。
+
+浏览器打开 `http://127.0.0.1:8000/` 可使用内嵌测试页。页面不会自动求解或重试；只有点击“发送一次求解”才会访问真实上游。页面不使用 Cookie 或浏览器存储，默认遮罩 RPC key、代理、`securityToken` 和 `certifyId`，刷新即清除当前结果。
 
 ```bash
 curl --fail --silent http://127.0.0.1:8000/health
@@ -67,7 +69,7 @@ curl --silent --show-error \
 }
 ```
 
-HTTP 输入不合法时返回 `400` 且不进入 Solver；通过输入校验后，每个请求都直接调用一次 Solver。Solver 的参数错误仍返回 `400`，完成态业务结果返回 `200`，协议、网络、视觉、内部错误、超时或 panic 返回脱敏 `500`。`POST /api/slider` 的这些响应都带 `X-Trace-ID`，并与响应体 `traceId` 一致。
+HTTP 输入不合法时返回 `400` 且不进入 Solver；明确的浏览器跨源 POST 返回 `403 ApiOriginError`。通过跨源和输入边界校验后，每个请求都直接调用一次 Solver。Solver 的参数错误仍返回 `400`，完成态业务结果返回 `200`，协议、网络、视觉、内部错误、超时或 panic 返回脱敏 `500`。`POST /api/slider` 的这些响应都带 `X-Trace-ID`，并与响应体 `traceId` 一致。
 
 `SceneId/sceneId`、`prefix/Prefix`、`AaduaneId/aaduaneId`、`proxy/Proxy` 都兼容；同组同时出现时规范字段优先。完整合同见 [docs/api.md](docs/api.md)。
 
@@ -166,7 +168,7 @@ make build-windows
 ali-slider-go/
 ├── cmd/server/            HTTP 服务启动器
 ├── pkg/slider/            可复用公共 Client 与稳定合同
-├── internal/server/       HTTP、OpenAPI、输入校验、trace 与 timeout
+├── internal/server/       HTTP、内嵌测试页、OpenAPI、输入校验、trace 与 timeout
 ├── internal/challenge/    完整编排、Captcha RPC、下载、transport、预热池
 ├── internal/device/       画像、指纹、Log1/2/3、DeviceToken 会话
 ├── internal/pe/           纯 Go PE data 构造与自检
@@ -191,7 +193,7 @@ ali-slider-go/
 - [Windows AMD64 便携包](docs/windows.md)
 - [Python → Go 迁移](docs/migration.md)
 - [故障排查](docs/troubleshooting.md)
-- [2026-08-08 无本地 admission 验证证据](docs/evidence/validation-2026-08-08-no-local-admission.md)
+- [2026-08-08 无本地 admission 历史快照证据](docs/evidence/validation-2026-08-08-no-local-admission.md)
 - [2026-08-07 脱敏验证证据](docs/evidence/validation-2026-08-07.md)
 - [变更记录](CHANGELOG.md)
 

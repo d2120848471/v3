@@ -2,7 +2,7 @@
 
 本文固化 `ali-slider-go` 的离线质量、性能、静态构建、容器和授权在线批次证据。只记录命令、环境、聚合数字和稳定分类；不保存 token、`CertifyId`、代理凭据、原始响应、挑战图片或 artifact 文件名。
 
-> **后续合同变更（2026-08-08）**：本页仅属于 2026-08-07 快照。后续源码已删除 HTTP Handler 的本地 admission gate、主动 429 和 `Retry-After`；每个通过输入校验的 POST 请求直接进入 Solver。本页的 44 文件摘要、Linux 二进制哈希和 Docker 镜像不包含该后续变更，不得用作当前 HTTP 合同的发布证据。历史 200/32 Client harness 结果保留不改写；当前离线证据见 [2026-08-08 无本地 admission 验证](./validation-2026-08-08-no-local-admission.md)。
+> **后续合同变更（2026-08-08）**：本页仅属于 2026-08-07 快照。后续源码已删除 HTTP Handler 的本地 admission gate、主动 429 和 `Retry-After`；通过当时输入校验的 POST 请求直接进入 Solver。本页的 44 文件摘要、Linux 二进制哈希和 Docker 镜像不包含该后续变更，不得用作当前 HTTP 合同的发布证据。历史 200/32 Client harness 结果保留不改写；后续的无本地 admission 历史快照见 [2026-08-08 证据](./validation-2026-08-08-no-local-admission.md)。当前发布合同还包含更后增加的内嵌页与跨源 403，不由这两份历史页证明。
 
 > 工作树尚未提交，不能用发布 commit 标识本次快照。选定生产源码与 fixture 的 44 文件选择集摘要为 `c590140a3734b0548077ee921bd4a688f46f378272b28238d49f541cd418f7de`；它不是发布 manifest、SBOM 或全部验证输入。Linux 二进制另有独立哈希，发布 commit 仍必须由 CI 重跑门禁。
 
