@@ -15,13 +15,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/d2120848471/v3/ali-slider-go/internal/device"
-	"github.com/d2120848471/v3/ali-slider-go/internal/protocol"
+	"github.com/d2120848471/v3/ali-slider-go/internal/v8runtime"
 )
 
 const (
@@ -43,7 +42,7 @@ var (
 	ErrUnsupportedPE = errors.New("unsupported dynamic PE script")
 	// ErrKeyNetwork 表示公开 SDK/PE 脚本无法通过本轮路由取得。
 	ErrKeyNetwork = errors.New("dynamic PE script download failed")
-	// ErrKeyRuntime 表示本机 Node 动态 PE/设备运行时不存在或执行失败。
+	// ErrKeyRuntime 表示本机动态 PE/设备运行时不存在或执行失败。
 	ErrKeyRuntime = errors.New("dynamic PE runtime failed")
 
 	staticPathPattern  = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+/pe\.[0-9]{3}\.[a-f0-9]{16}$`)
@@ -78,11 +77,16 @@ type cachedSDK struct {
 }
 
 // KeyResolver 按精确 StaticPath 缓存公开 SDK/PE 源码和结构画像五分钟。
-// Resolve 的缓存命中不启动 Node；Build 仍在每轮挑战的隔离 VM 内运行缓存脚本。
+// Resolve 的缓存命中不启动 VM；Build 仍在每轮挑战的隔离 V8 Isolate 内运行缓存脚本。
 type KeyResolver struct {
-	nodeBinary string
-	now        func() time.Time
-	collect    keyCollector
+	v8LibraryPath string
+	nodeBinary    string // 仅供 Node oracle 测试路径使用。
+	now           func() time.Time
+	collect       keyCollector
+
+	v8Mu      sync.Mutex
+	v8Library *v8runtime.Library
+	v8Closed  bool
 
 	mu   sync.RWMutex
 	keys map[string]cachedRuntimeProfile
@@ -90,18 +94,29 @@ type KeyResolver struct {
 	miss sync.Mutex
 }
 
-// NewKeyResolver 创建进程级 resolver。nodeBinary 为空时使用 PATH 中的 node。
-// Node 是生产设备会话和动态 PE data 逐挑战生成所需的运行时。
-func NewKeyResolver(nodeBinary string) *KeyResolver {
+// NewKeyResolver 创建进程级内嵌 V8 resolver。libraryPath 为空时从服务
+// 可执行文件所在目录加载当前平台的默认 wrapper 文件。
+func NewKeyResolver(libraryPath string) *KeyResolver {
+	if strings.TrimSpace(libraryPath) == "" {
+		libraryPath = v8runtime.DefaultLibraryPath()
+	}
+	return &KeyResolver{
+		v8LibraryPath: libraryPath,
+		now:           time.Now,
+		keys:          make(map[string]cachedRuntimeProfile),
+	}
+}
+
+// newNodeKeyResolver 只保留历史 Node 路径作为 oracle 和回滚测试，不由生产构造器调用。
+func newNodeKeyResolver(nodeBinary string) *KeyResolver {
 	if strings.TrimSpace(nodeBinary) == "" {
 		nodeBinary = defaultNodeBinary
 	}
-	return &KeyResolver{
-		nodeBinary: nodeBinary,
-		now:        time.Now,
-		collect:    collectRuntimeProfile,
-		keys:       make(map[string]cachedRuntimeProfile),
-	}
+	resolver := NewKeyResolver("")
+	resolver.v8LibraryPath = ""
+	resolver.nodeBinary = nodeBinary
+	resolver.collect = collectRuntimeProfile
+	return resolver
 }
 
 // Resolve 返回本轮 StaticPath 的结构画像。缓存键是完整版本化路径，绝不把
@@ -125,7 +140,7 @@ func (resolver *KeyResolver) Resolve(ctx context.Context, transport http.RoundTr
 		return RuntimeProfile{}, fmt.Errorf("%w: transport is nil", ErrKeyNetwork)
 	}
 
-	// 新分片很少出现；串行化 miss 可以同时避免重复下载 SDK、重复启动 Node，
+	// 新分片很少出现；串行化 miss 可以同时避免重复下载 SDK、重复启动 V8，
 	// 而所有稳定流量仍只走上面的读锁命中路径。
 	resolver.miss.Lock()
 	defer resolver.miss.Unlock()
@@ -153,7 +168,12 @@ func (resolver *KeyResolver) Resolve(ctx context.Context, transport http.RoundTr
 	if len(peSource) < 1_000 || !bytes.Contains(peSource, []byte("CaptchaConstructor")) {
 		return RuntimeProfile{}, fmt.Errorf("%w: PE script structure mismatch", ErrUnsupportedPE)
 	}
-	resolved, err := resolver.collect(ctx, resolver.nodeBinary, profile, sdkSource, peSource, now)
+	var resolved RuntimeProfile
+	if resolver.collect != nil {
+		resolved, err = resolver.collect(ctx, resolver.nodeBinary, profile, sdkSource, peSource, now)
+	} else {
+		resolved, err = resolver.collectV8RuntimeProfile(ctx, profile, sdkSource, peSource, now)
+	}
 	if err != nil {
 		return RuntimeProfile{}, err
 	}
@@ -448,13 +468,7 @@ func collectRuntimeProfile(ctx context.Context, nodeBinary string, profile devic
 		return RuntimeProfile{}, fmt.Errorf("%w: bridge process", ErrKeyRuntime)
 	}
 
-	var output struct {
-		Key         string   `json:"key"`
-		Argument    string   `json:"argument"`
-		Data        string   `json:"data"`
-		PayloadKeys []string `json:"payloadKeys"`
-		TrackKeys   []string `json:"trackKeys"`
-	}
+	var output runtimeProfileBridgeOutput
 	decoder := json.NewDecoder(bytes.NewReader(stdout.buffer.Bytes()))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&output); err != nil {
@@ -463,37 +477,7 @@ func collectRuntimeProfile(ctx context.Context, nodeBinary string, profile devic
 	if err := ensureJSONEOF(decoder); err != nil {
 		return RuntimeProfile{}, fmt.Errorf("%w: bridge output", ErrKeyRuntime)
 	}
-	if !argumentKeyPattern.MatchString(output.Key) || output.Argument == "" || output.Data == "" {
-		return RuntimeProfile{}, fmt.Errorf("%w: bridge result", ErrUnsupportedPE)
-	}
-	transformed, err := protocol.Transform64([]byte(dummyCertifyID), output.Key, false)
-	if err != nil || base64.StdEncoding.EncodeToString(transformed) != output.Argument {
-		return RuntimeProfile{}, fmt.Errorf("%w: independent key check", ErrUnsupportedPE)
-	}
-	decoded, err := protocol.UnpackData(output.Data)
-	if err != nil || decoded.Payload.Arg != output.Argument {
-		return RuntimeProfile{}, fmt.Errorf("%w: independent data check", ErrUnsupportedPE)
-	}
-	if !slices.Equal(output.PayloadKeys, []string{"TrackList", "TrackStartTime", "VerifyTime", "xPos", "slidePos", "arg"}) {
-		return RuntimeProfile{}, fmt.Errorf("%w: payload schema changed", ErrUnsupportedPE)
-	}
-	legacyTrackKeys := []string{"mc", "tc", "mu", "te", "mp", "tmv", "mm", "ks", "fi", "startTime", "si"}
-	currentTrackKeys := legacyTrackKeys[:len(legacyTrackKeys)-1]
-	includeScreenInfo := false
-	switch {
-	case slices.Equal(output.TrackKeys, currentTrackKeys):
-		if decoded.Payload.TrackList.SI != "" {
-			return RuntimeProfile{}, fmt.Errorf("%w: current TrackList mismatch", ErrUnsupportedPE)
-		}
-	case slices.Equal(output.TrackKeys, legacyTrackKeys):
-		if decoded.Payload.TrackList.SI == "" {
-			return RuntimeProfile{}, fmt.Errorf("%w: legacy TrackList mismatch", ErrUnsupportedPE)
-		}
-		includeScreenInfo = true
-	default:
-		return RuntimeProfile{}, fmt.Errorf("%w: TrackList schema changed", ErrUnsupportedPE)
-	}
-	return RuntimeProfile{ArgumentKey: output.Key, IncludeScreenInfo: includeScreenInfo}, nil
+	return validateRuntimeProfileBridgeOutput(output)
 }
 
 func ensureJSONEOF(decoder *json.Decoder) error {

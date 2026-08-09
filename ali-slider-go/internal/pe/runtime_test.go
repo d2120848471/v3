@@ -254,7 +254,7 @@ func TestRunNativePEAndResolverBuildWithIsolatedProcess(t *testing.T) {
 	}
 
 	now := time.Now()
-	resolver := NewKeyResolver(stub)
+	resolver := newNodeKeyResolver(stub)
 	resolver.now = func() time.Time { return now }
 	path, _ := normalizeStaticPath(testDynamicPath)
 	resolver.keys[path] = cachedRuntimeProfile{

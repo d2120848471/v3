@@ -58,6 +58,9 @@ func TestOnlineAcceptance(t *testing.T) {
 	options.MaxConcurrency = concurrency
 	options.DevicePrewarmCapacity = concurrency
 	options.ArtifactDir = artifactDirectory
+	if libraryPath := os.Getenv("ALI_SLIDER_V8_LIBRARY"); libraryPath != "" {
+		options.V8RuntimeLibrary = libraryPath
+	}
 	if sceneID := os.Getenv("ALI_SLIDER_ONLINE_SCENE_ID"); sceneID != "" {
 		options.DefaultSceneID = sceneID
 	}

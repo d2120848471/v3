@@ -449,7 +449,7 @@ func TestOpenDeviceKeepsOneProcessThroughCompletion(t *testing.T) {
 		{Type: "mousemove", X: 2, Y: 3, TimeStamp: 750, IsTrusted: true},
 	}
 	stub := writeDeviceRuntimeStub(t, validInitialDeviceStage(t, "53"), validVerifyDeviceStage(t, "53", len(events)))
-	resolver := NewKeyResolver(stub)
+	resolver := newNodeKeyResolver(stub)
 	resolver.sdk = cachedSDK{source: []byte("cached-sdk"), fetchedAt: time.Now()}
 	session, err := resolver.OpenDevice(context.Background(), newScriptTransport(), device.Profile{}, validDeviceRuntimeOptions())
 	if err != nil {
@@ -496,7 +496,7 @@ func TestOpenDeviceAndCompletionFailureBoundaries(t *testing.T) {
 	if _, err := (*KeyResolver)(nil).OpenDevice(context.Background(), transport, device.Profile{}, options); !errors.Is(err, ErrKeyRuntime) {
 		t.Fatalf("nil resolver: %v", err)
 	}
-	resolver := NewKeyResolver(filepath.Join(t.TempDir(), "missing-node"))
+	resolver := newNodeKeyResolver(filepath.Join(t.TempDir(), "missing-node"))
 	if _, err := resolver.OpenDevice(context.Background(), nil, device.Profile{}, options); !errors.Is(err, ErrKeyNetwork) {
 		t.Fatalf("nil transport: %v", err)
 	}

@@ -26,11 +26,12 @@ import (
 	"github.com/d2120848471/v3/ali-slider-go/internal/device"
 	"github.com/d2120848471/v3/ali-slider-go/internal/protocol"
 	"github.com/d2120848471/v3/ali-slider-go/internal/runtimekit"
+	"github.com/d2120848471/v3/ali-slider-go/internal/v8runtime"
 )
 
 const deviceBridgeLineLimit = 256 << 10
 
-// DeviceRuntimeOptions 固定一轮 Node FeiLin 会话的边界。
+// DeviceRuntimeOptions 固定一轮 FeiLin V8 会话的边界。
 type DeviceRuntimeOptions struct {
 	Prefix           string
 	Region           string
@@ -87,6 +88,7 @@ type DeviceRuntimeSession struct {
 	stderr   *cappedWriter
 	tempDir  string
 	relay    *connectRelay
+	v8Engine *v8runtime.Runtime
 
 	options       DeviceRuntimeOptions
 	sdkSource     []byte
@@ -123,6 +125,9 @@ func (resolver *KeyResolver) OpenDevice(ctx context.Context, transport http.Roun
 	resolver.miss.Unlock()
 	if err != nil {
 		return nil, err
+	}
+	if resolver.v8LibraryPath != "" {
+		return resolver.openV8Device(ctx, transport, profile, options, sdkSource)
 	}
 	nodePath, err := exec.LookPath(resolver.nodeBinary)
 	if err != nil {
@@ -645,7 +650,7 @@ func (session *DeviceRuntimeSession) Complete(ctx context.Context, getterArgumen
 		return device.Result{}, errors.New("device runtime context is nil")
 	}
 	session.mu.Lock()
-	if session.closed || session.completed || session.stdin == nil {
+	if session.closed || session.completed || session.stdin == nil && session.v8Engine == nil {
 		session.mu.Unlock()
 		return device.Result{}, errors.New("device runtime session is unavailable")
 	}
@@ -666,10 +671,16 @@ func (session *DeviceRuntimeSession) Complete(ctx context.Context, getterArgumen
 		session.mu.Unlock()
 		return device.Result{}, errors.New("encode device runtime completion")
 	}
+	engine := session.v8Engine
 	stdin := session.stdin
-	session.stdin = nil
+	if engine == nil {
+		session.stdin = nil
+	}
 	session.completed = true
 	session.mu.Unlock()
+	if engine != nil {
+		return session.completeV8Device(ctx, engine, payload, len(events))
+	}
 	if _, err := stdin.Write(payload); err != nil {
 		_ = stdin.Close()
 		return device.Result{}, fmt.Errorf("%w: write device completion", ErrKeyRuntime)
@@ -770,9 +781,11 @@ func (session *DeviceRuntimeSession) Close() {
 		return
 	}
 	session.closed = true
+	engine := session.v8Engine
+	session.v8Engine = nil
 	stdin := session.stdin
 	session.stdin = nil
-	process := session.command.Process
+	command := session.command
 	waitDone := session.waitDone
 	tempDir := session.tempDir
 	session.tempDir = ""
@@ -780,14 +793,19 @@ func (session *DeviceRuntimeSession) Close() {
 	session.relay = nil
 	session.sdkSource = nil
 	session.mu.Unlock()
+	if engine != nil {
+		_ = engine.Close()
+	}
 	if stdin != nil {
 		_ = stdin.Close()
 	}
-	select {
-	case <-waitDone:
-	default:
-		_ = process.Kill()
-		<-waitDone
+	if command != nil {
+		select {
+		case <-waitDone:
+		default:
+			_ = command.Process.Kill()
+			<-waitDone
+		}
 	}
 	if tempDir != "" {
 		_ = os.RemoveAll(tempDir)

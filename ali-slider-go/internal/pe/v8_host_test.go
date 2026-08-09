@@ -1,0 +1,163 @@
+package pe
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+)
+
+type v8HostEntropy struct {
+	value byte
+	err   error
+}
+
+func (entropy v8HostEntropy) Read(buffer []byte) (int, error) {
+	if entropy.err != nil {
+		return 0, entropy.err
+	}
+	for index := range buffer {
+		buffer[index] = entropy.value + byte(index)
+	}
+	return len(buffer), nil
+}
+
+func (v8HostEntropy) Uint64n(uint64) (uint64, error) { return 0, nil }
+
+type v8RoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (function v8RoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return function(request)
+}
+
+func TestV8HostRandom(t *testing.T) {
+	result, err := handleV8HostRequest(
+		context.Background(),
+		nil,
+		v8HostEntropy{value: 1},
+		false,
+		json.RawMessage(`{"op":"random","length":4}`),
+	)
+	if err != nil {
+		t.Fatalf("handleV8HostRequest(random) error = %v", err)
+	}
+	var response struct {
+		Base64 string `json:"base64"`
+	}
+	if err := json.Unmarshal(result, &response); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if want := base64.StdEncoding.EncodeToString([]byte{1, 2, 3, 4}); response.Base64 != want {
+		t.Fatalf("random base64 = %q, want %q", response.Base64, want)
+	}
+
+	for _, raw := range []string{
+		`{"op":"random","length":65537}`,
+		`{"op":"random","length":1,"extra":true}`,
+		`{"op":"missing"}`,
+	} {
+		if _, err := handleV8HostRequest(context.Background(), nil, v8HostEntropy{}, false, json.RawMessage(raw)); err == nil {
+			t.Fatalf("handleV8HostRequest(%s) unexpectedly succeeded", raw)
+		}
+	}
+}
+
+func TestV8HostHTTP(t *testing.T) {
+	transport := v8RoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Fatalf("ReadAll(request.Body) error = %v", err)
+		}
+		if request.URL.String() != "https://g.alicdn.com/path" || request.Method != http.MethodPost || string(body) != "payload" {
+			t.Fatalf("unexpected request %s %s %q", request.Method, request.URL, body)
+		}
+		if request.Header.Get("X-Test") != "yes" {
+			t.Fatalf("X-Test = %q", request.Header.Get("X-Test"))
+		}
+		return &http.Response{
+			StatusCode: http.StatusCreated,
+			Header:     http.Header{"X-Reply": {"one", "two"}},
+			Body:       io.NopCloser(strings.NewReader("ok")),
+			Request:    request,
+		}, nil
+	})
+	body := "payload"
+	raw, err := json.Marshal(v8HostRequest{
+		Op: "http",
+		Request: &v8HostHTTPRequest{
+			URL: "https://g.alicdn.com/path", Method: http.MethodPost,
+			Headers: map[string]string{"X-Test": "yes"}, Body: &body, Redirect: "manual",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := handleV8HostRequest(context.Background(), transport, v8HostEntropy{}, true, raw)
+	if err != nil {
+		t.Fatalf("handleV8HostRequest(http) error = %v", err)
+	}
+	var response v8HostHTTPResponse
+	if err := json.Unmarshal(result, &response); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if response.Status != http.StatusCreated || response.Body != "ok" || response.Headers["x-reply"] != "one, two" || response.Redirected {
+		t.Fatalf("unexpected response %#v", response)
+	}
+}
+
+func TestV8HostHTTPRejectsUnsafeRequests(t *testing.T) {
+	transport := v8RoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("must not run")
+	})
+	for _, request := range []v8HostHTTPRequest{
+		{URL: "http://g.alicdn.com/path", Method: "GET", Redirect: "manual"},
+		{URL: "https://example.com/path", Method: "GET", Redirect: "manual"},
+		{URL: "https://evil.aliyuncs.com.example/path", Method: "GET", Redirect: "manual"},
+		{URL: "https://g.alicdn.com:443/path", Method: "GET", Redirect: "manual"},
+		{URL: "https://user@g.alicdn.com/path", Method: "GET", Redirect: "manual"},
+		{URL: "https://g.alicdn.com/path", Method: "GET", Redirect: "follow"},
+	} {
+		raw, err := json.Marshal(v8HostRequest{Op: "http", Request: &request})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := handleV8HostRequest(context.Background(), transport, v8HostEntropy{}, true, raw); err == nil {
+			t.Fatalf("unsafe request %#v unexpectedly succeeded", request)
+		}
+	}
+
+	raw := json.RawMessage(`{"op":"http","request":{"url":"https://g.alicdn.com/path","method":"GET","headers":{},"body":null,"redirect":"manual"}}`)
+	if _, err := handleV8HostRequest(context.Background(), transport, v8HostEntropy{}, false, raw); err == nil {
+		t.Fatal("disabled HTTP host unexpectedly succeeded")
+	}
+}
+
+func TestV8HostHTTPResponseLimitAndCancellation(t *testing.T) {
+	tooLarge := bytes.Repeat([]byte{'x'}, int(keyScriptMaxBytes)+1)
+	transport := v8RoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(bytes.NewReader(tooLarge)),
+			Request:    request,
+		}, nil
+	})
+	request := v8HostHTTPRequest{URL: "https://g.alicdn.com/path", Method: "GET", Redirect: "manual"}
+	if _, err := roundTripV8HostRequest(context.Background(), transport, request); err == nil {
+		t.Fatal("oversized response unexpectedly succeeded")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	transport = v8RoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return nil, request.Context().Err()
+	})
+	if _, err := roundTripV8HostRequest(ctx, transport, request); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled response error = %v", err)
+	}
+}

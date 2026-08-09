@@ -32,11 +32,11 @@
 | `AssetMaxBytes` | `--asset-max-bytes` | `ALI_SLIDER_ASSET_MAX_BYTES` | `8388608`（8 MiB） | `1..67108864`；单张下载和视觉输入字节上限 |
 | `AssetMaxDimension` | `--asset-max-dimension` | `ALI_SLIDER_ASSET_MAX_DIMENSION` | `16384` | `1..16384`；视觉 PNG 宽高上限 |
 | `DevicePrewarmCapacity` | `--device-prewarm` | `ALI_SLIDER_DEVICE_PREWARM` | `32` | `0..MaxConcurrency`；`0` 显式关闭；启动时预热匹配默认直连配置的一次性 Device Session |
-| `PEKeyNodeBinary` | `--pe-key-node` | `ALI_SLIDER_PE_KEY_NODE` | `node` | 1–4096 个有效 UTF-8 字节且不含 NUL；设备与动态 PE 逐挑战运行使用的 Node.js 24 可执行文件名或绝对路径；配置名为兼容保留 |
+| `V8RuntimeLibrary` | `--v8-library` | `ALI_SLIDER_V8_LIBRARY` | 可执行文件同目录的平台默认文件 | 1–4096 个有效 UTF-8 字节且不含 NUL；Linux 通常为 `libali_slider_v8_runtime.so`，Windows 为 `ali_slider_v8_runtime.dll` |
 
 Artifact Store 另有不可放大的安全上限：默认最多 64 组、总计 512 MiB。超限时按受管组的最旧时间淘汰，不删除非受管文件或符号链接。
 
-`PEKeyNodeBinary` 不控制缓存周期。公开 SDK、精确 `StaticPath` 的 PE 源码及结构画像最多复用 5 分钟；到期后重新下载/采样。每轮挑战仍需 Node：设备 VM 从 Log1/2/3 保持到 Complete，动态 PE VM 用本轮 `CertifyId`、DeviceConfig、轨迹和时钟原生生成 `data`。DeviceToken、挑战参数和 `data` 不进入分钟级缓存；预热设备会话默认最多空闲 20 秒且一次性消费。Docker 和 Windows 便携包已经固定携带 Node `24.14.1`；直接运行源码或裸 Linux 二进制时需自行提供，并可用绝对路径避免 PATH 差异。
+`V8RuntimeLibrary` 只选择 wrapper，不控制缓存周期。公开 SDK、精确 `StaticPath` 的 PE 源码及结构画像最多复用 5 分钟；到期后重新下载/采样。每轮挑战仍会新建或租用短龄 V8 Device Isolate，并在 Log1/2/3 到 Complete 期间保持同一 FeiLin 状态；动态 PE 使用本轮 `CertifyId`、DeviceConfig、轨迹和时钟原生生成 `data`。DeviceToken、挑战参数和 `data` 不进入分钟级缓存；预热设备会话默认最多空闲 20 秒且一次性消费。Docker 和 Windows 便携包已携带对应动态库；裸二进制部署需将 wrapper 放在可执行文件同目录，或使用绝对路径显式配置。
 
 ## 逐请求 Solve 参数
 
@@ -94,7 +94,7 @@ go run ./cmd/server
 
 浏览器测试页使用当前监听地址的根路径，例如 `http://127.0.0.1:8000/`。它通过相对路径检查同源 `/health`，并以 POST JSON 调用同源 `/api/slider`；修改 `Host`/`Port` 后只需打开新的根地址，不存在独立页面配置。页面等待上限是浏览器单次操作参数，不修改服务端 `Timeout`。
 
-Windows 便携包不需要配置文件。完整解压后双击 `start.bat`；脚本先切换到自身目录，再提供回环地址、端口、包内 Artifact 路径和包内 `node.exe` 的安全默认值。高级用户可在 `cmd.exe` 追加 flag，后出现的值覆盖脚本默认值：
+Windows 便携包不需要配置文件。完整解压后双击 `start.bat`；脚本先切换到自身目录，再提供回环地址、端口、包内 Artifact 路径和包内 `ali_slider_v8_runtime.dll` 的安全默认值。缺少 DLL 时脚本会在启动前停止。高级用户可在 `cmd.exe` 追加 flag，后出现的值覆盖脚本默认值：
 
 ```bat
 start.bat --port=8001 --device-prewarm=16
@@ -111,7 +111,7 @@ export ALI_SLIDER_MAX_CONCURRENCY=16
 export ALI_SLIDER_TIMEOUT=25s
 export ALI_SLIDER_MIN_CONFIDENCE=0.45
 export ALI_SLIDER_ARTIFACT_RETENTION=168h
-export ALI_SLIDER_PE_KEY_NODE=/usr/local/bin/node
+export ALI_SLIDER_V8_LIBRARY=/opt/ali-slider/libali_slider_v8_runtime.so
 ```
 
 对应 flag 等价，且优先级更高：
@@ -123,7 +123,7 @@ export ALI_SLIDER_PE_KEY_NODE=/usr/local/bin/node
 --timeout 25s
 --min-confidence 0.45
 --artifact-retention 168h
---pe-key-node /usr/local/bin/node
+--v8-library /opt/ali-slider/libali_slider_v8_runtime.so
 ```
 
 ## 配置决策建议
@@ -155,5 +155,6 @@ export ALI_SLIDER_PE_KEY_NODE=/usr/local/bin/node
 | `internal/config/config.go:22`、`:125`、`:167` | 单一结构定义服务配置；兼容字段 `MaxConcurrency` 保持 `1..32`，用途明确为 Client 连接与预热资源预算。 | process environment + args → typed resource budget → Validate |
 | `internal/config/config.go:145`、`:150`、`:194` | 只在预热未显式配置时随降低的资源预算收敛；显式值仍必须满足 `0..MaxConcurrency`。 | max-concurrency override → implicit prewarm clamp |
 | `cmd/server/main.go` · `clientOptions` / `run` / `maxHeaderBytes`；`cmd/server/main_test.go` · `TestHeaderBudgetAcceptsMaximumLegacyQuery` | 完整配置映射到 Client 和 Handler，显式零值不会被二次默认化吞掉；真实 HTTP 入口可承载恰好 64 KiB raw query。 | Config + request limits → HTTP/Client options → validated runtime |
+| `internal/config/config.go` · `V8RuntimeLibrary`；`pkg/slider/client.go` · `CheckRuntime` | 动态库路径按 flag/env/default 解析；服务在预热和 ready 之前校验文件、C ABI 与 V8/ICU 初始化。 | config → purego load → ABI/version check → ready |
 | `internal/server/server.go` · `Handler` / `checkSolveOrigin` / `decodeQueryRequest` / `requestFromPayload` / `handleSolve`；`internal/server/openapi.go` · `legacyQueryParameters` / `solveResponses` | POST JSON 和 deprecated GET query 使用共享字段合同、分离参数源；明确浏览器跨源在 Solver 前返回 403，其他合法请求直接进入 Solver，两种方法只声明 200/400/403/500。 | method/source → origin + JSON/query gate → timeout context → Solve |
 | `internal/artifact/store.go` · `SaveFailure` / `Purge` | 保留期、组数和总字节硬配额同时执行。 | failure set → purge expired → evict oldest → O_EXCL write |

@@ -29,7 +29,7 @@ func TestOnlineNodeDeviceRuntime(t *testing.T) {
 	defer transport.CloseIdleConnections()
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
-	resolver := NewKeyResolver(os.Getenv("ALI_SLIDER_PE_KEY_NODE"))
+	resolver := newNodeKeyResolver(os.Getenv("ALI_SLIDER_PE_KEY_NODE"))
 	session, err := resolver.OpenDevice(ctx, transport, profile, DeviceRuntimeOptions{
 		Prefix: "fsgtmi", Region: "cn", Timeout: 25 * time.Second,
 		GatherCostMin: 180, GatherCostMax: 260, FirstTouchAgeMin: 650, FirstTouchAgeMax: 850,

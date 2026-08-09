@@ -153,7 +153,7 @@ GET 是真实有副作用的 Solve，不是健康检查。即使响应头禁止�
 | `timingsMs` | object | 稳定阶段名到非负毫秒数的映射 |
 | `traceId` | string | 服务生成的 12 位小写十六进制追踪 ID |
 
-`pkg/slider.Client` 已接通完整 Go 编排和逐挑战 Node Device/动态 PE 运行时。`ok=true` 的判定是 `VerifyCode == "T001" && VerifyResult && securityToken != ""`。2026-08-08 当前修复快照以 1 个新挑战、一次 Solve、零重试得到严格成功 `1/1`、墙钟约 `1579ms`；这只证明功能恢复，不构成成功率/P95 报告。2026-08-07 历史候选曾执行 200 个新挑战、并发 32，严格成功 `196`、Client 完整链墙钟 `P95=984ms`，但属于动态边界回归之前的不同实现，不得外推到当前架构。
+`pkg/slider.Client` 已接通完整 Go 编排和进程内 V8 Device/动态 PE 运行时，不启动 Node 子进程。`ok=true` 的判定是 `VerifyCode == "T001" && VerifyResult && securityToken != ""`。2026-08-08 以前的单挑战 `T001` 和 2026-08-07 `196/200`、Client `P95=984ms` 都属于旧运行时路径，不得外推到当前架构。当前 V8 生产组件探针只验证 Device/PE 执行，不调用 Captcha Init/Verify，因此不构成完整成功率或 P95 报告。
 
 两次记录都直接验证公共 Client，不是 HTTP 传输基准。历史批次的 `P99=1018ms`，不能声称 P99 或每个响应都小于 1 秒；当前单次 smoke 更不能用来计算分位数。聚合结果不包含令牌、挑战标识、图片或上游正文。
 

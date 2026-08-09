@@ -163,6 +163,9 @@ func (resolver *KeyResolver) Build(ctx context.Context, transport http.RoundTrip
 		}
 		sdkSource = bytes.Clone(input.SDKSource)
 	}
+	if resolver.v8LibraryPath != "" {
+		return resolver.runV8PE(ctx, profile, sdkSource, peSource, input)
+	}
 	return runNativePE(ctx, resolver.nodeBinary, profile, sdkSource, peSource, input)
 }
 

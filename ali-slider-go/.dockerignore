@@ -7,3 +7,4 @@ coverage.out
 coverage.html
 var/artifacts
 *.log
+native/v8runtime/target

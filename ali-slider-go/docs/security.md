@@ -132,17 +132,17 @@ Init 只能提供相对路径，不能指定完整 URL。下载器：
 
 ### 动态设备与 PE 运行时边界
 
-Init 返回的动态 PE 不能依赖有限硬编码表，也不能用随机 `arg` 或近似 Go payload 替代当前脚本。生产链会把真实单轮状态交给两个受控 Node VM，因此边界如下：
+Init 返回的动态 PE 不能依赖有限硬编码表，也不能用随机 `arg` 或近似 Go payload 替代当前脚本。生产链会把真实单轮状态交给同进程的两类 V8 Isolate，因此边界如下：
 
 - `StaticPath` 必须匹配版本号、三位分片号和 16 位小写十六进制摘要的固定格式；据此只构造 `g.alicdn.com/captcha-frontend/dynamicJS/...` URL。
 - Go 下载公开 SDK 时只允许 `o.alicdn.com`/`g.alicdn.com`，下载 PE 时只允许 `g.alicdn.com`；请求和每次重定向都要求 HTTPS、默认端口、无 userinfo/query/fragment，单脚本上限 2 MiB，并沿用本轮 transport/代理路由。
-- Device VM 接收本轮画像、prefix/region 和公开 SDK，允许访问 `https://g.alicdn.com` 与 `https://*.aliyuncs.com`；每个初始 URL和最多 3 跳重定向都重新检查协议、默认端口、userinfo 与 hostname。它从 Log1/2/3 保持到 Complete，接收 PE 实际 getter 参数/事件并产出同 session Verify token。
-- PE VM 接收真实 `SceneId`、`CertifyId`、DeviceToken、DeviceConfig、图片路径、尺寸、轨迹和逻辑时钟，用当前公开 PE 原生生成 `data`；该 VM 不提供 script/XHR 网络。Go 随后独立解包并验证 session、schema、坐标、getter 参数、事件计数和时钟边界。
-- 公开 SDK/PE 源码及结构画像只按精确 `StaticPath` 缓存 5 分钟；DeviceToken、`CertifyId`、DeviceConfig、轨迹、`data` 不进入分钟级缓存。预热 Device VM 默认最多空闲 20 秒、一次性消费。
-- 临时目录由进程独占创建，桥和脚本以 `0600` 写入；子进程工作目录固定，输出有 64 KiB 上限，PE 执行有 10 秒上限，退出/释放后删除临时目录。直连子进程环境清空；HTTP(S) 代理只注入必要的代理变量，因此代理凭据会进入该子进程内存；SOCKS 则由本机 allowlist CONNECT relay 复用 Go dialer，Node 不接收 SOCKS 凭据。
+- Device Isolate 接收本轮画像、prefix/region 和公开 SDK；JS 不直接持有 socket，只能通过同步 JSON host 回调请求 Go 访问 `https://g.alicdn.com` 与 `https://*.aliyuncs.com`。Go 对初始 URL 和每跳重定向重新检查协议、默认端口、userinfo 与 hostname。Isolate 从 Log1/2/3 保持到 Complete，接收 PE 实际 getter 参数/事件并产出同 session Verify token。
+- PE Isolate 接收真实 `SceneId`、`CertifyId`、DeviceToken、DeviceConfig、图片路径、尺寸、轨迹和逻辑时钟，用当前公开 PE 原生生成 `data`；该 Isolate 的 host 网络开关关闭。Go 随后独立解包并验证 session、schema、坐标、getter 参数、事件计数和时钟边界。
+- 公开 SDK/PE 源码及结构画像只按精确 `StaticPath` 缓存 5 分钟；DeviceToken、`CertifyId`、DeviceConfig、轨迹、`data` 不进入分钟级缓存。预热 Device Isolate 默认最多空闲 20 秒、一次性消费。
+- 不创建临时桥文件或子进程，也不向 JS 注入代理环境变量。HTTP(S)/SOCKS 凭据只保留在 Go transport 内存中；V8 host 只收发有大小上限的 JSON、响应与密码学随机字节。wrapper 对源码/输入/结果设上限，单 Isolate heap 上限 512 MiB，child script 默认 1 秒且最长 10 秒，Go context 取消会请求 V8 终止执行。
 - 路径、脚本、schema、token、session 或算法漂移直接停止且不 Verify，绝不回退随机值或静态伪造结果。
 
-Node `vm` 不是操作系统级沙箱；Device VM 还具有受限网络能力。本设计依赖严格 HTTPS allowlist/逐跳重定向校验、PE VM 禁网、有限输入输出、短生命周期和低权限服务账号缩小边界。Docker 固定以 UID/GID `65532` 运行，裸机部署也不得用 root/Administrator 常驻服务。公开脚本供应链异常仍应被视为运行时风险。
+V8 Isolate 不是操作系统级沙箱；wrapper 和 V8 与 Go 同进程，native panic/abort、内存破坏或未能终止的执行都可影响整个服务。本设计依赖严格 HTTPS allowlist/逐跳重定向校验、PE Isolate 禁网、有限输入输出、heap/时间上限、短生命周期和低权限服务账号缩小边界。Docker 固定以 UID/GID `65532` 运行，裸机部署也不得用 root/Administrator 常驻服务。公开脚本和 V8/Rust/ICU 供应链异常仍应被视为运行时风险。
 
 ## 8. 唯一 Verify
 
@@ -159,15 +159,14 @@ Node `vm` 不是操作系统级沙箱；Device VM 还具有受限网络能力。
 
 ## 9. 供应链与运行时
 
-- 生产 module 零第三方 Go 依赖。
-- `go.mod`、CI 和 Docker 使用 Go 1.26.5；本地 `govulncheck` 在该工具链下未发现可达漏洞。
-- Linux AMD64 二进制使用 `CGO_ENABLED=0`、`-trimpath`、stripped 静态构建。
-- 动态设备/PE 逐挑战执行固定使用 Node `24.14.1`；裸二进制部署必须提供受控 Node 路径，Docker 与 Windows 便携包直接携带该版本。
-- Windows AMD64 便携版包含 `CGO_ENABLED=0` 的 Go console PE、`node.exe` 和对应 `NODE-LICENSE.txt`；测试页仍内嵌于 Go EXE，不加载外部前端依赖。Windows 原生 CI 负责 test、文件白名单、哈希、解压启动和本地 HTTP smoke。
-- 官方 GitHub actions 使用完整 commit SHA 固定；普通 CI 权限保持 `contents: read`。Windows ZIP 包含 commit/build/Node 版本信息和所有包内文件的 SHA-256。
+- 生产 module 使用 `github.com/ebitengine/purego v0.10.2` 加载 wrapper；`go.sum` 和 `Cargo.lock` 均纳入版本控制。
+- `go.mod`、CI 和 Docker 使用 Go 1.26.5；wrapper 使用 Rust 1.88.0、`v8=149.4.0`、`deno_core_icudata=0.77.0`，并嵌入 ICU 77 common data。
+- Linux AMD64/ARM64 产物是 `CGO_ENABLED=0` Go launcher + 同架构 `.so` + 第三方 notices；launcher 通过 `libdl.so.2` 加载 wrapper，最终 Debian 镜像提供 glibc，不是静态单 ELF。
+- Windows AMD64 便携版包含 `CGO_ENABLED=0` 的 Go console PE、静态 MSVC CRT wrapper DLL 和 `THIRD-PARTY-NOTICES.txt`；测试页仍内嵌于 Go EXE。Windows 原生 CI 负责 Rust/Go→DLL 测试、文件白名单、哈希、解压启动和本地 HTTP smoke。
+- 官方 GitHub actions 使用完整 commit SHA 固定；普通 CI 权限保持 `contents: read`。Windows ZIP 包含 commit/build/Go/Rust/V8 版本信息和所有包内文件的 SHA-256。
 - 当前 Windows EXE 没有 Authenticode 代码签名；SmartScreen 可能提示未知发布者。SHA-256 不替代发布者签名，不得要求用户关闭 Defender。
-- 容器运行层固定为官方 Node `24.14.1` Alpine 镜像，Go 服务仍使用 UID/GID `65532`；运行层不再是 `scratch`，镜像面和更新策略必须按 Node/Alpine 一并维护。
-- CI 中项目测试和分析设为 `GOPROXY=off`，不访问真实业务目标。工具/Node 下载和漏洞库查询仍需要供应链网络；显式在线公开脚本/设备探针与挑战验收均不属于普通 CI。
+- 容器运行层固定为 Debian bookworm-slim，Go 服务使用 UID/GID `65532`；镜像面和更新策略必须覆盖 Debian/glibc、V8、ICU 和 Rust wrapper。
+- CI 中项目测试不访问真实业务目标。Go/Rust/V8 依赖获取、工具下载和漏洞库查询仍需要供应链网络；显式在线公开脚本/设备探针与挑战验收均不属于普通 CI。
 
 ## 10. 上线前检查清单
 
@@ -177,9 +176,9 @@ Node `vm` 不是操作系统级沙箱；Device VM 还具有受限网络能力。
 - [ ] 反向代理、APM、客户端日志不收集正文。
 - [ ] 测试页只部署在符合本 API 信任模型的网络边界；使用者已知页面显示值可能敏感，未启用浏览器/代理正文采集。
 - [ ] Artifact 目录不在 Web root，权限、配额、保留期和磁盘告警已验证。
-- [ ] Node `24.14.1` 来源、路径和低权限运行账号已验证；Docker/Windows 产物中的运行时及许可证/哈希完整。
-- [x] 当前源码快照的全量 unit/mock/race/vet/staticcheck/govulncheck/coverage 门禁通过；统一覆盖率为 `81.9%`，超过 `>=80%` 门槛，发布 commit 仍须 CI 重跑。
-- [x] Linux AMD64 静态构建与容器非 root `/health` smoke 通过。
+- [ ] V8 wrapper 来源、ABI、架构和低权限运行账号已验证；Docker/Windows 产物中的运行时、`THIRD-PARTY-NOTICES.txt` 及哈希完整。
+- [x] 当前源码快照的全量 unit/mock/race/vet/staticcheck/govulncheck/coverage 门禁通过；统一覆盖率为 `80.4%`，超过 `>=80%` 门槛，发布 commit 仍须 CI 重跑。
+- [x] Linux AMD64/ARM64 V8 native/ABI 测试、包构建与容器非 root `/health` smoke 通过。
 - [ ] Windows AMD64 原生测试、最终 ZIP smoke、SHA-256 与 Artifact 下载已在发布 commit 的 CI 中通过并归档。
 - [x] 纯计算 P99 与 2026-08-07 历史候选批次 200 轮、32 并发、应用层零重试的 Client 完整求解链 P95/成功率报告已生成并达到当时冻结门槛；该批未经过 HTTP Handler，且先于最终 one-shot 加固。
 - [ ] 针对实际机器资源的 RSS、GC、goroutine 峰值和长时间稳定性压测，以及生产外层控制的上线评审已完成。
@@ -195,6 +194,7 @@ Node `vm` 不是操作系统级沙箱；Device VM 还具有受限网络能力。
 | `internal/artifact/store.go` · `SaveFailure` / `Purge` | Unix 强制 POSIX 私有 mode；Windows 继承 NTFS ACL；两者共用受管名称、排他创建、整组回滚、保留期和配额。 | platform directory policy → private bounded set → purge/evict |
 | `internal/challenge/pool.go` · `canonicalProxyRoute` / `TransportPool.Get` | 路由归一、摘要 key、直连保留和 LRU 限制凭据泄漏与永久耗尽。 | proxy → canonical → SHA-256 key → bounded transport |
 | `internal/challenge/assets.go` · `DownloadAssets` | 固定 CDN、逐跳校验、字节上限和首错取消降低 SSRF/内存/尾延迟风险。 | relative path → allowlisted HTTPS → bounded bytes |
+| `internal/pe/v8_host.go`；`internal/v8runtime/runtime.go`；`native/v8runtime/src/lib.rs` | Device 只能通过 Go host 访问 HTTPS allowlist，PE host 禁网；ABI 输入/输出、heap、child script 时间和 context 取消均有边界。 | untrusted public JS → isolated V8 context → bounded host call → independently checked Go output |
 | `internal/challenge/rpc.go` · `RPCClient.Init/Verify` | Init 只一次，Verify 绑定该 ID 并在网络前消耗唯一尝试位。 | issued ID → irreversible Verify attempt |
 | `.github/workflows/ali-slider-go-ci.yml` | 官方 action 全 SHA 固定；项目测试与 Windows smoke 不访问真实目标，工具与 vuln DB 供应链网络被明确区分。 | pinned actions/tools → offline project checks → verified binary/ZIP |
 | `internal/device/rpc.go:119`、`:130`；`internal/device/session_test.go:130`、`:146`、`:150`、`:165` | Device `ResultObject` 保留原始 JSON，只在 Log1 解码配置，避免对 Log2/3 施加错误对象 schema。 | bounded response → action-specific decode → regression proof |

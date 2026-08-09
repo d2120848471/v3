@@ -40,7 +40,7 @@ type ClientOptions struct {
 	AssetMaxPixels        int64
 	DevicePrewarmCapacity int
 	DeviceSessionMaxAge   time.Duration
-	PEKeyNodeBinary       string
+	V8RuntimeLibrary      string
 
 	defaultsResolved bool
 }
@@ -58,7 +58,7 @@ func DefaultClientOptions() ClientOptions {
 		AssetMaxBytes: defaults.AssetMaxBytes, AssetMaxDimension: defaults.AssetMaxDimension,
 		AssetMaxPixels: 16 << 20, DevicePrewarmCapacity: defaults.DevicePrewarmCapacity,
 		DeviceSessionMaxAge: challenge.DefaultDeviceSessionMaxAge,
-		PEKeyNodeBinary:     defaults.PEKeyNodeBinary,
+		V8RuntimeLibrary:    defaults.V8RuntimeLibrary,
 		defaultsResolved:    true,
 	}
 }
@@ -74,6 +74,7 @@ type Client struct {
 	solver     challengeSolver
 	transports *challenge.TransportPool
 	devices    *challenge.DeviceSessionPool
+	peRuntime  *pe.KeyResolver
 	artifacts  artifact.Store
 
 	mu        sync.Mutex
@@ -83,8 +84,8 @@ type Client struct {
 	closeDone chan struct{}
 }
 
-// NewClient 创建 Go Client，不发外部请求或启动子进程。需要启动预热时显式调用 Prime；
-// Node 设备运行时按挑战启动；公开 SDK/PE 源码和结构画像在进程内复用五分钟。
+// NewClient 创建 Go Client，不发外部请求。需要启动预热时显式调用 Prime；
+// 设备与动态 PE 在进程内的 V8 Isolate 中执行，公开脚本和结构画像复用五分钟。
 func NewClient(options ClientOptions) (*Client, error) {
 	if !options.defaultsResolved {
 		options = fillClientDefaults(options)
@@ -108,12 +109,13 @@ func NewClient(options ClientOptions) (*Client, error) {
 		Entropy: sources.Entropy,
 	}
 
-	peRuntime := pe.NewKeyResolver(options.PEKeyNodeBinary)
+	peRuntime := pe.NewKeyResolver(options.V8RuntimeLibrary)
 	var fixedProfile *device.Profile
 	var devicePool *challenge.DeviceSessionPool
 	if options.DevicePrewarmCapacity > 0 {
 		profile, profileErr := device.GenerateProfile(sources.Entropy)
 		if profileErr != nil {
+			_ = peRuntime.Close()
 			transports.CloseIdleConnections()
 			return nil, fmt.Errorf("generate fixed device profile: %w", profileErr)
 		}
@@ -132,6 +134,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 			challenge.DevicePoolKeyFrom(deviceOptions, ""), poolOpen,
 		)
 		if err != nil {
+			_ = peRuntime.Close()
 			transports.CloseIdleConnections()
 			return nil, err
 		}
@@ -178,11 +181,12 @@ func NewClient(options ClientOptions) (*Client, error) {
 		if devicePool != nil {
 			devicePool.Close()
 		}
+		_ = peRuntime.Close()
 		transports.CloseIdleConnections()
 		return nil, err
 	}
 	return &Client{
-		options: options, solver: engine, transports: transports, devices: devicePool,
+		options: options, solver: engine, transports: transports, devices: devicePool, peRuntime: peRuntime,
 		artifacts: store, closeDone: make(chan struct{}),
 	}, nil
 }
@@ -230,6 +234,22 @@ func (client *Client) Prime(ctx context.Context) error {
 	return nil
 }
 
+// CheckRuntime 立即校验本地 V8 wrapper、C ABI 和 ICU 初始化。HTTP 服务在
+// 开始预热和对外报告 ready 前调用；普通 library 调用方也可用于部署探针。
+func (client *Client) CheckRuntime() error {
+	if client == nil || !client.begin() {
+		return &Error{Kind: ErrorInternal, Stage: "runtime", Message: "Client 已关闭或不可用"}
+	}
+	defer client.active.Done()
+	if client.peRuntime == nil {
+		return &Error{Kind: ErrorInternal, Stage: "runtime", Message: "V8 runtime 不可用"}
+	}
+	if _, err := client.peRuntime.CheckRuntime(); err != nil {
+		return &Error{Kind: ErrorInternal, Stage: "runtime", Message: "V8 runtime 校验失败", Cause: err}
+	}
+	return nil
+}
+
 // PurgeArtifacts 删除超过配置保留期的受管失败样本；不触碰其他文件。
 func (client *Client) PurgeArtifacts() (int, error) {
 	if client == nil || !client.begin() {
@@ -252,6 +272,9 @@ func (client *Client) Close() {
 		client.active.Wait()
 		if client.devices != nil {
 			client.devices.Close()
+		}
+		if client.peRuntime != nil {
+			_ = client.peRuntime.Close()
 		}
 		if client.transports != nil {
 			client.transports.CloseIdleConnections()
@@ -318,8 +341,8 @@ func fillClientDefaults(options ClientOptions) ClientOptions {
 	if options.DeviceSessionMaxAge == 0 {
 		options.DeviceSessionMaxAge = defaults.DeviceSessionMaxAge
 	}
-	if options.PEKeyNodeBinary == "" {
-		options.PEKeyNodeBinary = defaults.PEKeyNodeBinary
+	if options.V8RuntimeLibrary == "" {
+		options.V8RuntimeLibrary = defaults.V8RuntimeLibrary
 	}
 	return options
 }
@@ -349,8 +372,8 @@ func validateClientOptions(options ClientOptions) error {
 	if options.DevicePrewarmCapacity < 0 || options.DevicePrewarmCapacity > options.MaxConcurrency || options.DeviceSessionMaxAge <= 0 {
 		return errors.New("device prewarm settings are invalid")
 	}
-	if options.PEKeyNodeBinary == "" || len(options.PEKeyNodeBinary) > 4_096 || strings.ContainsRune(options.PEKeyNodeBinary, 0) || !utf8.ValidString(options.PEKeyNodeBinary) {
-		return errors.New("PE runtime Node binary must contain 1..4096 valid UTF-8 bytes")
+	if options.V8RuntimeLibrary == "" || len(options.V8RuntimeLibrary) > 4_096 || strings.ContainsRune(options.V8RuntimeLibrary, 0) || !utf8.ValidString(options.V8RuntimeLibrary) {
+		return errors.New("V8 runtime library path must contain 1..4096 valid UTF-8 bytes")
 	}
 	return nil
 }

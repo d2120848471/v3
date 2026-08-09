@@ -1,10 +1,10 @@
 # Python 到 Go 迁移指南
 
-> **迁移状态**：Go 主链已经落地；2026-08-08 的同机 A/B 发现迁移曾同时丢失两个关键动态边界：旧版在同一挑战内保持 FeiLin VM，并按当轮 `StaticPath` 执行当前 PE；迁移版改成纯 Go Device + 静态 key/近似 PE，最终持续 `F001`。当前实现恢复同挑战 Node 设备 VM 和逐轮原生 PE，只缓存公开源码/结构画像 5 分钟，并以 1 个新挑战、一次 Solve、零重试重新得到 `T001`。2026-08-07 的 `196/200`、P95 `984ms` 等数字仍只属于历史实现，不能证明本次修复后的成功率或性能。旧 Python 源码可从 Git 历史提交 `0509bfd` 恢复，Node/JS 动态基线在用户指定的 `d92c7d1`。
+> **迁移状态**：Go 主链已落地。2026-08-08 的同机 A/B 发现早期迁移曾丢失两个关键动态边界：旧版在同一挑战内保持 FeiLin VM，并按当轮 `StaticPath` 执行当前 PE；迁移版改成纯 Go Device + 静态 key/近似 PE，最终持续 `F001`。当前实现用同进程 V8 `149.4.0` 恢复动态语义：同一 Device Isolate 跨 Open/Complete，每轮禁网 PE Isolate 执行当前脚本，只缓存公开源码/结构画像 5 分钟，生产不启动 Node。Linux AMD64/ARM64 native/ABI 和 Linux AMD64 公开 Device/PE 组件探针已通过；完整 Solve 成功率/性能尚未重测。旧 Python 源码可从 Git 历史提交 `0509bfd` 恢复，用户指定的动态语义对照提交为 `d92c7d1`。
 
 ## 目标与冻结边界
 
-- Go 主进程负责编排、RPC、图片和纯 Go 视觉，不依赖 Python、浏览器、OpenCV、GoCV 或 CGo；Node.js 24 按挑战执行设备 SDK/FeiLin 与当前动态 PE。
+- Go 主进程负责编排、RPC、图片和纯 Go 视觉，不依赖 Python、Node 进程、浏览器、OpenCV、GoCV 或 CGo；通过 `purego` + Rust V8 wrapper 执行设备 SDK/FeiLin 与当前动态 PE。
 - reusable Go library 与 HTTP 服务共用同一完整编排。
 - HTTP Solve 请求先通过浏览器跨源边界和方法对应的 JSON/query 输入边界，再直接进入 `Solve`；无浏览器来源头的旧 curl/程序客户端保持兼容。应用内不设置在途请求闸门，也不因活动数返回 429。
 - 每轮状态隔离；每个 `CertifyId` 最多尝试一次 Verify，网络结果未知也不重试。
@@ -29,7 +29,7 @@
 | `challenge/assets.py` | `internal/challenge/assets.go` | 已实现 | 固定 CDN、双图并发、内存下载和边界 |
 | `challenge/track.py` | `internal/track/track.go` | 已实现 | embedded fixture、缩放、抽稀和有界扰动 |
 | `vision/gap_solver.py`、`geometry.py` | `internal/vision` | 已实现 | 纯 Go PNG、缺口定位、fallback 和几何 |
-| `runtime/pe.py`、历史 `runtime/node_pe.py` | `internal/pe` | 已实现 | 同挑战持久 Device VM、逐轮动态 PE、getter/event/data 自检；公开 SDK/PE 源码和画像按精确 `StaticPath` 缓存 5 分钟 |
+| `runtime/pe.py`、历史 `runtime/node_pe.py` | `internal/pe`、`internal/v8runtime`、`native/v8runtime` | 已实现 | 同挑战持久 V8 Device Isolate、逐轮动态 PE Isolate、getter/event/data 自检；公开 SDK/PE 源码和画像按精确 `StaticPath` 缓存 5 分钟 |
 | `challenge/session.py` | `internal/challenge/rpc.go`、`solver.go` | 已实现 | Init → Assets → Vision → PE/Device → 唯一 Verify |
 | `challenge/device_pool.py` | `internal/challenge/device_pool.go` | 已实现 | 有界 Prime/Lease、完整 key 隔离、过期和补货 |
 | `entrypoints/api.py` | `internal/server`、`cmd/server` | 已实现 | HTTP、内嵌测试页、OpenAPI、直接分派 Solve、日志、启动与优雅关闭 |
@@ -44,13 +44,13 @@
 ```text
 HTTP / library Request
   → route-isolated Transport
-  → Device Session（预热 Lease 或冷建 Log1/2/3）
+  → V8 Device Isolate（预热 Lease 或冷建 Log1/2/3）
   → InitCaptchaV3
   → KeyResolver（公开 SDK/精确 PE 源码与画像，5 分钟缓存）
   → 双图并发下载
   → vision.Solve + 置信度门禁
-  → track.LoadDefault + 当前动态 PE VM + Go 独立复核
-  → 同一 Device VM Complete + Verify token
+  → track.LoadDefault + 当前禁网 V8 PE Isolate + Go 独立复核
+  → 同一 Device Isolate Complete + Verify token
   → VerifyCaptchaV3（最多一次）
   → slider.Result / 脱敏分类错误
 ```
@@ -96,7 +96,7 @@ HTTP / library Request
 |---|---|---|
 | 默认 `127.0.0.1:8000` | 应用内无鉴权，缩小暴露面 | 外部访问必须经受控网络/反向代理 |
 | 恢复已废弃的 GET query；增加第一方内嵌测试页 | 保留旧 Python 传输兼容；测试页仍只使用 POST，不是 Swagger UI | 旧 GET 调用方可继续工作，新接入应使用 POST JSON |
-| Go 标准库编排 + 有界 Node 逐挑战运行时 | 消除 Python/OpenCV/浏览器 worker，同时保留上游动态设备/PE 语义 | Docker/Windows 固定携带 Node 24.14.1；裸二进制部署需提供 Node 路径 |
+| Go 标准库编排 + 进程内 V8 Isolate | 消除 Python/OpenCV/浏览器/Node 子进程，同时保留上游动态设备/PE 语义 | Docker/Windows 携带同架构 `.so`/DLL；裸部署需同目录 wrapper 或 `--v8-library` |
 | 图片默认在内存 | 降低临时文件竞争和泄漏 | 仅失败/低置信由 artifact 策略落盘 |
 | 更严格的 PNG/重定向/大小边界 | 防 SSRF、压缩炸弹和资源耗尽 | 异常旧输入更早失败 |
 | prefix 仅 ASCII 字母数字 | 与协议域名边界一致 | 标点/Unicode prefix 被拒绝 |
@@ -118,7 +118,7 @@ HTTP / library Request
 
 ### PE
 
-`internal/pe/builder_test.go` 保留 Python data oracle；`runtime_test.go` 锁定当前 10/历史 11 字段 TrackList、坐标、getter、事件与时钟合同，并用隔离假进程测试逐轮 native Build；`device_runtime_test.go` 锁定同 VM 两阶段、111→动态字段数、token/session/action、HTTP/SOCKS 路由和关闭生命周期。`keys_test.go` 另外锁定精确路径缓存、5 分钟 TTL、24 路并发 miss 合并和白名单/体积边界。显式在线组件探针不创建 Captcha Verify；完整验收必须另行显式授权。
+`internal/pe/builder_test.go` 保留 Python data oracle；旧 Node bridge 只作可选 oracle/上下文差异对照。`v8_bundle_test.go`、`v8_context_diff_test.go`、`internal/v8runtime/runtime_test.go` 锁定 bundle、Node 24 上下文兼容、C ABI、host callback、取消、heap/时间上限和 Isolate 生命周期；`device_runtime_test.go` 锁定同 Isolate 两阶段、token/session/action、HTTP/SOCKS 路由和关闭生命周期。`keys_test.go` 另外锁定精确路径缓存、5 分钟 TTL、24 路并发 miss 合并和白名单/体积边界。生产 V8 显式在线组件探针不创建 Captcha Init/Verify；完整验收必须另行明确授权。
 
 ### 视觉
 
@@ -131,18 +131,20 @@ HTTP / library Request
 
 ## 构建与部署产物
 
-### 静态二进制
+### Linux 双架构产物
 
 ```bash
-make build-linux
-file dist/ali-slider-go-linux-amd64
+make build-linux-amd64
+make build-linux-arm64
+file dist/linux-amd64/ali-slider-go
+file dist/linux-amd64/libali_slider_v8_runtime.so
 ```
 
-Go `1.26.5`、`CGO_ENABLED=0`、Linux AMD64 静态构建仍可生成单一 Go ELF；每轮真实求解都需要宿主提供 Node `24.14.1`，不能再把“Go ELF 静态”写成“完整运行时只有一个文件”。
+完整产物为 `CGO_ENABLED=0` Go launcher + 同架构 V8 `.so` + `THIRD-PARTY-NOTICES.txt`。`purego` 在 Linux 上使用 `libdl.so.2`，所以运行环境需 glibc；不能写成单文件、静态 ELF 或 `scratch` 部署。
 
 ### 容器
 
-`Dockerfile` 使用 Go `1.26.5` Alpine 构建层和 Node `24.14.1` Alpine 运行层，Go 服务仍以非 root UID/GID `65532` 运行。运行层不再是 `scratch`，目的是把逐挑战设备/PE 运行时完整迁入镜像。容器默认仍监听回环；需要端口映射时显式设置容器内 `0.0.0.0`，并优先只发布到宿主回环。
+`Dockerfile` 使用 Go `1.26.5` 构建层、Rust `1.88.0` V8 构建层和 Debian bookworm-slim 运行层，服务以非 root UID/GID `65532` 运行。启动时在 ready 前加载 `.so`、校验 C ABI 并初始化 V8/ICU。容器默认仍监听回环；需要端口映射时显式设置容器内 `0.0.0.0`，并优先只发布到宿主回环。
 
 ### 服务生命周期
 
@@ -150,6 +152,7 @@ Go `1.26.5`、`CGO_ENABLED=0`、Linux AMD64 静态构建仍可生成单一 Go EL
 
 - 解析并验证配置；
 - 创建 `slider.Client`；
+- 在 ready 前校验 wrapper、C ABI 与 V8/ICU；
 - 启动前清理过期 artifact；
 - 按配置并行 Prime 设备会话；
 - 注入完整 Client 到 HTTP Handler；
@@ -160,15 +163,15 @@ Go `1.26.5`、`CGO_ENABLED=0`、Linux AMD64 静态构建仍可生成单一 Go EL
 
 ### 阶段 1：离线等价——已完成
 
-协议、PE、edge-decoy、设备、Captcha、完整 Solver 和 HTTP 使用静态 fixture/Mock 验证；全量 test/race/vet/staticcheck/govulncheck 和静态构建已通过。
+协议、PE、edge-decoy、设备、Captcha、完整 Solver 和 HTTP 使用静态 fixture/Mock 验证；全量 Go 门禁及 Linux AMD64/ARM64 V8 native/ABI 构建已通过。
 
 ### 阶段 2：运维预演——已具备，发布前复核
 
-当前源码快照的统一覆盖率为 `81.9%`，高于 `>=80%` 门槛；Linux AMD64/ARM64、Windows AMD64 交叉构建、Docker 镜像构建及非 root `/health` smoke 已通过。发布 commit 仍应由 CI 重跑覆盖率和门禁，并复核启动、预热降级、定时清理、信号关闭、磁盘权限和日志脱敏。
+当前覆盖率快照为 `80.4%`，高于 `>=80%` 门槛，`internal/v8runtime` 为 `91.4%`；当前迁移候选已通过 Linux AMD64/ARM64 Rust native 和 Go→V8 ABI 测试、Windows AMD64 DLL 交叉构建/导出依赖检查、同架构 Debian/glibc 包检查、Docker 镜像构建及非 root `/health` smoke。发布 commit 仍应由 CI 重跑覆盖率和全部门禁，尤其是 Windows 原生 DLL 执行/最终 ZIP smoke。
 
-### 阶段 3：授权性能与在线验收——当前功能已恢复，性能需重测
+### 阶段 3：授权性能与在线验收——组件通过，完整 Solve 需重测
 
-2026-08-08 当前修复快照以 1 个新挑战、一次 Solve、零重试得到 `T001`，墙钟约 `1579ms`，只证明功能恢复。Mac ARM64 纯 Go 200 样本 `P99=57.05075ms` 和 2026-08-07 历史授权 Client harness 的 `196/200`、完整链 `P95=984ms` 都属于旧 PE 路径；它们保留为历史对照，但不能证明当前逐挑战 Node runtime 的成功率/P95。当前架构必须在新的明确授权下重做性能与容量报告；HTTP 端到端也尚未单独测量。
+当前生产 V8 `OpenDevice → Resolve → Build → Complete` 组件探针在 Linux AMD64 最终包中以 `2.78s` 通过，但不创建 Captcha Init/Verify。Mac ARM64 纯 Go 200 样本 `P99=57.05075ms`、2026-08-07 `196/200`/完整链 `P95=984ms` 及 2026-08-08 单挑战 `T001` 都属于旧运行时路径。当前 V8 架构必须在新的明确授权下重做完整成功率、性能与容量报告；HTTP 端到端也尚未单独测量。
 
 ### 阶段 4：小流量切换——待验收通过
 
@@ -182,7 +185,7 @@ Go `1.26.5`、`CGO_ENABLED=0`、Linux AMD64 静态构建仍可生成单一 Go EL
 
 - 通过反向代理或服务发现切换新请求，不共享 Python/Go 的 in-flight 状态。
 - 回滚只影响新挑战；已经进入 Verify 的 Go 请求不得交给 Python 重试。
-- 保留上一个已验证 Go 静态二进制、镜像 digest、配置快照和 OpenAPI 快照；敏感配置不入库。
+- 保留上一个已验证 Go launcher + 匹配 V8 wrapper、镜像 digest、配置快照和 OpenAPI 快照；敏感配置不入库。
 - 触发条件至少包含成功率、P95/P99、500、外层网关/上游 429、RSS、goroutine、预热失败、artifact 磁盘和脱敏告警。
 - 旧 Python 源码不在当前工作树；需要 oracle/回滚时从 Git 历史提交 `0509bfd` 临时恢复，不维持长期双栈。
 
@@ -192,13 +195,14 @@ Go `1.26.5`、`CGO_ENABLED=0`、Linux AMD64 静态构建仍可生成单一 Go EL
 - [x] `cmd/server`、优雅关闭、预热池、连接池和 artifact 定时清理已接线。
 - [x] HTTP/OpenAPI、唯一 Verify、错误脱敏和完整 Mock 链测试通过。
 - [x] Go `1.26.5` 全量 test/race/vet/staticcheck/govulncheck 通过。
-- [x] Linux AMD64 静态二进制构建通过。
-- [ ] Node 24.14.1 动态设备/PE 运行时、Docker 运行层和 Windows 包内 node.exe 在发布 commit/CI 上完成验证。
+- [x] Linux AMD64/ARM64 V8 Rust native、Go→ABI 测试与双文件包构建通过。
+- [x] Windows AMD64 V8 DLL 交叉构建、导出符号和系统 DLL 依赖检查通过。
+- [ ] Windows AMD64 原生 Rust/Go→DLL 测试与最终 ZIP smoke 在发布 commit CI 上完成。
 - [x] Go CI 工作流和覆盖率门槛已建立。
 - [ ] 最终发布 commit 的统一覆盖率报告已归档。
 - [x] 纯计算 P99 有可复现报告：200 样本 `P99=57.05075ms`。
-- [x] 2026-08-08 当前动态修复快照以 1 轮、并发 1、一次 Solve、零重试得到 `T001`；只作为功能 smoke。
-- [ ] 当前逐挑战 Node Device/PE 架构按新授权完成成功率、P95/P99 和资源报告；2026-08-07 历史 `196/200`、P95 `984ms` 不作为当前结果。
+- [x] 当前生产 V8 Device/PE 公开组件探针通过；它不创建 Captcha Init/Verify。
+- [ ] 当前逐挑战 V8 Device/PE 架构按新授权完成完整 Solve 成功率、P95/P99 和资源报告；2026-08-07 历史 `196/200`、P95 `984ms` 不作为当前结果。
 - [ ] 实际机器资源下的 RSS、GC、goroutine 峰值和长时间稳定性压测有可复现报告。
 - [ ] 生产外层鉴权、网络、日志、磁盘、回滚与值班流程通过评审。
 
@@ -212,9 +216,9 @@ Go `1.26.5`、`CGO_ENABLED=0`、Linux AMD64 静态构建仍可生成单一 Go EL
 | `internal/challenge/device_pool.go:22`、`:134`、`:190`、`:299` | 预热池按完整 key 隔离，并提供有界 Prime/Lease/冷建/过期/补货。 | Prime → key match → lease or cold open |
 | `cmd/server/main.go:36`、`:49`、`:55`、`:60`、`:93`、`:111`、`:147` | 启动器已接线配置、预热、启动/定时清理和优雅关闭。 | config → Client → HTTP → lifecycle cleanup |
 | `internal/server/server.go` · `checkSolveOrigin` / `decodeRequest` / `decodeQueryRequest` / `requestFromPayload` / `handleSolve`；`internal/server/server_test.go` · `TestLegacyGETQueryCompatibility` / `TestLegacyGETQueryValidationNeverCallsSolver` / `TestSolveParameterSourcesStaySeparated` / `TestBrowserOriginBoundaryPreservesLegacyClients` / `TestConcurrentRequestsAlwaysEnterSolver` | 旧 GET query 的字段、重复键、默认值、64 KiB、非法 encoding 和跨源边界均有回归；通过校验的 GET/POST 直接调用 Solver，没有本地 429。 | method → origin + JSON/query gate → timeout context → Solve exactly once |
-| `go.mod:3`；`Makefile` · `build-linux`；`Dockerfile` | Go `1.26.5` 静态二进制与 Node 24.14.1 运行层组成完整容器部署候选。 | source → static Go binary + bounded Node runtime → image |
-| `.github/workflows/ali-slider-go-ci.yml` · `quality` / `race` / `windows-package` | Linux quality、Darwin race 和 Windows package job 都在 `CGO_ENABLED=0` 下建立纯 Go 质量与发布门禁。 | change → split-platform CI evidence → release gate |
-| `internal/vision/solver_test.go:17`；`internal/pe/*_test.go` | Python oracle 只作为静态迁移证据；Go 主链不依赖 Python，设备/动态 PE 语义由有界 Node bridge 执行并由 Go 复核。 | fixture + exact StaticPath + challenge input → Node runtime → Go assertions |
-| `internal/pe/device_runtime_online_test.go` | 当前公开 SDK/PE 下，同一 Node Device VM 跨 Init/Complete 的组件探针通过；完成态 142 字段、4 个请求且不调用 Captcha Verify。 | public SDK/PE + Device RPC → persistent VM → validated completion |
+| `go.mod`；`native/v8runtime/Cargo.toml`；`Makefile` · `build-linux-amd64` / `build-linux-arm64`；`Dockerfile` | Go `1.26.5` launcher、Rust 1.88/V8 149.4 wrapper 与 Debian/glibc 组成完整容器部署候选。 | Go + Rust source → native/ABI tests → launcher + wrapper → image |
+| `.github/workflows/ali-slider-go-ci.yml` · `quality` / `race` / `linux-runtime` / `windows-package` | Linux AMD64/ARM64 用真实 `.so`，Windows 用真实 DLL，组成跨平台发布门禁。 | change → split-platform Go/Rust/V8 evidence → release gate |
+| `internal/vision/solver_test.go:17`；`internal/pe/v8_*_test.go`；`internal/v8runtime/runtime_test.go` | Python/Node oracle 只作静态迁移对照；生产主链在受控 V8 Isolate 执行当前脚本并由 Go 复核。 | fixture + exact StaticPath + challenge input → embedded V8 → Go assertions |
+| `internal/pe/v8_runtime_online_test.go` | 生产 `KeyResolver` 在同一 V8 Device Isolate 跨 Open/Complete，并以禁网 PE Isolate 构造 data；完成态 142 字段、4 个请求且不调用 Captcha Init/Verify。 | public SDK/PE + Device RPC → persistent Device Isolate + per-call PE Isolate → validated completion |
 | `internal/challenge/performance_test.go:65`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 200 样本纯计算 `P99=57.05075ms`，满足硬门槛。 | fixture → Vision/Track/PE → nearest-rank P99 |
 | `pkg/slider/online_acceptance_test.go:37`、`:49`、`:98`、`:128`、`:147`、`:165`、`:168`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 2026-08-07 的历史 Client harness 以 200/32/应用层零重试运行，严格成功 `196/200`、完整链 P95 `984ms`；它不经过 HTTP Handler，不证明当前 HTTP 限流或端到端延迟，最终 one-shot 加固后也未在线重跑。 | dated authorization → one Client.Solve per job → sanitized aggregate → bounded historical finding |

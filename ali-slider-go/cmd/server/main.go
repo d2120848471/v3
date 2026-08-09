@@ -53,6 +53,9 @@ func run(args []string, getenv func(string) string, logger *log.Logger) error {
 		return fmt.Errorf("创建 Client: %w", err)
 	}
 	defer client.Close()
+	if err := client.CheckRuntime(); err != nil {
+		return fmt.Errorf("检查内嵌 V8: %w", err)
+	}
 
 	if removed, purgeErr := client.PurgeArtifacts(); purgeErr != nil {
 		logger.Printf("event=artifact_purge status=warning error=%q", purgeErr.Error())
@@ -135,7 +138,7 @@ func clientOptions(cfg config.Config) slider.ClientOptions {
 	options.ArtifactDir, options.ArtifactRetention = cfg.ArtifactDir, cfg.ArtifactRetention
 	options.AssetMaxBytes, options.AssetMaxDimension = cfg.AssetMaxBytes, cfg.AssetMaxDimension
 	options.DevicePrewarmCapacity = cfg.DevicePrewarmCapacity
-	options.PEKeyNodeBinary = cfg.PEKeyNodeBinary
+	options.V8RuntimeLibrary = cfg.V8RuntimeLibrary
 	return options
 }
 

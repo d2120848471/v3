@@ -1,6 +1,6 @@
 # 性能测试与容量口径
 
-> **当前结论**：2026-08-08 恢复同挑战 Node Device VM 和当前动态 PE 后，单个新挑战以一次 Solve、零重试得到 `T001`，墙钟约 `1579ms`。样本数为 1，只证明功能恢复，不能计算当前 P95/P99 或成功率。原 Mac ARM64 纯 Go 200 样本 `P99=57.05075ms` 和 2026-08-07 Client `196/200`、`P95=984ms` 都属于旧的纯 Go/近似 PE 路径；它们保留为历史基线，不再视为当前生产路径的性能验收。当前 HTTP 端到端、Node VM 资源峰值和长时间稳定性仍待正式授权测量。
+> **当前结论**：生产运行时已改为同进程 V8 `149.4.0`。Linux AMD64 最终包的 Device/PE 组件探针以 `2.78s` 通过，但它不创建 Captcha Init/Verify，不能计算完整 Solve 的 P95/P99 或成功率。原 Mac ARM64 纯 Go 200 样本 `P99=57.05075ms`、2026-08-07 Client `196/200`、`P95=984ms` 及旧单挑战 `1579ms` 都属于旧运行时路径；它们保留为历史基线，不再视为当前生产路径的性能验收。当前 HTTP 端到端、V8 Isolate/Go 资源峰值和长时间稳定性仍待正式授权测量。
 
 ## 性能目标
 
@@ -21,14 +21,14 @@
 | Key | 边界 | 主要内容 |
 |---|---|---|
 | `setup` | 请求校验后到客户端准备完成 | 画像选择、route/transport、设备与 Captcha client 构造 |
-| `deviceSession` | Lease/Open 开始到首枚 token 可用 | 预热 Node VM 命中，或冷建同一 FeiLin VM 的 Log1/2/3 |
+| `deviceSession` | Lease/Open 开始到首枚 token 可用 | 预热 V8 Device Isolate 命中，或冷建同一 FeiLin 状态的 Log1/2/3 |
 | `init` | Captcha Init 请求往返 | InitCaptchaV3 |
 | `resolvePEKey` | Init 后到当前 PE 结构画像可用 | 5 分钟缓存命中，或公开 SDK/PE 下载与画像采样 |
 | `downloadAssets` | 两图下载整体墙钟 | 背景图和 shadow 并行下载 |
 | `downloadBackground` | 单图下载 | 背景图 |
 | `downloadShadow` | 单图下载 | shadow |
 | `vision` | 两张 PNG 到识别结果 | PNG 解码、缺口定位、置信度和几何 |
-| `buildVerifyData` | 轨迹到 PE data | 启动当前动态 PE VM、逻辑时钟、原生 data/getter/events、Go Pack/Unpack 合同自检 |
+| `buildVerifyData` | 轨迹到 PE data | 启动当前禁网 V8 PE Isolate、逻辑时钟、原生 data/getter/events、Go Pack/Unpack 合同自检 |
 | `completeDevice` | 设备完成态 | 同一 FeiLin VM 事件回放/getter、Verify token 和最终 Log2 |
 | `verify` | Captcha Verify 请求往返 | 唯一一次 VerifyCaptchaV3 |
 | `clientCleanup` | release 开始到返回 | 关闭已消费会话并触发有界补货 |
@@ -43,13 +43,13 @@
 | 指标 | 起点与终点 | 包含 | 不包含 |
 |---|---|---|---|
 | 视觉算法 | PNG bytes 进入 `vision.Solve` 到返回 | 解码、图像操作、fallback、坐标 | 轨迹、PE、网络 |
-| 生产本地构建链 | 已取得两张 PNG 到动态 PE/Data 自检完成 | vision、track、Node PE VM、协议解包/合同自检 | Device Complete、Captcha Verify、其他网络与图片下载 |
+| 生产本地构建链 | 已取得两张 PNG 到动态 PE/Data 自检完成 | vision、track、V8 PE Isolate、协议解包/合同自检 | Device Complete、Captcha Verify、其他网络与图片下载 |
 | Solver total | `challenge.Solver.Solve` 进入到清理完成 | 本地计算与全部上游等待 | HTTP parse/write 和客户端网络 |
 | 完整请求 | 负载发生器发出 HTTP 到读完 response | 服务 HTTP、Solver、上游等待 | 负载发生器准备数据的时间 |
 | 吞吐 | 窗口内完成响应数 / 墙钟秒数 | 成功、业务失败、技术失败分别计数 | 不能只统计成功响应 |
 | 在途并发 | 合法请求进入 `Solve` 到 Solver 返回 | Solver 运行及上游等待 | 跨源边界、JSON/query/字段校验在 Solver 前拒绝的请求；外层代理在到达本进程前拒绝的请求 |
 
-`internal/challenge/performance_test.go` 仍提供显式启用的 200 样本纯 Go oracle/视觉回归。历史 Mac ARM64 结果为 `P50=50.577458ms`、`P95=55.711708ms`、`P99=57.05075ms`、`max=60.337542ms`；但该测试使用 fake PE resolver/旧本地 builder，不包含当前逐挑战 Node PE VM，因此只能继续作为视觉/纯 Go 回归，不能证明当前生产 `buildVerifyData` 的 P99。
+`internal/challenge/performance_test.go` 仍提供显式启用的 200 样本纯 Go oracle/视觉回归。历史 Mac ARM64 结果为 `P50=50.577458ms`、`P95=55.711708ms`、`P99=57.05075ms`、`max=60.337542ms`；但该测试使用 fake PE resolver/旧本地 builder，不包含当前逐挑战 V8 PE Isolate，因此只能继续作为视觉/纯 Go 回归，不能证明当前生产 `buildVerifyData` 的 P99。
 
 ## 统计定义
 
@@ -71,7 +71,7 @@ P(q) 的零基下标 = ceil(q × N) - 1
 - P95 是升序第 190 个样本。
 - P99 是升序第 198 个样本。
 
-历史纯计算门禁和授权候选批次都使用 200 个逐次样本及 nearest-rank 口径。架构改变后必须对当前 Node production path 重新采样；任何报告都禁止从旧实现、单个 smoke 或平均值推算当前 P95/P99。
+历史纯计算门禁和授权候选批次都使用 200 个逐次样本及 nearest-rank 口径。架构改变后必须对当前 V8 production path 重新采样；任何报告都禁止从旧实现、单个 smoke 或平均值推算当前 P95/P99。
 
 ## 正式基准环境
 
@@ -84,7 +84,7 @@ CPU:      Apple M3 Max
 内存:     51,539,607,552 bytes（48 GiB）
 ```
 
-module、CI 和 Docker 构建均固定 Go `1.26.5`。Linux AMD64 已验证为静态构建目标，但不能把其功能构建结果与 Mac 性能基线混为同一结论。
+module、CI 和 Docker 构建均固定 Go `1.26.5`，wrapper 构建固定 Rust `1.88.0`/V8 `149.4.0`。Linux AMD64/ARM64 只验证了功能构建/native ABI，不能与 Mac 性能基线混为同一结论。
 
 每份性能报告还必须记录 commit、工作树状态、Go toolchain、OS/arch、`GOMAXPROCS`、电源模式、温度/降频、后台负载、直连/代理、预热容量及 benchmark 参数。
 
@@ -137,7 +137,7 @@ ALI_SLIDER_PERF=1 GOMAXPROCS=16 \
   -run '^TestPureComputeP99$'
 ```
 
-该测试仅在声明的 `darwin/arm64` 基线执行，顺序采集 200 次 `Vision → Track → fake/纯 Go PE/Data`，按 nearest-rank 输出 P50/P95/P99/max。历史结果 `P99=57.05075ms`；它不包含当前 Node PE VM，其他平台 `SKIP` 或该历史 PASS 都不能记作当前生产路径通过。
+该测试仅在声明的 `darwin/arm64` 基线执行，顺序采集 200 次 `Vision → Track → fake/纯 Go PE/Data`，按 nearest-rank 输出 P50/P95/P99/max。历史结果 `P99=57.05075ms`；它不包含当前 V8 PE Isolate，其他平台 `SKIP` 或该历史 PASS 都不能记作当前生产路径通过。
 
 扩展稳定性画像可按以下流程：
 
@@ -150,7 +150,7 @@ ALI_SLIDER_PERF=1 GOMAXPROCS=16 \
 7. 至少重复 5 轮；任一正式轮次 P99 超过 100 ms，则硬门槛失败。
 8. race detector 单独用于正确性，不把插桩后的耗时作为性能数据。
 
-当前架构需新增包含 Node PE VM 的同口径 200 样本门禁；在此之前，旧 200 样本只用于纯 Go/视觉回归趋势。
+当前架构需新增包含 V8 PE Isolate 的同口径 200 样本门禁；在此之前，旧 200 样本只用于纯 Go/视觉回归趋势。
 
 ## Mock Solver/HTTP 分层容量方法
 
@@ -165,13 +165,13 @@ ALI_SLIDER_PERF=1 GOMAXPROCS=16 \
 - 记录完成吞吐、P50/P95/P99/max、错误分类、goroutine、RSS 和 GC；外层代理 429 与第三方上游 429 分开归因。
 - 在 `-race` 下复跑状态正确性，但性能数字来自无 race 插桩版本。
 
-离线 `TestSolverOffline32ConcurrentSuccess` 证明状态隔离；历史 Client harness 以 32 并发完成 200 轮。热构建缓存下的 Mock 与 `200×32=6,400` 次离线 Solve 都使用 fake PE runtime，不启动 production Node VM；这些数字只证明 Go 编排和池状态，不是当前 Node 进程的吞吐、RSS 或泄漏证明。生产形态的 Node/Go RSS、GC、goroutine/进程峰值、持续吞吐和长时间稳定性仍待测。
+离线 `TestSolverOffline32ConcurrentSuccess` 证明状态隔离；历史 Client harness 以 32 并发完成 200 轮。热构建缓存下的 Mock 与 `200×32=6,400` 次离线 Solve 都使用 fake PE runtime，不启动 production V8 Isolate；这些数字只证明 Go 编排和池状态，不是当前 V8 的吞吐、RSS 或泄漏证明。生产形态的 V8/Go RSS、heap、GC、goroutine/原生线程峰值、持续吞吐和长时间稳定性仍待测。
 
 取消本地 HTTP admission 后，Handler goroutine 与已进入的 Solve 数可随来流增长；Transport 连接数和预热库存有界，并不能把 HTTP 在途数变成有界。当前尚未验证生产流量下请求堆积、上游连接等待、超时风暴、RSS/GC 峰值或进程耗尽边界，因此 64 并发回归不得写成“服务支持无界并发”或生产容量结论。需要保护生产实例时，应在外层反向代理、负载均衡或 API 网关配置容量与速率策略，并把其 429 单独统计。
 
-## 2026-08-08 当前功能 smoke
+## 2026-08-08 历史功能 smoke
 
-当前修复快照只执行 1 个新挑战、并发 1、一次 Solve、零重试：严格成功 `1/1`，墙钟 `1579ms`。该数字证明 `T001` 功能合同，不是当前均值、P50、P95 或 P99；不得与 1 秒 P95 目标直接比较，也不得据此估算并发容量。
+当时的动态修复快照只执行 1 个新挑战、并发 1、一次 Solve、零重试：严格成功 `1/1`，墙钟 `1579ms`。该数字属于本次内嵌 V8 迁移之前的运行时，只作历史对照，不是当前均值、P50、P95 或 P99。
 
 ## 2026-08-07 授权在线历史批次
 
@@ -209,13 +209,13 @@ ALI_SLIDER_PERF=1 GOMAXPROCS=16 \
 
 | 字段 | 要求 |
 |---|---|
-| 版本 | commit、dirty 状态、Go `1.26.5` |
+| 版本 | commit、dirty 状态、Go `1.26.5`、Rust `1.88.0`、V8 `149.4.0` |
 | 环境 | OS、arch、CPU、内存、`GOMAXPROCS`、电源模式 |
 | 数据集 | fixture/授权样本数量及普通、困难、负例分布 |
 | 模式 | 冷建/热态、直连/代理、并发度 |
 | 样本 | 预热数、实测数、重复轮次 |
 | 延迟 | mean、P50、P95、P99、max，单位 ms |
-| 资源 | B/op、allocs/op、RSS、GC、goroutine 峰值 |
+| 资源 | B/op、allocs/op、RSS、Go GC、V8 heap、goroutine/原生线程峰值 |
 | 正确性 | oracle 通过数或在线严格成功数；失败分类 |
 | 结论 | 逐项写明通过、失败或未测 |
 

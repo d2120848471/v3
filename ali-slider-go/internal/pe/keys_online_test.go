@@ -32,7 +32,7 @@ func TestOnlineKeyResolver(t *testing.T) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
 	defer transport.CloseIdleConnections()
-	resolver := NewKeyResolver(os.Getenv("ALI_SLIDER_PE_KEY_NODE"))
+	resolver := newNodeKeyResolver(os.Getenv("ALI_SLIDER_PE_KEY_NODE"))
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	resolved, err := resolver.Resolve(ctx, transport, profile, staticPath)

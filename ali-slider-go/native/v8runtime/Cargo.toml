@@ -1,0 +1,20 @@
+[package]
+name = "ali-slider-v8-runtime"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+deno_core_icudata = "=0.77.0"
+v8 = "=149.4.0"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+panic = "unwind"
+strip = "symbols"
