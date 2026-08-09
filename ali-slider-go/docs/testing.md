@@ -1,6 +1,6 @@
 # 测试与质量门禁
 
-> **当前结论**：生产运行时已从 Node 子进程迁到同进程 V8 `149.4.0`。Linux AMD64/ARM64 均已通过 Rust wrapper 单测和 Go→V8 实际 ABI 测试；Windows AMD64 DLL 已交叉构建并检查导出符号/系统 DLL 依赖，原生执行由 Windows CI 门禁完成。Linux AMD64 最终包的生产 Device/PE 组件探针以 `2.78s` 通过，完成态为 142 个指纹字段、4 个请求、`dataLength=1164`；它不创建 Captcha Init/Verify。历史覆盖率、Mac ARM64 纯 Go 200 样本、2026-08-07 `196/200` 与 `P95=984ms` 仅作旧路径基线，不能外推为当前 V8 生产链的性能或成功率。
+> **当前结论**：生产运行时已从Node子进程迁到同进程V8 `149.4.0`。Device使用动态V8；PE按精确 `StaticPath`先做当前V8/纯Go完整差分，兼容才开启纯Go快路，其余保留V8 fallback。Linux AMD64/ARM64已通过Rust wrapper和Go→V8 ABI测试；Windows AMD64 DLL已交叉构建。最终安全候选真实50次为 `47/50`、mean `2562ms`、P50 `2157ms`、P95 `4910ms`，分类错误0；成功率不低于基线，但mean约1秒未通过。
 
 ## 测试原则
 
@@ -22,7 +22,7 @@
 | L3 完整离线链 | 验证 Device → Init → PE profile → Assets → Vision → native PE contract → Device Complete → Verify | `solver_test.go` | 单一 Mock transport / fake PE runtime | 通过 |
 | L4 服务合同 | HTTP 四路径、POST JSON + deprecated GET query、内嵌页/CSP、别名/空值/参数源、状态码、OpenAPI、64 并发直通、无本地主动 429、日志脱敏、启动配置 | `server_test.go`、`cmd/server/main_test.go` | Mock Solver/占用端口 | 通过 |
 | L5 工程门禁 | fmt、vet、test、race、coverage、staticcheck、govulncheck、V8 native/ABI 测试与便携包 | `Makefile`、Docker BuildKit、CI | Linux AMD64/ARM64 实际 V8 `.so`；Windows AMD64 原生 DLL；工具/依赖获取可联网 | 本地候选已验证；发布 commit 由 CI 重跑 |
-| L6 授权在线 | 生产 V8 Device/动态 PE 组件探针；受控挑战 acceptance | `v8_runtime_online_test.go`、其他 `online` build tag 测试 | 双重显式开关/授权；普通 CI 永不执行 | 当前 V8 组件探针通过；完整 Solve 成功率/延迟尚未重测 |
+| L6 授权在线 | 生产 V8 Device、精确 PE 差分探针；受控挑战 acceptance | `v8_runtime_online_test.go`、`online_acceptance_test.go`、其他 `online` build tag 测试 | 双重显式开关/授权；普通 CI 永不执行 | 当前V8/纯Go差分为0；最终50次 `47/50`、mean `2562ms`；4-slot/10-job组件通过 |
 
 ## Go 版本与快速验证
 
@@ -132,7 +132,7 @@ Device RPC 的 `ResultObject` 在真实服务上并非所有 action 都使用同
 
 ## 动态 PE 与持久 V8 Device Isolate 组件探针
 
-生产探针直接构造 `NewKeyResolver(libraryPath)`，请求公开 SDK/Device/PE，在同一 V8 Device Isolate 中完成 Open 和 Complete，中间使用单独禁网 PE Isolate 执行 Resolve/Build。它使用 dummy `CertifyId` 和静态图片名，不创建 Captcha Init/Verify：
+生产探针直接构造 `NewKeyResolver(libraryPath)`，请求公开 SDK/Device/PE，验证同一外层 V8 Device Isolate 两轮 recycle 后 context/session/token 仍独立，并在单独禁网 PE context 中强制 V8 输出、再与纯 Go 逐字段差分。它使用 dummy `CertifyId` 和静态图片名，不创建 Captcha Init/Verify：
 
 ```bash
 ALI_SLIDER_V8_DEVICE_ONLINE=1 \
@@ -142,6 +142,18 @@ CGO_ENABLED=0 go test -count=1 -tags online \
 ```
 
 Linux AMD64 最终 Debian/glibc 包中已验证：`tokenLength=1616`、`dataLength=1164`、Complete 后 142 个指纹字段、4 个请求，测试用时 `2.78s`。这只证明生产 V8 Device/PE 组件合同，不是验证码成功率。
+
+并发组件探针按默认直连生产模型创建最多4个独立画像池slot，以Complete→Recycle接力服务10个job；同样不创建Captcha Init/Verify：
+
+```bash
+ALI_SLIDER_V8_DEVICE_CONCURRENT_ONLINE=1 \
+ALI_SLIDER_V8_DEVICE_CONCURRENCY=10 \
+ALI_SLIDER_V8_TEST_LIBRARY=/absolute/path/libali_slider_v8_runtime.so \
+CGO_ENABLED=0 go test -count=1 -tags online \
+  -run '^TestOnlineV8DeviceRuntimeConcurrentPrime$' -v ./internal/pe
+```
+
+Linux AMD64实测10/10满足142字段、4请求合同，组件wall为9.27s。前置默认直连A/B已证明5个同时存活的Device VM出现138字段，10-live还会触发request sequence错误；因此该测试锁定4槽池模型，不提供提高预热库存上限的开关。
 
 `keys_online_test.go` 和 `device_runtime_online_test.go` 仍保留旧 Node 路径，仅用于人工回归 oracle，不由生产构造器、普通测试或发布包调用。普通 test/CI 不设置任何 online 开关，因此不会访问 CDN/Device。
 
@@ -192,7 +204,7 @@ go test -count=1 -v ./internal/server
 - Solver error/panic、普通日志和 artifact 均不泄漏 token、`CertifyId`、代理凭据或原始正文。
 - `slider.Client.Close` 等待活跃 Solve/Prime/Purge，再关闭预热会话和空闲连接。
 
-64 并发测试是服务合同回归，不是生产容量证明。当前 Handler 不设置 HTTP 在途硬上限；`MaxConcurrency` 只限制 Client 每 route/host 的出站连接与预热资源。生产来流超过下游消化速度时，goroutine、等待中的 Solve、内存和超时可继续增长，相关耗尽边界尚未实测，详见[性能测试与容量口径](./performance.md#mock-solverhttp-分层容量方法)。
+64并发测试是服务合同回归，不是生产容量证明。Handler不设置HTTP在途硬上限；`MaxConcurrency`只限制每route/host连接与PE资源，默认直连Device池满4槽会让更多Solve等待而非返回429。生产来流超过下游消化速度时，goroutine、等待中的Solve、内存和超时仍可增长，详见[性能测试与容量口径](./performance.md#mock-solverhttp-分层容量方法)。
 
 ## Linux 双架构构建
 
@@ -322,7 +334,7 @@ errorsByKind={} wallP50Ms=1579 wallP95Ms=1579 wallP99Ms=1579 wallMaxMs=1579
 | `.github/workflows/ali-slider-go-ci.yml` · `quality` / `race` / `linux-runtime` / `windows-package` | Linux AMD64/ARM64 用真实 `.so`，Windows 用真实 DLL；只有平台 native/ABI/test/smoke 通过才上传产物。 | PR/push → cross-platform Go/Rust/V8 gates → verified artifacts |
 | `internal/protocol/protocol_test.go:47`、`:125`、`:211` | 协议关键输出由静态 Python oracle 锁定。 | Python fixture → Go primitives → equality |
 | `internal/vision/solver_test.go:17` | edge-decoy 正负 fixture 已通过跨语言静态对照。 | PNG fixture → Go vision → accept/reject assertion |
-| `internal/pe/builder_test.go`、`keys_test.go`、`runtime_test.go`、`device_runtime_test.go` | PE 保留 Python oracle；动态 runtime 的 5 分钟缓存、并发 miss、路径/下载边界、持久 Device VM、native data、SOCKS relay 和关闭生命周期由离线替身锁定。 | profile + StaticPath + challenge input → cached scripts / per-challenge VM → independently verified output |
+| `internal/pe/builder_test.go`、`keys_test.go`、`runtime_test.go`、`v8_runtime_test.go`、`device_runtime_test.go` | PE 保留 Python oracle；SDK 5 分钟软 TTL、PE 30 分钟硬 TTL、分片 singleflight、V8/纯 Go 差分、路径/下载边界、Device recycle 和关闭生命周期均由测试锁定。 | profile + exact StaticPath + current V8 oracle → verified pure-Go or V8 fallback → independently checked output |
 | `internal/challenge/solver_test.go` · `TestSolverOfflineCompleteSuccess` / `TestSolverUsesResolvedDynamicPEKey` / `TestSolverClassifiesPEKeyFailuresBeforeAssetsAndVerify` | 完整离线链覆盖动态 runtime 注入、稳定错误分类和 Verify 前停止。 | Device → Init → PE profile → Vision/native PE → guarded Verify |
 | `internal/challenge/device_pool_test.go:138`、`:177`、`:930` | 预热池覆盖有界并行、key 隔离及 Lease/Close 竞态。 | Prime/Lease → bounded ownership → Close |
 | `internal/server/server.go` · `checkSolveOrigin` / `decodeQueryRequest` / `handleSolve`；`internal/server/server_test.go` · `TestLegacyGETQueryCompatibility` / `TestLegacyGETQueryValidationNeverCallsSolver` / `TestSolveParameterSourcesStaySeparated` / `TestConcurrentRequestsAlwaysEnterSolver` / `TestBrowserOriginBoundaryPreservesLegacyClients`；`cmd/server/main_test.go` · `TestHeaderBudgetAcceptsMaximumLegacyQuery` | POST JSON 与 deprecated GET query 的输入、分源、HTTP header 预算和跨源合同有回归；HTTP 无本地 admission，64 个合法并发 POST 全部进入 Solver。 | origin + JSON/query gate → every valid Solve entered → release → 200 |

@@ -1,6 +1,6 @@
 # 排障手册
 
-> **当前边界**：生产 Device/PE 已改为 Go 进程内 V8 `149.4.0`，不启动 Node 子进程。Linux AMD64/ARM64 native/ABI 测试已通过；Windows DLL 已交叉构建，待发布 commit 的 Windows CI 原生复验。生产 V8 公开 Device/PE 组件探针已通过，但不创建 Captcha Init/Verify。纯计算 `P99=57.05075ms`、2026-08-07 `196/200` 和 Client `P95=984ms` 都属于旧路径；当前 V8 生产链的完整成功率、P95/P99、资源峰值和长稳压测仍无结论。排障过程中不得擅自重跑或扩大在线流量，也不得重试同一 `CertifyId`。
+> **当前边界**：生产Device和精确PE oracle使用Go进程内V8 `149.4.0`，不启动Node；PE只在当前V8与纯Go完整差分一致后才在TTL内走纯算，其余保留V8 fallback。每个live Device slot独立画像，默认直连预热池库存默认和硬上限为4。最终安全候选真实50次为 `47/50`、mean `2562ms`、P50 `2157ms`、P95 `4910ms`，分类错误0，明确未达mean约1秒；资源峰值和长稳压测仍无结论。排障时不得擅自扩大在线流量或重试同一 `CertifyId`。
 
 ## 快速分流
 
@@ -43,7 +43,7 @@ curl --fail --silent http://127.0.0.1:8000/health
 
 | 现象 | 直接证据 | 常见原因 | 处理 |
 |---|---|---|---|
-| `配置无效` | 进程退出并给出配置边界 | host/port、Client 连接/预热资源预算、timeout、confidence、artifact 或预热值越界 | 对照 [配置说明](./configuration.md) 修正 flag/env；不要绕过 Validate |
+| `配置无效` | 进程退出并给出配置边界 | host/port、连接/PE预算、timeout、artifact，或prewarm>4、prewarm+reserve>4 | 对照[配置说明](./configuration.md)修正flag/env；不要绕过Validate或提高预热池库存上限 |
 | `HTTP 服务退出: bind... address already in use` | 启动器退出 | 端口被占用 | Unix 用 `lsof -nP -iTCP:8000 -sTCP:LISTEN`；Windows 用 `Get-NetTCPConnection -LocalPort 8000`；关闭旧实例或换端口 |
 | `event=device_prewarm status=warning` | 进程继续启动 | 设备 RPC 超时、部分 Prime 失败或配置/出口问题 | 请求会冷建兜底；检查网络和 device 日志阶段，不把 warning 当预热成功 |
 | `检查内嵌 V8` 后进程退出 | 未出现 ready | wrapper 文件缺失、架构/格式错误、C ABI 不匹配或 V8/ICU 初始化失败 | 检查 `--v8-library`/`ALI_SLIDER_V8_LIBRARY`、`file`；Linux 再用 `ldd`，Windows 确认 EXE 与 DLL 同为 AMD64；不绕过启动自检 |
@@ -55,7 +55,7 @@ curl --fail --silent http://127.0.0.1:8000/health
 
 启动器会在创建 Client 后立即清理一次 artifact，随后每小时清理，并在 SIGINT/SIGTERM 时执行 HTTP 优雅关闭和 `Client.Close`。
 
-`MaxConcurrency` / `--max-concurrency` 只控制 Client 每 route/host 的出站连接与预热资源预算，不是 HTTP Handler 的并发闸门。服务没有本地活动请求数保护；外部部署必须由网关落实鉴权以及按身份/IP 的频率、并发和总量限制。
+`MaxConcurrency` / `--max-concurrency`只控制Client每route/host的出站连接与PE资源预算，不是HTTP Handler并发闸门。默认直连Device预热池4槽是实测协议正确性边界，也不拒绝HTTP请求；满池请求会在Solver中等待。外部部署仍必须由网关落实鉴权、频率、并发和总量限制。
 
 ## HTTP 排障矩阵
 
@@ -91,11 +91,11 @@ library 错误的 `Stage` 和成功结果 `timingsMs` 使用稳定阶段名：
 | `setup` | proxy route、画像或 client 构造 | proxy 格式、route 容量、prefix |
 | `deviceSession` | 预热 Lease 或冷建同一 V8/FeiLin Isolate 的 Log1/2/3 | wrapper/ABI、pool key、会话年龄、设备 endpoint/时钟、代理 |
 | `init` | InitCaptchaV3 | 签名、SceneId/prefix、出口 |
-| `resolvePEKey` | 精确 `StaticPath` 的公开 SDK/PE 下载、5 分钟结构画像采样或缓存命中 | V8 wrapper、CDN allowlist、代理路由；有效缓存命中应接近 0 ms |
+| `resolvePEKey` | 精确 `StaticPath` 的公开 SDK/PE 下载、V8 画像采样 + 纯 Go 完整差分，或缓存命中 | V8 wrapper、CDN allowlist、代理路由；SDK 软 TTL 5 分钟，PE 硬 TTL 30 分钟；有效缓存命中应接近 0 ms |
 | `downloadAssets` | CDN/重定向/大小 | 相对路径、HTTPS allowlist、Content-Length |
 | `vision` | PNG 或低置信 | alpha、尺寸、候选、edge-decoy |
-| `buildVerifyData` | 用本轮输入在禁网 V8 Isolate 执行当前动态 PE，并由 Go 复核 | Track、ExpectedXPos、DeviceConfig、getter、Pack/Unpack、逻辑时钟、V8 timeout/heap |
-| `completeDevice` | 在同一 FeiLin VM 回放 PE events/getter 并执行最终 Log2 | VM 生命周期、事件顺序、getter 参数、DeviceToken session |
+| `buildVerifyData` | 已验证分片用纯 Go Builder，其余在禁网 V8 Isolate 执行；两者都独立复核 | Track、ExpectedXPos、DeviceConfig、getter、Pack/Unpack、逻辑时钟；V8 fallback 再检查 timeout/heap |
+| `completeDevice` | 在同一FeiLin VM回放PE events/getter并执行最终Log2 | VM生命周期、事件顺序、getter、DeviceToken；若默认直连并发出现137/138字段或sequence错误，确认未绕过预热池4槽边界 |
 | `verify` | 唯一 Verify 请求/响应 | 网络未知也不得重试同一挑战 |
 | `clientCleanup` | release/关闭/补货 | pool Lease 所有权、Close 竞态 |
 
@@ -120,10 +120,11 @@ HTTP 错误响应不会回显底层 cause。只有受控 library 调用方可以
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| 已 Prime 但请求仍冷建 | pool key 与请求不完全一致 | 检查 prefix、route、profile ID、timeout 和设备时序范围 |
+| 已Prime但请求仍冷建 | pool key与请求不一致或4个slot均不可用 | 检查prefix、route、timeout和设备时序范围；默认直连slot各有独立画像，不能要求某个外部ProfileID命中 |
 | 使用逐请求 proxy 时未命中直连池 | route 不同，按设计隔离 | 为安全保留冷建；不得跨 proxy 复用会话 |
 | 约 20 秒后首次请求变慢 | idle 会话超过默认最大年龄 | 记录过期/冷建；通过 library 配置评估合理年龄，不无限延长 |
-| 消费后后台出现设备请求 | release 后有界异步补货 | 正常；监控补货失败，`ready+pending+leased` 不超过容量 |
+| 消费后后台出现设备请求 | release 后原位 recycle 会重建新 context/session/token，失败时冷补货 | 正常；监控 recycle/补货失败；资源最多 `capacity+reserve`，reserve 默认 0 |
+| 开启 `--device-reserve` 后 Device 快但总耗时变慢 | 额外 Device V8/网络与冷 PE 画像或 Complete 争用 | 先回到默认 0；只根据本机同口径 A/B 开启，不用单一 `deviceSession` 阶段做决策 |
 | Prime 部分失败 | opener/网络失败 | 成功库存保留；可在授权环境再次 Prime，其他请求冷建 |
 | Close 与 Lease 并发 | 关停过程取消任务并清理 ownership | 应由 `Client.Close` 统一关闭；不要绕过 release |
 
@@ -142,9 +143,9 @@ Device RPC 的成功响应 schema 按 action 处理：Log1 必须给出对象形
 | shadow 无 alpha/空形状 | 拼图图错误 | 不 Verify；纳入授权负例回归 |
 | 两图尺寸不匹配 | 跨请求错配或缓存污染 | 检查单轮状态隔离；禁止复用 mutable 图片 |
 | 低置信 | 无缺口、诱饵或算法不确定 | 不 Verify；查看脱敏 artifact，先复现 oracle |
-| `dynamic PE runtime failed` | V8 wrapper/ABI 不可用、Isolate 超时/heap 超限或输出不合法 | 用 `Client.CheckRuntime`、`ALI_SLIDER_V8_TEST_LIBRARY=... go test ./internal/v8runtime ./internal/pe` 和显式组件探针检查；Docker/Windows 包必须使用同包的 `.so`/DLL |
+| `dynamic PE runtime failed` | 首次画像或 fallback 所需 V8 wrapper/ABI 不可用、Isolate 超时/heap 超限或输出不合法 | 用 `Client.CheckRuntime`、`ALI_SLIDER_V8_TEST_LIBRARY=... go test ./internal/v8runtime ./internal/pe` 和显式组件探针检查；不得因快路存在就省略 `.so`/DLL |
 | `unsupported dynamic PE script` | StaticPath 格式、公开脚本结构、候选唯一性或 Go 独立复核失败 | 不随机兜底、不 Verify；保存路径和稳定错误类别，不保存真实 CertifyId/正文，更新 bridge 前先做离线逆向验证 |
-| 同一路径每轮都新建 Isolate | 逐挑战 Device/PE Isolate 本来就是独立状态；若同时每轮重下公开脚本/重采画像，才说明 Client/KeyResolver 被逐请求重建或 5 分钟 TTL 已过 | 复用一个 `slider.Client`；用 `resolvePEKey` 耗时/受控下载计数区分 Isolate 执行与 cache miss，不要缓存挑战级 token/data |
+| 同一路径每轮都重采画像 | Client/KeyResolver 被逐请求重建、SDK 字节变化、PE 硬 TTL 到期，或前次采样失败 | 复用一个 `slider.Client`；用 `resolvePEKey` 耗时和脱敏 profile 计数区分 miss；不要延长硬 TTL 或缓存挑战级 token/data |
 | PE xPos mismatch | 轨迹换算与视觉坐标相差超过 1 px | 检查尺寸、最后 touchmove 和坐标；不 Verify |
 | invalid PE logical clock | Init、first-touch、轨迹和 now 不一致 | 核对毫秒单位/主机时钟；不要绕过新鲜度 |
 | PE self-check mismatch | Pack/Unpack 或 schema 内部回归 | 停止并运行 protocol/PE oracle |
@@ -183,6 +184,7 @@ go test -count=1 -race \
 | 2026-08-07 的 32 并发历史短批次和离线 RSS 筛查通过 | 把 6.16 秒 Client harness 或含 Go 驱动的 Mock maxRSS 外推成生产长稳容量 | 按实际机器资源另测生产 RSS、GC、goroutine 峰值、持续吞吐和长时间稳定性 |
 | 热态与冷态差异大 | 忽略预热 key/年龄 | 分开报告 Prime、命中、过期、冷建和 proxy |
 | 并行视觉快但在线慢 | 把算法吞吐当完整链 | 分别报告视觉、纯计算、Solver、HTTP 和在线 |
+| 前25次与后25次不同 | 把后半窗口写成全部50次结果 | 同时报告全批和后半；最终全批mean为 `2562ms`，不是后25的 `2232ms`；同时检查默认池4槽等待、分片数和 `resolvePEKey` |
 
 当前纯计算 `P99=57.05075ms`；2026-08-07 的历史授权 Client harness 严格成功 `196/200`，完整求解链墙钟 `P95=984ms`，达到当时两项冻结目标。该批 `P99=1018ms`，不得声称 P99 小于 1 秒、HTTP 端到端已测或 200/32 是当前 Handler 限制；也不得把它写成 one-shot 加固后最终源码的第二份在线报告。完整方法见[性能测试与容量口径](./performance.md)和[脱敏验证证据](./evidence/validation-2026-08-07.md)。
 

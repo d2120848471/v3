@@ -80,15 +80,18 @@ type deviceCompletion struct {
 type DeviceRuntimeSession struct {
 	mu sync.Mutex
 
-	command  *exec.Cmd
-	stdin    io.WriteCloser
-	stdout   *bufio.Reader
-	waitDone chan struct{}
-	waitErr  error
-	stderr   *cappedWriter
-	tempDir  string
-	relay    *connectRelay
-	v8Engine *v8runtime.Runtime
+	command     *exec.Cmd
+	stdin       io.WriteCloser
+	stdout      *bufio.Reader
+	waitDone    chan struct{}
+	waitErr     error
+	stderr      *cappedWriter
+	tempDir     string
+	relay       *connectRelay
+	v8Engine    *v8runtime.Runtime
+	v8Open      []byte
+	profile     device.Profile
+	deviceSlots chan struct{}
 
 	options       DeviceRuntimeOptions
 	sdkSource     []byte
@@ -102,6 +105,14 @@ type DeviceRuntimeSession struct {
 	firstTouchSet bool
 	completed     bool
 	closed        bool
+}
+
+// DeviceProfile 返回该 V8 Device 槽位实际绑定的画像。
+func (session *DeviceRuntimeSession) DeviceProfile() device.Profile {
+	if session == nil {
+		return device.Profile{}
+	}
+	return session.profile.Clone()
 }
 
 // OpenDevice 启动 challenge-worker，完成 Log1/Log2/Log3，并保留 VM 等待 PE
@@ -119,10 +130,13 @@ func (resolver *KeyResolver) OpenDevice(ctx context.Context, transport http.Roun
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	releaseDeviceSlot, err := acquireDeviceExecutionSlot(ctx, resolver.deviceSlots)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseDeviceSlot()
 
-	resolver.miss.Lock()
 	sdkSource, err := resolver.sdkSource(ctx, transport, profile, resolver.now())
-	resolver.miss.Unlock()
 	if err != nil {
 		return nil, err
 	}
@@ -202,7 +216,7 @@ func (resolver *KeyResolver) OpenDevice(ctx context.Context, transport http.Roun
 	session := &DeviceRuntimeSession{
 		command: command, stdin: stdin, stdout: bufio.NewReaderSize(stdoutPipe, 32<<10),
 		waitDone: make(chan struct{}), stderr: stderr, tempDir: runtimeDirectory, relay: relay, options: options,
-		sdkSource: bytes.Clone(sdkSource),
+		sdkSource: bytes.Clone(sdkSource), profile: profile.Clone(), deviceSlots: resolver.deviceSlots,
 	}
 	cleanupDirectory = false
 	go func() {
@@ -678,6 +692,11 @@ func (session *DeviceRuntimeSession) Complete(ctx context.Context, getterArgumen
 	}
 	session.completed = true
 	session.mu.Unlock()
+	releaseDeviceSlot, err := acquireDeviceExecutionSlot(ctx, session.deviceSlots)
+	if err != nil {
+		return device.Result{}, err
+	}
+	defer releaseDeviceSlot()
 	if engine != nil {
 		return session.completeV8Device(ctx, engine, payload, len(events))
 	}
@@ -710,6 +729,73 @@ func (session *DeviceRuntimeSession) Complete(ctx context.Context, getterArgumen
 		return device.Result{}, fmt.Errorf("%w: device bridge exit", ErrKeyRuntime)
 	}
 	return result, nil
+}
+
+// Recycle 在同一个已加载 bridge 的 V8 Isolate 内建立全新浏览器 context 和
+// Device session。它只复用宿主与编译结果，不复用上一轮 session/token/挑战态。
+func (session *DeviceRuntimeSession) Recycle(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("device runtime recycle context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	session.mu.Lock()
+	if session.closed || !session.completed || session.v8Engine == nil || len(session.v8Open) == 0 {
+		session.mu.Unlock()
+		return errors.New("device runtime session is not recyclable")
+	}
+	engine := session.v8Engine
+	payload := bytes.Clone(session.v8Open)
+	session.mu.Unlock()
+	releaseDeviceSlot, err := acquireDeviceExecutionSlot(ctx, session.deviceSlots)
+	if err != nil {
+		return err
+	}
+	defer releaseDeviceSlot()
+
+	result, err := engine.Call(ctx, "__aliV8DeviceOpen", payload)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("%w: recycle V8 Device: %v", ErrKeyRuntime, err)
+	}
+	var stage deviceBridgeStage
+	if err := decodeV8Result(result, &stage); err != nil {
+		return fmt.Errorf("%w: recycle V8 Device output", ErrKeyRuntime)
+	}
+
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.closed || session.v8Engine != engine {
+		return errors.New("device runtime session closed during recycle")
+	}
+	session.secrets = protocol.FrontendSecrets{}
+	session.config = protocol.DeviceConfig{}
+	session.verifyProfile = deviceVerifyArgProfile{}
+	session.initToken = ""
+	session.initParsed = protocol.DeviceToken{}
+	session.initial = device.Result{}
+	session.firstTouchAge = 0
+	session.firstTouchSet = false
+	if err := session.acceptInitialStage(stage); err != nil {
+		return err
+	}
+	session.completed = false
+	return nil
+}
+
+func acquireDeviceExecutionSlot(ctx context.Context, slots chan struct{}) (func(), error) {
+	if slots == nil {
+		return func() {}, nil
+	}
+	select {
+	case slots <- struct{}{}:
+		return func() { <-slots }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func validateRuntimeInteractions(events []device.InteractionEvent) error {
@@ -783,6 +869,7 @@ func (session *DeviceRuntimeSession) Close() {
 	session.closed = true
 	engine := session.v8Engine
 	session.v8Engine = nil
+	session.v8Open = nil
 	stdin := session.stdin
 	session.stdin = nil
 	command := session.command

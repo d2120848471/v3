@@ -278,6 +278,51 @@ func TestRunNativePEAndResolverBuildWithIsolatedProcess(t *testing.T) {
 	}
 }
 
+func TestResolverBuildUsesOnlySelfVerifiedPureGoProfile(t *testing.T) {
+	_, input := validNativeRuntimeFixture(t)
+	now := time.Now()
+	resolver := newNodeKeyResolver(filepath.Join(t.TempDir(), "missing-node"))
+	resolver.now = func() time.Time { return now }
+	path, _ := normalizeStaticPath(testDynamicPath)
+	resolver.keys[path] = cachedRuntimeProfile{
+		profile: RuntimeProfile{
+			ArgumentKey: testArgumentKey, PureGoCompatible: true,
+		},
+		profileSampled: true,
+		sdkSource:      []byte("sdk"),
+		peSource:       []byte("pe"),
+		sampledAt:      now,
+	}
+	result, err := resolver.Build(context.Background(), nil, device.Profile{}, testDynamicPath, input)
+	if err != nil {
+		t.Fatalf("self-verified fast Build() error = %v", err)
+	}
+	decoded, err := protocol.UnpackData(result.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantArgument, err := buildArgument(input.CertifyID, testDynamicPath, testArgumentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Payload.Arg != wantArgument || result.XPos != 29 || result.SlidePos != 80 || len(result.InteractionEvents) != len(input.Track) {
+		t.Fatalf("pure-Go result contract mismatch: x=%d slide=%d interactions=%d", result.XPos, result.SlidePos, len(result.InteractionEvents))
+	}
+
+	resolver.keys[path] = cachedRuntimeProfile{
+		profile: RuntimeProfile{
+			ArgumentKey: testArgumentKey, PureGoCompatible: false,
+		},
+		profileSampled: true,
+		sdkSource:      []byte("sdk"),
+		peSource:       []byte("pe"),
+		sampledAt:      now,
+	}
+	if _, err := resolver.Build(context.Background(), nil, device.Profile{}, testDynamicPath, input); !errors.Is(err, ErrKeyRuntime) {
+		t.Fatalf("unverified profile did not fall back to V8/Node runtime: %v", err)
+	}
+}
+
 func TestRunNativePERejectsProcessAndOutputFailures(t *testing.T) {
 	_, input := validNativeRuntimeFixture(t)
 	var absentContext context.Context

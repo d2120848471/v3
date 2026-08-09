@@ -1,10 +1,10 @@
 # Python 到 Go 迁移指南
 
-> **迁移状态**：Go 主链已落地。2026-08-08 的同机 A/B 发现早期迁移曾丢失两个关键动态边界：旧版在同一挑战内保持 FeiLin VM，并按当轮 `StaticPath` 执行当前 PE；迁移版改成纯 Go Device + 静态 key/近似 PE，最终持续 `F001`。当前实现用同进程 V8 `149.4.0` 恢复动态语义：同一 Device Isolate 跨 Open/Complete，每轮禁网 PE Isolate 执行当前脚本，只缓存公开源码/结构画像 5 分钟，生产不启动 Node。Linux AMD64/ARM64 native/ABI 和 Linux AMD64 公开 Device/PE 组件探针已通过；完整 Solve 成功率/性能尚未重测。旧 Python 源码可从 Git 历史提交 `0509bfd` 恢复，用户指定的动态语义对照提交为 `d92c7d1`。
+> **迁移状态**：Go主链已落地。2026-08-08同机A/B发现早期迁移丢失两个动态边界：旧版在同一挑战内保持FeiLin VM，并按当轮 `StaticPath`执行当前PE；迁移版改成纯Go Device+静态key/近似PE，最终持续 `F001`。当前实现用同进程V8 `149.4.0`恢复动态语义：同一Device会话跨Open/Complete，PE按精确 `StaticPath`由当前V8与纯Go完整差分，兼容后才纯算，否则回退V8；每个live slot独立画像，默认直连池最多保留4个VM。最终安全候选真实50次 `47/50`、mean `2562ms`，mean约1秒未通过。旧Python源码可从Git历史提交 `0509bfd`恢复，用户指定对照提交为 `d92c7d1`。
 
 ## 目标与冻结边界
 
-- Go 主进程负责编排、RPC、图片和纯 Go 视觉，不依赖 Python、Node 进程、浏览器、OpenCV、GoCV 或 CGo；通过 `purego` + Rust V8 wrapper 执行设备 SDK/FeiLin 与当前动态 PE。
+- Go 主进程负责编排、RPC、图片和纯 Go 视觉，不依赖 Python、Node 进程、浏览器、OpenCV、GoCV 或 CGo；通过 `purego` + Rust V8 wrapper 执行设备 SDK/FeiLin 和精确 PE oracle/fallback，已验证分片的单轮 data 由纯 Go Builder 构造。
 - reusable Go library 与 HTTP 服务共用同一完整编排。
 - HTTP Solve 请求先通过浏览器跨源边界和方法对应的 JSON/query 输入边界，再直接进入 `Solve`；无浏览器来源头的旧 curl/程序客户端保持兼容。应用内不设置在途请求闸门，也不因活动数返回 429。
 - 每轮状态隔离；每个 `CertifyId` 最多尝试一次 Verify，网络结果未知也不重试。
@@ -29,7 +29,7 @@
 | `challenge/assets.py` | `internal/challenge/assets.go` | 已实现 | 固定 CDN、双图并发、内存下载和边界 |
 | `challenge/track.py` | `internal/track/track.go` | 已实现 | embedded fixture、缩放、抽稀和有界扰动 |
 | `vision/gap_solver.py`、`geometry.py` | `internal/vision` | 已实现 | 纯 Go PNG、缺口定位、fallback 和几何 |
-| `runtime/pe.py`、历史 `runtime/node_pe.py` | `internal/pe`、`internal/v8runtime`、`native/v8runtime` | 已实现 | 同挑战持久 V8 Device Isolate、逐轮动态 PE Isolate、getter/event/data 自检；公开 SDK/PE 源码和画像按精确 `StaticPath` 缓存 5 分钟 |
+| `runtime/pe.py`、历史 `runtime/node_pe.py` | `internal/pe`、`internal/v8runtime`、`native/v8runtime` | 已实现 | 同挑战持久 V8 Device 会话、外层 Isolate recycle/新 context、精确 PE 动态差分、纯 Go 快路/V8 fallback、getter/event/data 自检；SDK 软 5 分钟、PE 硬 30 分钟 |
 | `challenge/session.py` | `internal/challenge/rpc.go`、`solver.go` | 已实现 | Init → Assets → Vision → PE/Device → 唯一 Verify |
 | `challenge/device_pool.py` | `internal/challenge/device_pool.go` | 已实现 | 有界 Prime/Lease、完整 key 隔离、过期和补货 |
 | `entrypoints/api.py` | `internal/server`、`cmd/server` | 已实现 | HTTP、内嵌测试页、OpenAPI、直接分派 Solve、日志、启动与优雅关闭 |
@@ -46,10 +46,10 @@ HTTP / library Request
   → route-isolated Transport
   → V8 Device Isolate（预热 Lease 或冷建 Log1/2/3）
   → InitCaptchaV3
-  → KeyResolver（公开 SDK/精确 PE 源码与画像，5 分钟缓存）
+  → KeyResolver（公开 SDK/精确 PE 源码与 V8 自校验，软 5/硬 30 分钟）
   → 双图并发下载
   → vision.Solve + 置信度门禁
-  → track.LoadDefault + 当前禁网 V8 PE Isolate + Go 独立复核
+  → track.LoadDefault + 已验证纯 Go Builder 或禁网 V8 fallback + Go 独立复核
   → 同一 Device Isolate Complete + Verify token
   → VerifyCaptchaV3（最多一次）
   → slider.Result / 脱敏分类错误
@@ -86,7 +86,7 @@ HTTP / library Request
 - `/api/slider` 响应包含 `X-Trace-ID`；全部响应使用 `Cache-Control: no-store`。
 - Handler 不生成本地 429、`Retry-After`、`TooManyChallenges`、活动数或退避字段。外层网关仍可按自身策略返回 429；上游 429 属于上游非 2xx，进入 Solver 的稳定网络错误分类，不作为本地过载响应透传。
 
-`MaxConcurrency` / `--max-concurrency` 是兼容旧名，只作为 Client 每 route/host 的出站连接与设备预热资源预算；它不限制 HTTP 在途请求数，也不决定 Handler 是否接收请求。
+`MaxConcurrency` / `--max-concurrency`是兼容旧名，只作为每route/host连接与PE资源预算；默认Device预热池库存另有硬上限4。它们都不限制HTTP在途请求数，也不决定Handler是否接收请求。
 
 当前 HTTP 直达合同已通过 HTTP Mock 和并发 Handler 回归验证。Device Log1/2/3 在线探针与 2026-08-07 的 `Client.Solve` 在线批次分别证明设备链和 Client 链；两者都不能替代 HTTP 传输端到端测量。
 
@@ -171,7 +171,7 @@ file dist/linux-amd64/libali_slider_v8_runtime.so
 
 ### 阶段 3：授权性能与在线验收——组件通过，完整 Solve 需重测
 
-当前生产 V8 `OpenDevice → Resolve → Build → Complete` 组件探针在 Linux AMD64 最终包中以 `2.78s` 通过，但不创建 Captcha Init/Verify。Mac ARM64 纯 Go 200 样本 `P99=57.05075ms`、2026-08-07 `196/200`/完整链 `P95=984ms` 及 2026-08-08 单挑战 `T001` 都属于旧运行时路径。当前 V8 架构必须在新的明确授权下重做完整成功率、性能与容量报告；HTTP 端到端也尚未单独测量。
+当前路径已在Linux AMD64验证精确PE的强制V8/纯Go差分为0，并完成最终安全候选真实50次：`47/50`、mean `2562ms`、P50 `2157ms`、P95 `4910ms`，分类错误0。Mac ARM64纯Go200样本、2026-08-07旧路径和2026-08-08单挑战仍只作历史对照。HTTP端到端、资源峰值和长时间容量仍未单独测量。
 
 ### 阶段 4：小流量切换——待验收通过
 
@@ -202,7 +202,8 @@ file dist/linux-amd64/libali_slider_v8_runtime.so
 - [ ] 最终发布 commit 的统一覆盖率报告已归档。
 - [x] 纯计算 P99 有可复现报告：200 样本 `P99=57.05075ms`。
 - [x] 当前生产 V8 Device/PE 公开组件探针通过；它不创建 Captcha Init/Verify。
-- [ ] 当前逐挑战 V8 Device/PE 架构按新授权完成完整 Solve 成功率、P95/P99 和资源报告；2026-08-07 历史 `196/200`、P95 `984ms` 不作为当前结果。
+- [x] 当前Device+精确PE自校验架构完成50次Client Solve验收；最终安全候选 `47/50`、mean `2562ms`，1秒目标未通过；默认直连池4槽边界由公开组件A/B验证。
+- [ ] 补充 HTTP 端到端、P99、RSS/GC/goroutine/原生线程峰值和长时间稳定性报告。
 - [ ] 实际机器资源下的 RSS、GC、goroutine 峰值和长时间稳定性压测有可复现报告。
 - [ ] 生产外层鉴权、网络、日志、磁盘、回滚与值班流程通过评审。
 
@@ -219,6 +220,6 @@ file dist/linux-amd64/libali_slider_v8_runtime.so
 | `go.mod`；`native/v8runtime/Cargo.toml`；`Makefile` · `build-linux-amd64` / `build-linux-arm64`；`Dockerfile` | Go `1.26.5` launcher、Rust 1.88/V8 149.4 wrapper 与 Debian/glibc 组成完整容器部署候选。 | Go + Rust source → native/ABI tests → launcher + wrapper → image |
 | `.github/workflows/ali-slider-go-ci.yml` · `quality` / `race` / `linux-runtime` / `windows-package` | Linux AMD64/ARM64 用真实 `.so`，Windows 用真实 DLL，组成跨平台发布门禁。 | change → split-platform Go/Rust/V8 evidence → release gate |
 | `internal/vision/solver_test.go:17`；`internal/pe/v8_*_test.go`；`internal/v8runtime/runtime_test.go` | Python/Node oracle 只作静态迁移对照；生产主链在受控 V8 Isolate 执行当前脚本并由 Go 复核。 | fixture + exact StaticPath + challenge input → embedded V8 → Go assertions |
-| `internal/pe/v8_runtime_online_test.go` | 生产 `KeyResolver` 在同一 V8 Device Isolate 跨 Open/Complete，并以禁网 PE Isolate 构造 data；完成态 142 字段、4 个请求且不调用 Captcha Init/Verify。 | public SDK/PE + Device RPC → persistent Device Isolate + per-call PE Isolate → validated completion |
+| `internal/pe/v8_runtime_online_test.go` | 生产 `KeyResolver` 验证同一外层 V8 Device Isolate 的两轮 session/token 独立，并对当前精确 PE 做强制 V8/纯 Go payload、事件和时钟差分；不调用 Captcha Init/Verify。 | public SDK/PE + Device RPC → recycled outer Isolate / fresh round → V8 oracle → verified builder |
 | `internal/challenge/performance_test.go:65`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 200 样本纯计算 `P99=57.05075ms`，满足硬门槛。 | fixture → Vision/Track/PE → nearest-rank P99 |
 | `pkg/slider/online_acceptance_test.go:37`、`:49`、`:98`、`:128`、`:147`、`:165`、`:168`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 2026-08-07 的历史 Client harness 以 200/32/应用层零重试运行，严格成功 `196/200`、完整链 P95 `984ms`；它不经过 HTTP Handler，不证明当前 HTTP 限流或端到端延迟，最终 one-shot 加固后也未在线重跑。 | dated authorization → one Client.Solve per job → sanitized aggregate → bounded historical finding |

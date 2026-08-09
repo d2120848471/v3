@@ -130,6 +130,14 @@ type Session struct {
 	completed          bool
 }
 
+// DeviceProfile 返回该会话在 HTTP、指纹和 PE 中共同使用的画像。
+func (session *Session) DeviceProfile() Profile {
+	if session == nil || session.client == nil {
+		return Profile{}
+	}
+	return session.client.options.Profile.Clone()
+}
+
 // Open 创建独立状态并完成 Log1、Log2、Log3。
 func (client *Client) Open(ctx context.Context) (*Session, error) {
 	if client == nil {

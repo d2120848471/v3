@@ -25,6 +25,41 @@ func (*poolRuntimeSession) Complete(context.Context, string, []device.Interactio
 }
 func (session *poolRuntimeSession) Close() { session.closes.Add(1) }
 
+type poolRecyclableSession struct {
+	*poolRuntimeSession
+	recycles  *atomic.Int32
+	active    *atomic.Int32
+	maxActive *atomic.Int32
+	started   chan<- struct{}
+	gate      <-chan struct{}
+	err       error
+}
+
+func (session *poolRecyclableSession) Recycle(ctx context.Context) error {
+	session.recycles.Add(1)
+	if session.active != nil {
+		active := session.active.Add(1)
+		defer session.active.Add(-1)
+		for {
+			current := session.maxActive.Load()
+			if active <= current || session.maxActive.CompareAndSwap(current, active) {
+				break
+			}
+		}
+	}
+	if session.started != nil {
+		session.started <- struct{}{}
+	}
+	if session.gate != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-session.gate:
+		}
+	}
+	return session.err
+}
+
 type poolTestOpener struct {
 	calls     atomic.Int32
 	active    atomic.Int32
@@ -123,7 +158,7 @@ func TestDevicePoolKeyAndConstructorValidation(t *testing.T) {
 		open     DeviceSessionOpener
 	}{
 		{name: "negative capacity", capacity: -1, key: valid, open: opener.Open},
-		{name: "large capacity", capacity: 33, key: valid, open: opener.Open},
+		{name: "large capacity", capacity: maxDeviceSessionCapacity + 1, key: valid, open: opener.Open},
 		{name: "negative age", capacity: 1, maxAge: -1, key: valid, open: opener.Open},
 		{name: "incomplete key", capacity: 1, key: DevicePoolKey{}, open: opener.Open},
 		{name: "invalid timeout", capacity: 1, key: invalidTimeout, open: opener.Open},
@@ -145,6 +180,19 @@ func TestDevicePoolKeyAndConstructorValidation(t *testing.T) {
 	defer disabled.Close()
 	if err := disabled.Prime(context.Background()); err != nil || opener.calls.Load() != 0 {
 		t.Fatalf("disabled Prime opened a session: calls=%d err=%v", opener.calls.Load(), err)
+	}
+	if _, err := NewRuntimeDeviceSessionPoolWithReserve(1, maxDeviceSessionReserve+1, time.Second, valid, func(context.Context) (DeviceSession, error) {
+		return &poolRuntimeSession{closes: new(atomic.Int32)}, nil
+	}); err == nil {
+		t.Fatal("oversized runtime reserve was accepted")
+	}
+	if _, err := NewRuntimeDeviceSessionPoolWithReserve(0, 1, time.Second, DevicePoolKey{}, nil); err == nil {
+		t.Fatal("reserve without baseline capacity was accepted")
+	}
+	if _, err := NewRuntimeDeviceSessionPoolWithReserve(maxDeviceSessionCapacity, 1, time.Second, valid, func(context.Context) (DeviceSession, error) {
+		return &poolRuntimeSession{closes: new(atomic.Int32)}, nil
+	}); err == nil {
+		t.Fatal("reserve exceeding total live capacity was accepted")
 	}
 }
 
@@ -247,6 +295,55 @@ func TestDeviceSessionPoolLeaseSeparatesKeysAndRefillsOnConsumption(t *testing.T
 	if cold.calls.Load() != 2 || fixed.calls.Load() != 3 {
 		t.Fatalf("closed pool did not stay cold: cold=%d fixed=%d", cold.calls.Load(), fixed.calls.Load())
 	}
+}
+
+func TestDeviceSessionPoolFullMatchWaitsForExistingSlot(t *testing.T) {
+	fixed := newPoolTestOpener()
+	cold := newPoolTestOpener()
+	key := poolTestKey("", "fixed")
+	pool, err := NewDeviceSessionPool(1, time.Second, key, fixed.Open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := pool.Prime(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	first, releaseFirst, err := pool.Lease(context.Background(), key, cold.Open)
+	if err != nil || first == nil {
+		t.Fatalf("first Lease: session=%v err=%v", first, err)
+	}
+
+	type leaseOutcome struct {
+		session *device.Session
+		release func()
+		err     error
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result := make(chan leaseOutcome, 1)
+	go func() {
+		session, release, leaseErr := pool.Lease(ctx, key, cold.Open)
+		result <- leaseOutcome{session: session, release: release, err: leaseErr}
+	}()
+	waitForPool(t, "full matching waiter", func() bool { return poolWaiters(pool) == 1 })
+	if cold.calls.Load() != 0 {
+		t.Fatalf("full matching Lease cold-opened %d sessions", cold.calls.Load())
+	}
+	releaseFirst()
+	var second leaseOutcome
+	select {
+	case second = <-result:
+	case <-time.After(time.Second):
+		t.Fatal("full matching Lease did not receive recycled capacity")
+	}
+	if second.err != nil || second.session == nil || second.release == nil {
+		t.Fatalf("second Lease: session=%v release=%t err=%v", second.session, second.release != nil, second.err)
+	}
+	if cold.calls.Load() != 0 || fixed.calls.Load() != 2 {
+		t.Fatalf("full matching recovery: cold=%d fixed=%d", cold.calls.Load(), fixed.calls.Load())
+	}
+	second.release()
 }
 
 func TestDeviceSessionPoolReleaseBoundsLeasedAndRefillWork(t *testing.T) {
@@ -615,19 +712,22 @@ func TestDeviceSessionPoolExpiredColdFailureWaitsForDemandBeforeRecovery(t *test
 	})
 }
 
-func TestDeviceSessionPoolThirtyTwoLeasesWaitForSamePendingBatch(t *testing.T) {
+func TestDeviceSessionPoolCapacityLeasesWaitForSamePendingBatch(t *testing.T) {
 	gate := make(chan struct{})
 	fixed := newPoolTestOpener()
 	fixed.gate = gate
 	key := poolTestKey("", "fixed")
-	pool, err := NewDeviceSessionPool(32, time.Second, key, fixed.Open)
+	pool, err := NewDeviceSessionPool(maxDeviceSessionCapacity, time.Second, key, fixed.Open)
 	if err != nil {
 		t.Fatal(err)
 	}
 	primeResult := make(chan error, 1)
 	go func() { primeResult <- pool.Prime(context.Background()) }()
-	for range 32 {
+	for range maxDeviceSessionOpenConcurrency {
 		<-fixed.started
+	}
+	if fixed.maxActive.Load() != maxDeviceSessionOpenConcurrency {
+		t.Fatalf("large Prime active=%d, want %d", fixed.maxActive.Load(), maxDeviceSessionOpenConcurrency)
 	}
 
 	cold := newPoolTestOpener()
@@ -636,9 +736,9 @@ func TestDeviceSessionPoolThirtyTwoLeasesWaitForSamePendingBatch(t *testing.T) {
 		release func()
 		err     error
 	}
-	leaseResults := make(chan leaseOutcome, 32)
+	leaseResults := make(chan leaseOutcome, maxDeviceSessionCapacity)
 	start := make(chan struct{})
-	for range 32 {
+	for range maxDeviceSessionCapacity {
 		go func() {
 			<-start
 			session, release, leaseErr := pool.Lease(context.Background(), key, cold.Open)
@@ -646,7 +746,7 @@ func TestDeviceSessionPoolThirtyTwoLeasesWaitForSamePendingBatch(t *testing.T) {
 		}()
 	}
 	close(start)
-	waitForPool(t, "32 pending waiters", func() bool { return poolWaiters(pool) == 32 })
+	waitForPool(t, "capacity pending waiters", func() bool { return poolWaiters(pool) == maxDeviceSessionCapacity })
 	if cold.calls.Load() != 0 {
 		t.Fatalf("pending waiters cold-opened %d sessions", cold.calls.Load())
 	}
@@ -655,8 +755,8 @@ func TestDeviceSessionPoolThirtyTwoLeasesWaitForSamePendingBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	releases := make([]func(), 0, 32)
-	for range 32 {
+	releases := make([]func(), 0, maxDeviceSessionCapacity)
+	for range maxDeviceSessionCapacity {
 		select {
 		case outcome := <-leaseResults:
 			if outcome.err != nil || outcome.session == nil || outcome.release == nil {
@@ -668,7 +768,7 @@ func TestDeviceSessionPoolThirtyTwoLeasesWaitForSamePendingBatch(t *testing.T) {
 		}
 	}
 	ready, pending, leased, _ := poolCounts(pool)
-	if cold.calls.Load() != 0 || fixed.calls.Load() != 32 || poolWaiters(pool) != 0 || ready != 0 || pending != 0 || leased != 32 {
+	if cold.calls.Load() != 0 || fixed.calls.Load() != maxDeviceSessionCapacity || poolWaiters(pool) != 0 || ready != 0 || pending != 0 || leased != maxDeviceSessionCapacity {
 		t.Fatalf("shared pending batch: cold=%d fixed=%d waiters=%d ready=%d pending=%d leased=%d", cold.calls.Load(), fixed.calls.Load(), poolWaiters(pool), ready, pending, leased)
 	}
 	pool.Close()
@@ -943,7 +1043,7 @@ func TestDeviceSessionPoolCancellationAndFailures(t *testing.T) {
 func TestDeviceSessionPoolConcurrentCloseAndLease(t *testing.T) {
 	key := poolTestKey("", "fixed")
 	opener := newPoolTestOpener()
-	pool, err := NewDeviceSessionPool(8, time.Second, key, opener.Open)
+	pool, err := NewDeviceSessionPool(maxDeviceSessionCapacity, time.Second, key, opener.Open)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1065,4 +1165,233 @@ func TestRuntimeDeviceSessionPoolPreservesInterfaceSessionLifecycle(t *testing.T
 	if closes.Load() != 2 {
 		t.Fatalf("runtime session closes=%d, want 2", closes.Load())
 	}
+}
+
+func TestRuntimeDeviceSessionPoolMaintainsBoundedLeaseReserve(t *testing.T) {
+	key := poolTestKey("", "runtime-profile")
+	var opens, closes atomic.Int32
+	opener := func(context.Context) (DeviceSession, error) {
+		opens.Add(1)
+		return &poolRuntimeSession{closes: &closes}, nil
+	}
+	pool, err := NewRuntimeDeviceSessionPoolWithReserve(2, 2, time.Second, key, opener)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.Prime(context.Background()); err != nil {
+		pool.Close()
+		t.Fatal(err)
+	}
+	if opens.Load() != 2 {
+		pool.Close()
+		t.Fatalf("Prime opened reserve early: opens=%d", opens.Load())
+	}
+	releases := make([]func(), 0, 2)
+	for range 2 {
+		_, release, leaseErr := pool.LeaseRuntime(context.Background(), key, opener)
+		if leaseErr != nil {
+			pool.Close()
+			t.Fatal(leaseErr)
+		}
+		releases = append(releases, release)
+	}
+	waitForPool(t, "bounded runtime reserve", func() bool {
+		ready, pending, leased, _ := poolCounts(pool)
+		return opens.Load() == 4 && ready == 2 && pending == 0 && leased == 2
+	})
+	for _, release := range releases {
+		release()
+	}
+	waitForPool(t, "runtime reserve shrink", func() bool {
+		ready, pending, leased, _ := poolCounts(pool)
+		return ready == 2 && pending == 0 && leased == 0 && closes.Load() == 2
+	})
+	pool.Close()
+	if opens.Load() != 4 || closes.Load() != 4 {
+		t.Fatalf("reserve lifecycle: opens=%d closes=%d", opens.Load(), closes.Load())
+	}
+}
+
+func TestRuntimeDeviceSessionPoolRecyclesInPlaceAndFallsBack(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		key := poolTestKey("", "runtime-profile")
+		var opens, closes, recycles atomic.Int32
+		var first *poolRecyclableSession
+		opener := func(context.Context) (DeviceSession, error) {
+			opens.Add(1)
+			session := &poolRecyclableSession{
+				poolRuntimeSession: &poolRuntimeSession{closes: &closes},
+				recycles:           &recycles,
+			}
+			if first == nil {
+				first = session
+			}
+			return session, nil
+		}
+		pool, err := NewRuntimeDeviceSessionPool(1, time.Second, key, opener)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.Prime(context.Background()); err != nil {
+			pool.Close()
+			t.Fatal(err)
+		}
+		session, release, err := pool.LeaseRuntime(context.Background(), key, opener)
+		if err != nil || session != first {
+			pool.Close()
+			t.Fatalf("first Lease: session=%T same=%v err=%v", session, session == first, err)
+		}
+		release()
+		release()
+		waitForPool(t, "recycled runtime", func() bool {
+			ready, pending, leased, _ := poolCounts(pool)
+			return ready == 1 && pending == 0 && leased == 0 && recycles.Load() == 1
+		})
+		if opens.Load() != 1 || closes.Load() != 0 {
+			pool.Close()
+			t.Fatalf("recycle rebuilt runtime: opens=%d closes=%d", opens.Load(), closes.Load())
+		}
+		session, release, err = pool.LeaseRuntime(context.Background(), key, opener)
+		if err != nil || session != first {
+			pool.Close()
+			t.Fatalf("second Lease: session=%T same=%v err=%v", session, session == first, err)
+		}
+		pool.Close()
+		release()
+		ready, pending, leased, closed := poolCounts(pool)
+		if closes.Load() != 1 || recycles.Load() != 1 || !closed || ready != 0 || pending != 0 || leased != 0 {
+			t.Fatalf("closed release: closes=%d recycles=%d closed=%v ready=%d pending=%d leased=%d", closes.Load(), recycles.Load(), closed, ready, pending, leased)
+		}
+	})
+
+	t.Run("failure cold refills", func(t *testing.T) {
+		key := poolTestKey("", "runtime-profile")
+		var opens, closes, recycles atomic.Int32
+		sentinel := errors.New("recycle failed")
+		opener := func(context.Context) (DeviceSession, error) {
+			call := opens.Add(1)
+			base := &poolRuntimeSession{closes: &closes}
+			if call == 1 {
+				return &poolRecyclableSession{poolRuntimeSession: base, recycles: &recycles, err: sentinel}, nil
+			}
+			return base, nil
+		}
+		pool, err := NewRuntimeDeviceSessionPool(1, time.Second, key, opener)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.Prime(context.Background()); err != nil {
+			pool.Close()
+			t.Fatal(err)
+		}
+		_, release, err := pool.LeaseRuntime(context.Background(), key, opener)
+		if err != nil {
+			pool.Close()
+			t.Fatal(err)
+		}
+		release()
+		waitForPool(t, "failed recycle cold refill", func() bool {
+			ready, pending, leased, _ := poolCounts(pool)
+			return ready == 1 && pending == 0 && leased == 0 && opens.Load() == 2 && closes.Load() == 1
+		})
+		if recycles.Load() != 1 {
+			pool.Close()
+			t.Fatalf("recycle calls=%d", recycles.Load())
+		}
+		pool.Close()
+		if closes.Load() != 2 {
+			t.Fatalf("total closes=%d", closes.Load())
+		}
+	})
+
+	t.Run("close cancels recycle", func(t *testing.T) {
+		key := poolTestKey("", "runtime-profile")
+		var closes, recycles atomic.Int32
+		started := make(chan struct{}, 1)
+		gate := make(chan struct{})
+		opener := func(context.Context) (DeviceSession, error) {
+			return &poolRecyclableSession{
+				poolRuntimeSession: &poolRuntimeSession{closes: &closes},
+				recycles:           &recycles, started: started, gate: gate,
+			}, nil
+		}
+		pool, err := NewRuntimeDeviceSessionPool(1, time.Second, key, opener)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.Prime(context.Background()); err != nil {
+			pool.Close()
+			t.Fatal(err)
+		}
+		_, release, err := pool.LeaseRuntime(context.Background(), key, opener)
+		if err != nil {
+			pool.Close()
+			t.Fatal(err)
+		}
+		release()
+		<-started
+		closed := make(chan struct{})
+		go func() {
+			pool.Close()
+			close(closed)
+		}()
+		select {
+		case <-closed:
+		case <-time.After(time.Second):
+			t.Fatal("Close did not cancel recycle")
+		}
+		if recycles.Load() != 1 || closes.Load() != 1 {
+			t.Fatalf("recycles=%d closes=%d", recycles.Load(), closes.Load())
+		}
+	})
+
+	t.Run("large pool bounds recycle concurrency", func(t *testing.T) {
+		key := poolTestKey("", "runtime-profile")
+		var closes, recycles, active, maxActive atomic.Int32
+		started := make(chan struct{}, maxDeviceSessionCapacity)
+		gate := make(chan struct{})
+		opener := func(context.Context) (DeviceSession, error) {
+			return &poolRecyclableSession{
+				poolRuntimeSession: &poolRuntimeSession{closes: &closes},
+				recycles:           &recycles, active: &active, maxActive: &maxActive,
+				started: started, gate: gate,
+			}, nil
+		}
+		pool, err := NewRuntimeDeviceSessionPool(maxDeviceSessionCapacity, time.Second, key, opener)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.Prime(context.Background()); err != nil {
+			pool.Close()
+			t.Fatal(err)
+		}
+		releases := make([]func(), 0, maxDeviceSessionCapacity)
+		for range maxDeviceSessionCapacity {
+			_, release, leaseErr := pool.LeaseRuntime(context.Background(), key, opener)
+			if leaseErr != nil {
+				pool.Close()
+				t.Fatal(leaseErr)
+			}
+			releases = append(releases, release)
+		}
+		for _, release := range releases {
+			release()
+		}
+		for range maxDeviceSessionOpenConcurrency {
+			<-started
+		}
+		if maxActive.Load() != maxDeviceSessionOpenConcurrency || recycles.Load() != maxDeviceSessionOpenConcurrency {
+			pool.Close()
+			t.Fatalf("recycle active=%d calls=%d, want %d", maxActive.Load(), recycles.Load(), maxDeviceSessionOpenConcurrency)
+		}
+		close(gate)
+		waitForPool(t, "bounded large recycle", func() bool {
+			ready, pending, leased, _ := poolCounts(pool)
+			return ready == maxDeviceSessionCapacity && pending == 0 && leased == 0 && recycles.Load() == maxDeviceSessionCapacity
+		})
+		pool.Close()
+		if closes.Load() != maxDeviceSessionCapacity {
+			t.Fatalf("large recycle closes=%d", closes.Load())
+		}
+	})
 }

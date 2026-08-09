@@ -13,6 +13,7 @@ import (
 
 	"github.com/d2120848471/v3/ali-slider-go/internal/artifact"
 	"github.com/d2120848471/v3/ali-slider-go/internal/challenge"
+	"github.com/d2120848471/v3/ali-slider-go/internal/config"
 	"github.com/d2120848471/v3/ali-slider-go/internal/runtimekit"
 )
 
@@ -33,13 +34,14 @@ func TestDefaultOptionsPreserveExplicitZeroValues(t *testing.T) {
 	options.MinimumConfidence = 0
 	options.GatherCostMin, options.GatherCostMax = 0, 0
 	options.DevicePrewarmCapacity = 0
+	options.DeviceSessionReserve = 0
 	options.ArtifactDir = t.TempDir()
 	client, err := NewClient(options)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	if client.options.MinimumConfidence != 0 || client.options.GatherCostMin != 0 || client.options.GatherCostMax != 0 || client.options.DevicePrewarmCapacity != 0 {
+	if client.options.MinimumConfidence != 0 || client.options.GatherCostMin != 0 || client.options.GatherCostMax != 0 || client.options.DevicePrewarmCapacity != 0 || client.options.DeviceSessionReserve != 0 {
 		t.Fatalf("explicit zeros were overwritten: %+v", client.options)
 	}
 }
@@ -50,8 +52,8 @@ func TestZeroOptionsUseProductionPrewarmDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	if client.options.DevicePrewarmCapacity != DefaultClientOptions().DevicePrewarmCapacity || client.devices == nil {
-		t.Fatalf("zero options prewarm capacity=%d poolNil=%t", client.options.DevicePrewarmCapacity, client.devices == nil)
+	if client.options.DevicePrewarmCapacity != DefaultClientOptions().DevicePrewarmCapacity || client.options.DeviceSessionReserve != DefaultClientOptions().DeviceSessionReserve || client.devices == nil {
+		t.Fatalf("zero options prewarm capacity=%d reserve=%d poolNil=%t", client.options.DevicePrewarmCapacity, client.options.DeviceSessionReserve, client.devices == nil)
 	}
 }
 
@@ -192,6 +194,27 @@ func TestNewClientValidationAndArtifactPurge(t *testing.T) {
 	invalid.DefaultPrefix = "bad-prefix"
 	if _, err := NewClient(invalid); err == nil {
 		t.Fatal("invalid options accepted")
+	}
+	invalid = DefaultClientOptions()
+	invalid.DeviceSessionReserve = config.MaxDeviceSessionReserve + 1
+	if _, err := NewClient(invalid); err == nil {
+		t.Fatal("invalid device reserve accepted")
+	}
+	invalid = DefaultClientOptions()
+	invalid.DevicePrewarmCapacity = config.MaxDevicePrewarmCapacity + 1
+	if _, err := NewClient(invalid); err == nil {
+		t.Fatal("invalid device prewarm accepted")
+	}
+	invalid = DefaultClientOptions()
+	invalid.DeviceSessionReserve = 1
+	if _, err := NewClient(invalid); err == nil {
+		t.Fatal("device prewarm plus reserve overflow accepted")
+	}
+	invalid = DefaultClientOptions()
+	invalid.DevicePrewarmCapacity = 0
+	invalid.DeviceSessionReserve = 1
+	if _, err := NewClient(invalid); err == nil {
+		t.Fatal("device reserve without prewarm accepted")
 	}
 	options := DefaultClientOptions()
 	options.DevicePrewarmCapacity = 0

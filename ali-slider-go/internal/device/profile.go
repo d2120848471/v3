@@ -121,6 +121,14 @@ type Profile struct {
 	TextMetricScale     float64
 }
 
+// Clone 返回不共享 slice 底层数组的只读画像副本。
+func (p Profile) Clone() Profile {
+	p.UABrands = append([]UABrand(nil), p.UABrands...)
+	p.UAFullVersions = append([]UABrand(nil), p.UAFullVersions...)
+	p.Languages = append([]string(nil), p.Languages...)
+	return p
+}
+
 // GenerateProfile 从同一家族抽取自洽画像。所有随机字段均来自注入熵。
 func GenerateProfile(entropy runtimekit.Entropy) (Profile, error) {
 	if entropy == nil {

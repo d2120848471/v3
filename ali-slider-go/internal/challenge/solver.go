@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -113,15 +114,19 @@ type peSDKSourceProvider interface {
 	PESDKSource() ([]byte, error)
 }
 
-// PEKeyResolver 缓存公开 SDK/PE 脚本与运行画像，并用当前分片逐挑战原生生成
-// data；离线测试可注入无 Node、无网络的实现。
+type deviceProfileProvider interface {
+	DeviceProfile() device.Profile
+}
+
+// PEKeyResolver 缓存公开 SDK/PE 脚本，并用当前分片逐挑战原生生成
+// data；离线测试可注入无 V8、无网络的实现。
 type PEKeyResolver interface {
-	Resolve(context.Context, http.RoundTripper, device.Profile, string) (pe.RuntimeProfile, error)
+	Prepare(context.Context, http.RoundTripper, device.Profile, string) error
 	Build(context.Context, http.RoundTripper, device.Profile, string, pe.RuntimeInput) (pe.Result, error)
 }
 
-// SolverOptions 固定进程级资源边界。FixedProfile 非 nil 时，HTTP、设备与 PE
-// 全程共享同一份只读画像，这是设备会话预热命中的必要条件。
+// SolverOptions 固定进程级资源边界。FixedProfile 只供离线/兼容调用固定画像；
+// 生产动态会话会在 Lease 后提供 slot 实际画像，并贯穿 HTTP、设备与 PE。
 type SolverOptions struct {
 	Timeout           time.Duration
 	MinimumConfidence float64
@@ -244,11 +249,27 @@ func (solver *Solver) Solve(parent context.Context, request SolveRequest) (outco
 		session.Close()
 		return outcome, fail(FailureInternal, currentStage, "设备会话释放器缺失", nil)
 	}
+	var releaseOnce sync.Once
+	releaseSession := func() { releaseOnce.Do(release) }
 	defer func() {
 		cleanupStarted := time.Now()
-		release()
+		releaseSession()
 		timings["clientCleanup"] = elapsedMilliseconds(cleanupStarted)
 	}()
+	if provider, ok := session.(deviceProfileProvider); ok {
+		profile := provider.DeviceProfile()
+		if profile.ProfileID == "" {
+			return outcome, fail(FailureProtocol, currentStage, "设备会话画像不可用", nil)
+		}
+		setup.profile = profile
+	}
+	setup.rpcClient, err = NewRPCClient(RPCOptions{
+		Transport: setup.transport, Profile: setup.profile, Sources: solver.options.Sources,
+		SceneID: request.SceneID, Prefix: request.Prefix, RPCKeyID: request.RPCKeyID,
+	})
+	if err != nil {
+		return outcome, fail(FailureProtocol, currentStage, "验证码客户端初始化失败", err)
+	}
 	initToken, err := session.InitToken()
 	if err != nil || initToken == "" {
 		return outcome, stageFailure(ctx, FailureProtocol, currentStage, "设备初始化 token 不可用", err)
@@ -268,28 +289,40 @@ func (solver *Solver) Solve(parent context.Context, request SolveRequest) (outco
 		return outcome, err
 	}
 
-	currentStage = "resolvePEKey"
-	resolveStarted := time.Now()
-	_, err = solver.options.PEKeys.Resolve(ctx, setup.transport, setup.profile, challengeValue.StaticPath)
-	timings[currentStage] = elapsedMilliseconds(resolveStarted)
-	if err != nil {
-		return outcome, peKeyFailure(ctx, currentStage, err)
+	// PE 源码和两张图片只依赖 Init 路径，三者并发下载。
+	// 当轮真实 PE 仍在 Build 阶段单独执行并完整校验。
+	type prepareResult struct {
+		elapsed int
+		err     error
 	}
-	if err := checkStageContext(ctx, currentStage); err != nil {
-		return outcome, err
-	}
-
+	prepareResults := make(chan prepareResult, 1)
+	go func() {
+		started := time.Now()
+		prepareErr := solver.options.PEKeys.Prepare(ctx, setup.transport, setup.profile, challengeValue.StaticPath)
+		prepareResults <- prepareResult{elapsed: elapsedMilliseconds(started), err: prepareErr}
+	}()
 	currentStage = "downloadAssets"
 	downloadStarted := time.Now()
 	assets, err = DownloadAssets(ctx, setup.transport, setup.profile, defaultReferer, challengeValue.ImagePath, challengeValue.PuzzleImagePath, AssetLimits{MaxBytes: solver.options.AssetMaxBytes})
 	timings[currentStage] = elapsedMilliseconds(downloadStarted)
+	assetErr := err
+	prepared := <-prepareResults
+	timings["resolvePEKey"] = prepared.elapsed
+	if prepared.err != nil {
+		currentStage = "resolvePEKey"
+		return outcome, peKeyFailure(ctx, currentStage, prepared.err)
+	}
+	if err := checkStageContext(ctx, "resolvePEKey"); err != nil {
+		currentStage = "resolvePEKey"
+		return outcome, err
+	}
 	if backgroundMS, ok := assets.TimingsMS["background"]; ok {
 		timings["downloadBackground"] = backgroundMS
 	}
 	if shadowMS, ok := assets.TimingsMS["shadow"]; ok {
 		timings["downloadShadow"] = shadowMS
 	}
-	if err != nil {
+	if assetErr != nil {
 		return outcome, stageFailure(ctx, FailureNetwork, currentStage, "验证码图片下载失败", err)
 	}
 	if err := checkStageContext(ctx, currentStage); err != nil {
@@ -359,7 +392,7 @@ func (solver *Solver) Solve(parent context.Context, request SolveRequest) (outco
 					})
 					if err == nil {
 						timings[currentStage] = elapsedMilliseconds(buildStarted)
-						return solver.completeAndVerify(ctx, request, setup, session, challengeValue, estimate, build, timings, &currentStage, &artifactReason)
+						return solver.completeAndVerify(ctx, request, setup, session, releaseSession, challengeValue, estimate, build, timings, &currentStage, &artifactReason)
 					}
 				}
 			}
@@ -382,6 +415,7 @@ func (solver *Solver) completeAndVerify(
 	request SolveRequest,
 	setup setupState,
 	session DeviceSession,
+	releaseSession func(),
 	challengeValue CaptchaChallenge,
 	estimate vision.Estimate,
 	build pe.Result,
@@ -421,6 +455,9 @@ func (solver *Solver) completeAndVerify(
 	if err := checkStageContext(ctx, *currentStage); err != nil {
 		return outcome, err
 	}
+	// Complete 后 session 已无后续消费者；提前开始池内 recycle，
+	// 使其与 Verify 网络重叠。外层 once+defer 仍保底所有早退路径。
+	releaseSession()
 
 	*currentStage = "verify"
 	verifyStarted := time.Now()
@@ -477,15 +514,8 @@ func (solver *Solver) setup(ctx context.Context, request SolveRequest) (setupSta
 	if err != nil {
 		return setupState{}, fail(FailureInternal, "setup", "设备客户端初始化失败", err)
 	}
-	rpcClient, err := NewRPCClient(RPCOptions{
-		Transport: transport, Profile: profile, Sources: solver.options.Sources,
-		SceneID: request.SceneID, Prefix: request.Prefix, RPCKeyID: request.RPCKeyID,
-	})
-	if err != nil {
-		return setupState{}, fail(FailureProtocol, "setup", "验证码客户端初始化失败", err)
-	}
 	return setupState{
-		transport: transport, profile: profile, deviceClient: deviceClient, rpcClient: rpcClient,
+		transport: transport, profile: profile, deviceClient: deviceClient,
 		proxied: proxied, deviceKey: DevicePoolKeyFrom(deviceOptions, request.Proxy),
 	}, nil
 }

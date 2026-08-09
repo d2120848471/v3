@@ -138,6 +138,7 @@ func clientOptions(cfg config.Config) slider.ClientOptions {
 	options.ArtifactDir, options.ArtifactRetention = cfg.ArtifactDir, cfg.ArtifactRetention
 	options.AssetMaxBytes, options.AssetMaxDimension = cfg.AssetMaxBytes, cfg.AssetMaxDimension
 	options.DevicePrewarmCapacity = cfg.DevicePrewarmCapacity
+	options.DeviceSessionReserve = cfg.DeviceSessionReserve
 	options.V8RuntimeLibrary = cfg.V8RuntimeLibrary
 	return options
 }

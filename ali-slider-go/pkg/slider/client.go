@@ -18,13 +18,15 @@ import (
 	"github.com/d2120848471/v3/ali-slider-go/internal/runtimekit"
 )
 
+const dynamicDevicePoolProfileID = "dynamic-device-profile-slot"
+
 // ClientOptions 配置可并发复用的 Go Client。直接使用零值结构时会按
 // DefaultClientOptions 补齐。如需显式传递有意义的零（如置信度 0、
 // GatherCost 0..0 或关闭预热），应先调用 DefaultClientOptions 再覆盖。
 type ClientOptions struct {
 	DefaultSceneID string
 	DefaultPrefix  string
-	// MaxConcurrency 是兼容旧名：只控制每 route/host 出站连接与预热资源边界，不限制 Solve 调用。
+	// MaxConcurrency 是兼容旧名：控制每 route/host 出站连接与 PE 资源预算，不限制 Solve 调用。
 	MaxConcurrency        int
 	MaxTransportRoutes    int
 	Timeout               time.Duration
@@ -39,8 +41,11 @@ type ClientOptions struct {
 	AssetMaxDimension     int
 	AssetMaxPixels        int64
 	DevicePrewarmCapacity int
-	DeviceSessionMaxAge   time.Duration
-	V8RuntimeLibrary      string
+	// DeviceSessionReserve 是有会话租出时投机保留的小额备用库存。
+	// Prime 仍只建 DevicePrewarmCapacity 个，无租约时也收缩回该容量。
+	DeviceSessionReserve int
+	DeviceSessionMaxAge  time.Duration
+	V8RuntimeLibrary     string
 
 	defaultsResolved bool
 }
@@ -57,9 +62,10 @@ func DefaultClientOptions() ClientOptions {
 		ArtifactDir: defaults.ArtifactDir, ArtifactRetention: defaults.ArtifactRetention,
 		AssetMaxBytes: defaults.AssetMaxBytes, AssetMaxDimension: defaults.AssetMaxDimension,
 		AssetMaxPixels: 16 << 20, DevicePrewarmCapacity: defaults.DevicePrewarmCapacity,
-		DeviceSessionMaxAge: challenge.DefaultDeviceSessionMaxAge,
-		V8RuntimeLibrary:    defaults.V8RuntimeLibrary,
-		defaultsResolved:    true,
+		DeviceSessionReserve: defaults.DeviceSessionReserve,
+		DeviceSessionMaxAge:  challenge.DefaultDeviceSessionMaxAge,
+		V8RuntimeLibrary:     defaults.V8RuntimeLibrary,
+		defaultsResolved:     true,
 	}
 }
 
@@ -67,8 +73,8 @@ type challengeSolver interface {
 	Solve(context.Context, challenge.SolveRequest) (challenge.SolveOutcome, error)
 }
 
-// Client 可被多个 goroutine 并发复用。每次 Solve 仍持有独立挑战、设备与
-// Verify 尝试位；共享连接池、密码学熵、只读画像、公开 PE 脚本/画像缓存和可选预热池。
+// Client 可被多个 goroutine 并发复用。每次 Solve 仍持有独立挑战、设备画像与
+// Verify 尝试位；共享连接池、密码学熵、公开 PE 脚本/画像缓存和可选预热池。
 type Client struct {
 	options    ClientOptions
 	solver     challengeSolver
@@ -109,19 +115,16 @@ func NewClient(options ClientOptions) (*Client, error) {
 		Entropy: sources.Entropy,
 	}
 
-	peRuntime := pe.NewKeyResolver(options.V8RuntimeLibrary)
-	var fixedProfile *device.Profile
+	peRuntime := pe.NewKeyResolverWithCapacity(options.V8RuntimeLibrary, options.MaxConcurrency)
 	var devicePool *challenge.DeviceSessionPool
 	if options.DevicePrewarmCapacity > 0 {
-		profile, profileErr := device.GenerateProfile(sources.Entropy)
-		if profileErr != nil {
-			_ = peRuntime.Close()
-			transports.CloseIdleConnections()
-			return nil, fmt.Errorf("generate fixed device profile: %w", profileErr)
-		}
-		fixedProfile = &profile
-		deviceOptions := productionDeviceOptions(options, profile, sources)
+		poolProfile := device.Profile{ProfileID: dynamicDevicePoolProfileID}
+		deviceOptions := productionDeviceOptions(options, poolProfile, sources)
 		poolOpen := func(ctx context.Context) (challenge.DeviceSession, error) {
+			profile, profileErr := device.GenerateProfile(sources.Entropy)
+			if profileErr != nil {
+				return nil, fmt.Errorf("generate device slot profile: %w", profileErr)
+			}
 			return peRuntime.OpenDevice(ctx, directTransport, profile, pe.DeviceRuntimeOptions{
 				Prefix: options.DefaultPrefix, Region: "cn", Timeout: options.Timeout,
 				GatherCostMin: options.GatherCostMin, GatherCostMax: options.GatherCostMax,
@@ -129,8 +132,8 @@ func NewClient(options ClientOptions) (*Client, error) {
 				Sources: sources,
 			})
 		}
-		devicePool, err = challenge.NewRuntimeDeviceSessionPool(
-			options.DevicePrewarmCapacity, options.DeviceSessionMaxAge,
+		devicePool, err = challenge.NewRuntimeDeviceSessionPoolWithReserve(
+			options.DevicePrewarmCapacity, options.DeviceSessionReserve, options.DeviceSessionMaxAge,
 			challenge.DevicePoolKeyFrom(deviceOptions, ""), poolOpen,
 		)
 		if err != nil {
@@ -151,7 +154,9 @@ func NewClient(options ClientOptions) (*Client, error) {
 		deviceOptions := productionDeviceOptions(options, profile, sources)
 		deviceOptions.Prefix = request.Prefix
 		if devicePool != nil {
-			return devicePool.LeaseRuntime(ctx, challenge.DevicePoolKeyFrom(deviceOptions, request.Proxy), opener)
+			poolKey := challenge.DevicePoolKeyFrom(deviceOptions, request.Proxy)
+			poolKey.ProfileID = dynamicDevicePoolProfileID
+			return devicePool.LeaseRuntime(ctx, poolKey, opener)
 		}
 		session, openErr := opener(ctx)
 		if openErr != nil || session == nil {
@@ -174,7 +179,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		FirstTouchAgeMin: options.FirstTouchAgeMin, FirstTouchAgeMax: options.FirstTouchAgeMax,
 		AssetMaxBytes: options.AssetMaxBytes, AssetMaxDimension: options.AssetMaxDimension,
 		AssetMaxPixels: options.AssetMaxPixels, Sources: sources, GetTransport: getTransport,
-		Artifacts: &store, FixedProfile: fixedProfile, OpenDevice: openDevice,
+		Artifacts: &store, OpenDevice: openDevice,
 		PEKeys: peRuntime,
 	})
 	if err != nil {
@@ -338,6 +343,9 @@ func fillClientDefaults(options ClientOptions) ClientOptions {
 	if options.DevicePrewarmCapacity == 0 {
 		options.DevicePrewarmCapacity = defaults.DevicePrewarmCapacity
 	}
+	if options.DeviceSessionReserve == 0 {
+		options.DeviceSessionReserve = defaults.DeviceSessionReserve
+	}
 	if options.DeviceSessionMaxAge == 0 {
 		options.DeviceSessionMaxAge = defaults.DeviceSessionMaxAge
 	}
@@ -369,7 +377,10 @@ func validateClientOptions(options ClientOptions) error {
 	if options.AssetMaxBytes < 1 || options.AssetMaxBytes > 64<<20 || options.AssetMaxDimension < 1 || options.AssetMaxDimension > 16_384 || options.AssetMaxPixels < 1 {
 		return errors.New("asset limits are invalid")
 	}
-	if options.DevicePrewarmCapacity < 0 || options.DevicePrewarmCapacity > options.MaxConcurrency || options.DeviceSessionMaxAge <= 0 {
+	if options.DevicePrewarmCapacity < 0 || options.DevicePrewarmCapacity > min(options.MaxConcurrency, config.MaxDevicePrewarmCapacity) ||
+		options.DeviceSessionReserve < 0 || options.DeviceSessionReserve > config.MaxDeviceSessionReserve ||
+		options.DevicePrewarmCapacity == 0 && options.DeviceSessionReserve != 0 ||
+		options.DevicePrewarmCapacity+options.DeviceSessionReserve > config.MaxDevicePrewarmCapacity || options.DeviceSessionMaxAge <= 0 {
 		return errors.New("device prewarm settings are invalid")
 	}
 	if options.V8RuntimeLibrary == "" || len(options.V8RuntimeLibrary) > 4_096 || strings.ContainsRune(options.V8RuntimeLibrary, 0) || !utf8.ValidString(options.V8RuntimeLibrary) {

@@ -2,7 +2,7 @@
 
 ## 1. 默认信任模型
 
-> 服务没有应用内 API 鉴权，也没有基于活动请求数的本地接纳闸门。默认只监听 `127.0.0.1:8000`。显式改为 `0.0.0.0` 时，任何网络可达客户端都可以直接触发 `Solve`、消耗 CPU/内存、Client 连接/预热预算和上游配额，还可以传入代理路由并促使服务对外连接。`GET /api/slider?...` 只是 deprecated 的旧客户端兼容入口，会立即执行与 POST 相同的真实求解，不是安全的读操作。`GET /` 测试页与 API 使用同一信任边界，不提供账号或权限隔离。
+> 服务没有应用内API鉴权，也没有基于活动请求数的本地接纳闸门。默认只监听 `127.0.0.1:8000`。显式改为 `0.0.0.0`时，任何网络可达客户端都能触发Solve、消耗CPU/内存、连接/PE/默认4槽Device池和上游配额，还可传入代理路由。deprecated GET仍有真实副作用；测试页与API也不提供账号隔离。
 
 服务的 HTTP surface 仍是四个路径：`GET /`、`GET|POST /api/slider`、`GET /health` 和 `GET /openapi.json`。Solve 的两种方法都只声明 `200/400/403/500`；Handler 不主动返回 429。
 
@@ -16,7 +16,7 @@
 
 Handler 不生成本地 429、`Retry-After`、`TooManyChallenges`、活动数或退避字段。外层网关和上游仍可能返回 429，但这不等于应用内存在资源保护；因此外层鉴权以及按身份/IP 的频率、并发和总量限制是公网或共享网络部署的必要前置条件。
 
-`MaxConcurrency` / `--max-concurrency` 是兼容旧名，只作为 Client 每 route/host 的出站连接与设备预热资源预算；它不限制 HTTP 请求进入。启动器在非回环监听时输出一条纯文本安全警告，但警告不是强制控制。
+`MaxConcurrency` / `--max-concurrency`是兼容旧名，只作为每route/host连接与PE资源预算；默认Device预热池库存另有硬上限4。二者都不限制HTTP请求进入。启动器在非回环监听时输出安全警告，但警告不是强制控制。
 
 回环监听只缩小网络暴露，不阻止同机不可信进程访问，也不能把浏览器页面当作身份边界。API 不启用宽松 CORS；Handler 根据 `Origin` / `Sec-Fetch-Site` 拒绝明确的浏览器跨源 POST 和 deprecated GET，但这只是 drive-by 缓解，不是鉴权或完整 CSRF 保护。Go `CrossOriginProtection` 原本会把 GET 视为安全方法，所以 Handler 在同源检查副本中将旧 GET 当作 POST，再保留原请求的 GET/query 语义。明确跨源返回 `403 ApiOriginError` 且不进入 Solver；同源请求、用户在地址栏直接发起的 `Sec-Fetch-Site: none` 以及无浏览器头的旧 API 客户端仍允许。共享机器仍需操作系统用户隔离和外层访问控制。
 
@@ -136,9 +136,9 @@ Init 返回的动态 PE 不能依赖有限硬编码表，也不能用随机 `arg
 
 - `StaticPath` 必须匹配版本号、三位分片号和 16 位小写十六进制摘要的固定格式；据此只构造 `g.alicdn.com/captcha-frontend/dynamicJS/...` URL。
 - Go 下载公开 SDK 时只允许 `o.alicdn.com`/`g.alicdn.com`，下载 PE 时只允许 `g.alicdn.com`；请求和每次重定向都要求 HTTPS、默认端口、无 userinfo/query/fragment，单脚本上限 2 MiB，并沿用本轮 transport/代理路由。
-- Device Isolate 接收本轮画像、prefix/region 和公开 SDK；JS 不直接持有 socket，只能通过同步 JSON host 回调请求 Go 访问 `https://g.alicdn.com` 与 `https://*.aliyuncs.com`。Go 对初始 URL 和每跳重定向重新检查协议、默认端口、userinfo 与 hostname。Isolate 从 Log1/2/3 保持到 Complete，接收 PE 实际 getter 参数/事件并产出同 session Verify token。
-- PE Isolate 接收真实 `SceneId`、`CertifyId`、DeviceToken、DeviceConfig、图片路径、尺寸、轨迹和逻辑时钟，用当前公开 PE 原生生成 `data`；该 Isolate 的 host 网络开关关闭。Go 随后独立解包并验证 session、schema、坐标、getter 参数、事件计数和时钟边界。
-- 公开 SDK/PE 源码及结构画像只按精确 `StaticPath` 缓存 5 分钟；DeviceToken、`CertifyId`、DeviceConfig、轨迹、`data` 不进入分钟级缓存。预热 Device Isolate 默认最多空闲 20 秒、一次性消费。
+- 每个Device slot持有独立只读画像；当轮RPC headers、图片、PE与Device Isolate使用租到会话的实际画像。JS不直接持有socket，只能通过同步JSON host回调请求Go访问严格白名单；Isolate从Log1/2/3保持到Complete并产出同session Verify token。
+- 新精确 PE 分片使用禁网 V8 Isolate 对固定假输入采样，并与纯 Go Builder 的 payload、事件和时钟完整差分。仅兼容分片在 TTL 内用本轮真实 `SceneId`、`CertifyId`、DeviceToken、DeviceConfig、图片路径、尺寸、轨迹和逻辑时钟纯算 `data`；不兼容分片在禁网 V8 中按本轮输入构造。Go 随后对两条路径都独立解包并验证 session、schema、坐标、getter 参数、事件计数和时钟边界。
+- 公开SDK每5分钟字节复核；精确PE源码/profile最多30分钟强制重下与V8差分。DeviceToken、`CertifyId`、DeviceConfig、轨迹、`data`不进入分钟级缓存。预热挑战状态默认最多空闲20秒且一次性消费；默认直连池最多保留4个Isolate，满池等待，下一轮必须重建context/session/token。
 - 不创建临时桥文件或子进程，也不向 JS 注入代理环境变量。HTTP(S)/SOCKS 凭据只保留在 Go transport 内存中；V8 host 只收发有大小上限的 JSON、响应与密码学随机字节。wrapper 对源码/输入/结果设上限，单 Isolate heap 上限 512 MiB，child script 默认 1 秒且最长 10 秒，Go context 取消会请求 V8 终止执行。
 - 路径、脚本、schema、token、session 或算法漂移直接停止且不 Verify，绝不回退随机值或静态伪造结果。
 

@@ -1,5 +1,7 @@
 # Ali Slider 内嵌 V8 运行时迁移报告
 
+> 本文是“恢复动态语义”阶段的历史快照。后续性能优化在保留动态 V8 oracle/fallback 的前提下增加了精确分片纯 Go 快路、5 分钟 SDK 软 TTL 和 30 分钟 PE 硬 TTL。当前状态以 [2026-08-09 性能证据](./evidence/validation-2026-08-09-performance.md) 为准。
+
 ## 执行摘要
 
 早期 Go 迁移失败的核心不是 IP，而是丢失动态运行时语义：它曾用静态 key/近似 Go payload 代替“同挑战 Device VM 状态 + 当轮 PE 脚本”。当前候选已用 Go 进程内 V8 `149.4.0` 恢复该语义，生产不启动 Node。
@@ -39,7 +41,7 @@ flowchart LR
 
 - 可 5 分钟复用：公开 SDK 源码、精确 PE 源码、对应结构画像。
 - 不得跨轮复用：DeviceToken、`CertifyId`、DeviceConfig、轨迹、逻辑时钟、`data`、Verify 尝试位。
-- 预热 Device Isolate 最多空闲 20 秒且一次性消费；它不是分钟级 token 缓存。
+- 每个live Device slot使用独立画像；默认直连公开组件A/B确认预热池最多安全保留4个Isolate。预热会话最多空闲20秒且一次性消费；它不是分钟级token缓存。
 
 ## Evidence
 

@@ -153,7 +153,7 @@ GET 是真实有副作用的 Solve，不是健康检查。即使响应头禁止�
 | `timingsMs` | object | 稳定阶段名到非负毫秒数的映射 |
 | `traceId` | string | 服务生成的 12 位小写十六进制追踪 ID |
 
-`pkg/slider.Client` 已接通完整 Go 编排和进程内 V8 Device/动态 PE 运行时，不启动 Node 子进程。`ok=true` 的判定是 `VerifyCode == "T001" && VerifyResult && securityToken != ""`。2026-08-08 以前的单挑战 `T001` 和 2026-08-07 `196/200`、Client `P95=984ms` 都属于旧运行时路径，不得外推到当前架构。当前 V8 生产组件探针只验证 Device/PE 执行，不调用 Captcha Init/Verify，因此不构成完整成功率或 P95 报告。
+`pkg/slider.Client`已接通完整Go编排、进程内V8 Device和精确PE动态自校验，不启动Node子进程。`ok=true`的判定是 `VerifyCode == "T001" && VerifyResult && securityToken != ""`。2026-08-09最终安全候选真实50次为 `47/50`、mean `2562ms`、P50 `2157ms`、P95 `4910ms`；3次均为业务F015，分类错误0。该数据直接调用Client，不经HTTP Handler，且mean约1秒未通过。2026-08-07 `196/200`与 `P95=984ms`仍只属于旧运行时对照。
 
 两次记录都直接验证公共 Client，不是 HTTP 传输基准。历史批次的 `P99=1018ms`，不能声称 P99 或每个响应都小于 1 秒；当前单次 smoke 更不能用来计算分位数。聚合结果不包含令牌、挑战标识、图片或上游正文。
 
@@ -168,7 +168,7 @@ GET 是真实有副作用的 Solve，不是健康检查。即使响应头禁止�
 | `500` | `UnhandledProtocolError` | 未分类错误或 Solver panic；响应不回显原始错误 | 已调用一次 |
 | `404` | 无固定 `errorType` | 未开放的方法或路径 | 不调用 |
 
-HTTP 层不设置本地 admission gate、不维护并发槽，也不因本机在途请求数主动返回 `429` 或 `Retry-After`。每个通过浏览器跨源与输入校验的 GET/POST Solve 请求都直接进入 Solver；`--max-concurrency` 仅是 Client 每个 route/host 的出站连接与设备预热资源预算，不是 HTTP 并发上限。上游、连接池或机器资源仍可能自然等待或以技术错误结束。
+HTTP层不设置本地admission gate、不维护HTTP请求槽，也不因本机在途请求数主动返回 `429`或 `Retry-After`。每个通过浏览器跨源与输入校验的GET/POST Solve请求都进入Solver；`--max-concurrency`仅是每route/host连接与PE预算，默认Device预热池另有4槽库存边界。它们都不是HTTP admission上限；合法请求可在Solver内部等待资源或以技术错误结束。
 
 通过跨源和输入校验的请求使用服务 `--timeout`。Handler 从请求 `context.Context` 派生 deadline 并传入 Solver；调用方断开或 deadline 到期会取消该 context，超时返回脱敏 `500 NetworkError`。Solver panic 由 Handler 恢复并返回脱敏 `500 UnhandledProtocolError`，不会回显 panic 内容。自定义 Solver 仍必须主动响应 `context.Context`。
 
@@ -211,7 +211,7 @@ curl --fail --output openapi.json http://127.0.0.1:8000/openapi.json
 | `internal/server/server.go` · `decodeRequest` / `decodeQueryRequest` / `requestFromPayload` / `optionalAliasedText`；`internal/server/server_test.go` · `TestLegacyGETQueryCompatibility` / `TestLegacyGETQueryValidationNeverCallsSolver` / `TestSolveParameterSourcesStaySeparated` | JSON body 和 raw query 各限 64 KiB；GET/POST 参数源分离，query 同名取最后值，规范名优先，非法 encoding 在 Solver 前返回 400。 | method → JSON body 或 query → alias resolution → `slider.Request` |
 | `internal/server/server.go` · `normalizeProxy` | HTTP 层校验代理 scheme、主机和端口，并为无 scheme 输入补 `http://`。 | proxy text → `url.Parse` → normalized proxy |
 | `internal/server/server.go` · `browserOriginProtection` / `checkSolveOrigin` / `handleSolve` / `callSolver` / `solverErrorResponse`；`internal/server/server_test.go` · `TestBrowserOriginBoundaryPreservesLegacyClients` | GET 有真实副作用，因此与 POST 一样经过跨源检查；无浏览器来源头客户端允许，合法请求在 deadline context 中调用一次 Solver。 | origin gate → method-specific parse → timeout context → Solve ×1 → result/error mapping |
-| `internal/config/config.go` · `MaxConcurrency`；`cmd/server/main.go` · `clientOptions`；`pkg/slider/client.go` · `NewTransportPool` | 兼容配置名 `MaxConcurrency` 只进入 Client 的每 route/host 连接与预热资源边界，不进入 HTTP Handler。 | config → ClientOptions → transport/prewarm budget；valid GET/POST Solve → Solver |
+| `internal/config/config.go` · `MaxConcurrency` / `MaxDevicePrewarmCapacity`；`cmd/server/main.go` · `clientOptions`；`pkg/slider/client.go` · `NewClient` | `MaxConcurrency`只进入连接/PE预算；Device live另限4；都不进入HTTP admission。 | config → ClientOptions → transport/PE/device budgets；valid GET/POST Solve → Solver |
 | `pkg/slider/types.go:22` · `Result`；`:45` · `ErrorKind` | 成功响应字段与稳定错误类别由 library 合同定义。 | Solver output → server response DTO → JSON |
 | `internal/server/openapi.go` · `openAPIDocument` / `legacyQueryParameters` / `solveResponses`；`internal/server/server_test.go` · `TestEmbeddedAPITestPage` / `TestOnlyFrozenRoutesAreExposed` | 运行时 OpenAPI 描述 POST JSON、已废弃 GET 的 8 个 query 名称、完整 200 字段及 400/403/500 合同；测试页仍只手工发送 POST。 | GET `/` / `/openapi.json` → embedded page / generated contract → same-origin manual POST |
 | `internal/device/rpc.go:119`、`:130` | Device 顶层 Code 统一校验，只有 Log1 解码对象内的 DeviceConfig；Log2/3 接受非对象结果。 | upstream JSON → action-specific schema → session result |

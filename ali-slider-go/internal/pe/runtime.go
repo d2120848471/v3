@@ -19,6 +19,7 @@ import (
 
 	"github.com/d2120848471/v3/ali-slider-go/internal/device"
 	"github.com/d2120848471/v3/ali-slider-go/internal/protocol"
+	"github.com/d2120848471/v3/ali-slider-go/internal/runtimekit"
 	"github.com/d2120848471/v3/ali-slider-go/internal/track"
 )
 
@@ -144,12 +145,16 @@ func (resolver *KeyResolver) Build(ctx context.Context, transport http.RoundTrip
 	if err != nil {
 		return Result{}, err
 	}
-	if _, err := resolver.Resolve(ctx, transport, profile, path); err != nil {
+	if err := resolver.prepareRuntimeSources(ctx, transport, profile, path); err != nil {
+		return Result{}, err
+	}
+	runtimeProfile, profileErr := resolver.ensureRuntimeProfile(ctx, transport, profile, path)
+	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
 	sdkSource, peSource, ok := resolver.cachedRuntimeSources(path, resolver.now())
 	if !ok {
-		if _, err := resolver.Resolve(ctx, transport, profile, path); err != nil {
+		if err := resolver.prepareRuntimeSources(ctx, transport, profile, path); err != nil {
 			return Result{}, err
 		}
 		sdkSource, peSource, ok = resolver.cachedRuntimeSources(path, resolver.now())
@@ -163,6 +168,29 @@ func (resolver *KeyResolver) Build(ctx context.Context, transport http.RoundTrip
 		}
 		sdkSource = bytes.Clone(input.SDKSource)
 	}
+	if profileErr == nil && runtimeProfile.PureGoCompatible {
+		fastResult, fastErr := (Builder{
+			Profile: profile,
+			Sources: runtimekit.NewSystemSources(),
+		}).Build(ctx, Input{
+			SceneID: input.SceneID, CertifyID: input.CertifyID,
+			Dimensions: Dimensions{
+				RenderedWidth: input.Dimensions.RenderedWidth,
+				HandleWidth:   input.Dimensions.HandleWidth,
+			},
+			Track: input.Track, StaticPath: path,
+			ArgumentKey: runtimeProfile.ArgumentKey, IncludeScreenInfo: runtimeProfile.IncludeScreenInfo,
+			ExpectedXPos: input.ExpectedXPos, InitBeginTimeMS: input.InitBeginTimeMS,
+			FirstTouchAgeMS: input.FirstTouchAgeMS,
+		})
+		if fastErr == nil {
+			return fastResult, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
+		}
+		// 当轮输入超出已自校验快路时，保留原生 V8 结果。
+	}
 	if resolver.v8LibraryPath != "" {
 		return resolver.runV8PE(ctx, profile, sdkSource, peSource, input)
 	}
@@ -172,12 +200,16 @@ func (resolver *KeyResolver) Build(ctx context.Context, transport http.RoundTrip
 func (resolver *KeyResolver) cachedRuntimeSources(path string, now time.Time) ([]byte, []byte, bool) {
 	resolver.mu.RLock()
 	defer resolver.mu.RUnlock()
+	return resolver.cachedRuntimeSourcesLocked(path, now)
+}
+
+// cachedRuntimeSourcesLocked 要求调用方已持有 resolver.mu 的读锁或写锁。
+func (resolver *KeyResolver) cachedRuntimeSourcesLocked(path string, now time.Time) ([]byte, []byte, bool) {
 	cached, ok := resolver.keys[path]
 	if !ok || len(cached.sdkSource) == 0 || len(cached.peSource) == 0 {
 		return nil, nil, false
 	}
-	age := now.Sub(cached.sampledAt)
-	if age < 0 || age >= keyProfileCacheTTL {
+	if !runtimeProfileCacheFresh(cached, now) {
 		return nil, nil, false
 	}
 	return bytes.Clone(cached.sdkSource), bytes.Clone(cached.peSource), true

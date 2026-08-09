@@ -3,12 +3,13 @@
 //! V8 Isolate 只在创建它的 Rust worker 线程上使用。Go 可以从任意
 //! goroutine 调用导出函数，命令会被串行转交给该线程。
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Once, mpsc};
+use std::sync::{Arc, Condvar, Mutex, Once, OnceLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -21,8 +22,159 @@ const DEFAULT_VM_SCRIPT_TIMEOUT_MS: u64 = 1_000;
 const MAX_VM_SCRIPT_TIMEOUT_MS: u64 = 10_000;
 const MAX_ISOLATE_HEAP_BYTES: usize = 512 * 1024 * 1024;
 const HEAP_TERMINATION_GRACE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_SCRIPT_CODE_CACHE_ENTRIES: usize = 64;
+const MAX_SCRIPT_CODE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 static INITIALIZE_V8: Once = Once::new();
+static SCRIPT_CODE_CACHE: OnceLock<ScriptCodeCacheStore> = OnceLock::new();
+
+struct ScriptCodeCacheStore {
+    cache: Mutex<ScriptCodeCache>,
+    ready: Condvar,
+}
+
+struct ScriptCodeCache {
+    entries: HashMap<String, Vec<u8>>,
+    order: VecDeque<String>,
+    compiling: HashSet<String>,
+    bytes: usize,
+}
+
+enum ScriptCacheLookup<'a> {
+    Cached(Vec<u8>),
+    Compile(ScriptCompileReservation<'a>),
+}
+
+struct ScriptCompileReservation<'a> {
+    store: &'a ScriptCodeCacheStore,
+    key: String,
+    active: bool,
+}
+
+impl ScriptCodeCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            compiling: HashSet::new(),
+            bytes: 0,
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<Vec<u8>> {
+        let value = self.entries.get(key)?.clone();
+        self.order.retain(|candidate| candidate != key);
+        self.order.push_back(key.to_owned());
+        Some(value)
+    }
+
+    fn remove(&mut self, key: &str) {
+        if let Some(value) = self.entries.remove(key) {
+            self.bytes = self.bytes.saturating_sub(key.len() + value.len());
+        }
+        self.order.retain(|candidate| candidate != key);
+    }
+
+    fn insert(&mut self, key: String, value: Vec<u8>) {
+        let footprint = key.len().saturating_add(value.len());
+        if footprint > MAX_SCRIPT_CODE_CACHE_BYTES {
+            return;
+        }
+        self.remove(&key);
+        while self.entries.len() >= MAX_SCRIPT_CODE_CACHE_ENTRIES
+            || self.bytes.saturating_add(footprint) > MAX_SCRIPT_CODE_CACHE_BYTES
+        {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(old_value) = self.entries.remove(&oldest) {
+                self.bytes = self
+                    .bytes
+                    .saturating_sub(oldest.len().saturating_add(old_value.len()));
+            }
+        }
+        self.bytes = self.bytes.saturating_add(footprint);
+        self.order.push_back(key.clone());
+        self.entries.insert(key, value);
+    }
+}
+
+impl ScriptCodeCacheStore {
+    fn new() -> Self {
+        Self {
+            cache: Mutex::new(ScriptCodeCache::new()),
+            ready: Condvar::new(),
+        }
+    }
+
+    // 同一精确源码只允许一个编译者；不同源码在离开
+    // 这个短临界区后可以并发编译，避免冷 PE 分片全局串行。
+    fn lookup(&self, key: &str) -> ScriptCacheLookup<'_> {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if let Some(value) = cache.get(key) {
+                return ScriptCacheLookup::Cached(value);
+            }
+            if cache.compiling.insert(key.to_owned()) {
+                return ScriptCacheLookup::Compile(ScriptCompileReservation {
+                    store: self,
+                    key: key.to_owned(),
+                    active: true,
+                });
+            }
+            cache = self
+                .ready
+                .wait(cache)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn remove(&self, key: &str) {
+        self.cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(key);
+    }
+}
+
+impl ScriptCompileReservation<'_> {
+    fn finish(mut self, value: Option<Vec<u8>>) {
+        self.release(value);
+    }
+
+    fn release(&mut self, value: Option<Vec<u8>>) {
+        if !self.active {
+            return;
+        }
+        let mut cache = self
+            .store
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(value) = value {
+            cache.insert(self.key.clone(), value);
+        }
+        cache.compiling.remove(&self.key);
+        self.active = false;
+        drop(cache);
+        self.store.ready.notify_all();
+    }
+}
+
+impl Drop for ScriptCompileReservation<'_> {
+    fn drop(&mut self) {
+        // 编译失败或 panic 也必须唤醒同源码等待者；
+        // 等待者会成为新的唯一编译者。
+        self.release(None);
+    }
+}
+
+fn script_code_cache() -> &'static ScriptCodeCacheStore {
+    SCRIPT_CODE_CACHE.get_or_init(ScriptCodeCacheStore::new)
+}
 
 macro_rules! caught_message {
     ($scope:ident) => {{
@@ -617,12 +769,62 @@ fn native_vm_run_in_context(
 
     let scope = &mut v8::ContextScope::new(scope, context);
     v8::tc_scope!(let try_catch, scope);
+    // sourceURL 也会影响 V8 的 ScriptOrigin；缓存键必须覆盖
+    // 最终编译文本，不能让不同动态 PE 分片串用 CachedData。
+    let cache_key = source.clone();
     let Some(source) = v8::String::new(try_catch, &source) else {
         throw_js_error(try_catch, "V8 context source allocation failed");
         let _ = try_catch.rethrow();
         return;
     };
-    let Some(script) = v8::Script::compile(try_catch, source, None) else {
+
+    // 缓存只保留编译产物；每轮仍 bind 到新 child context
+    // 并重新 run。同源码 miss 按 key singleflight，不同精确 PE
+    // 可并发编译；预留在 script.run 前完成，不会与嵌套
+    // iframe context 的同源码执行形成重入等待。
+    let script = match script_code_cache().lookup(&cache_key) {
+        ScriptCacheLookup::Cached(cached_bytes) => {
+            let cached_data = v8::CachedData::new(&cached_bytes);
+            let mut compiler_source =
+                v8::script_compiler::Source::new_with_cached_data(source, None, cached_data);
+            let script = v8::script_compiler::compile(
+                try_catch,
+                &mut compiler_source,
+                v8::script_compiler::CompileOptions::ConsumeCodeCache,
+                v8::script_compiler::NoCacheReason::NoReason,
+            );
+            let rejected = compiler_source
+                .get_cached_data()
+                .is_none_or(v8::CachedData::rejected);
+            if rejected || script.is_none() {
+                script_code_cache().remove(&cache_key);
+            }
+            script
+        }
+        ScriptCacheLookup::Compile(reservation) => {
+            let mut compiler_source = v8::script_compiler::Source::new(source, None);
+            let unbound = v8::script_compiler::compile_unbound_script(
+                try_catch,
+                &mut compiler_source,
+                v8::script_compiler::CompileOptions::EagerCompile,
+                v8::script_compiler::NoCacheReason::NoReason,
+            );
+            match unbound {
+                Some(unbound) => {
+                    let cached_data = unbound
+                        .create_code_cache()
+                        .map(|cached_data| cached_data.to_vec());
+                    reservation.finish(cached_data);
+                    Some(unbound.bind_to_current_context(try_catch))
+                }
+                None => {
+                    reservation.finish(None);
+                    None
+                }
+            }
+        }
+    };
+    let Some(script) = script else {
         let _ = try_catch.rethrow();
         return;
     };
@@ -976,6 +1178,39 @@ mod tests {
     #[test]
     fn quotes_json_errors() {
         assert_eq!(json_quote("a\n\"b\\c"), "\"a\\n\\\"b\\\\c\"");
+    }
+
+    #[test]
+    fn code_cache_coalesces_same_source_and_keeps_other_sources_independent() {
+        let store = ScriptCodeCacheStore::new();
+        let first = match store.lookup("same-source") {
+            ScriptCacheLookup::Compile(reservation) => reservation,
+            ScriptCacheLookup::Cached(_) => panic!("new cache unexpectedly hit"),
+        };
+        let other = match store.lookup("other-source") {
+            ScriptCacheLookup::Compile(reservation) => reservation,
+            ScriptCacheLookup::Cached(_) => panic!("different source unexpectedly hit"),
+        };
+        other.finish(Some(vec![4, 5, 6]));
+
+        thread::scope(|scope| {
+            let waiter = scope.spawn(|| match store.lookup("same-source") {
+                ScriptCacheLookup::Cached(value) => value,
+                ScriptCacheLookup::Compile(reservation) => {
+                    reservation.finish(None);
+                    panic!("same source started a second concurrent compile")
+                }
+            });
+            first.finish(Some(vec![1, 2, 3]));
+            assert_eq!(waiter.join().unwrap(), vec![1, 2, 3]);
+        });
+        match store.lookup("other-source") {
+            ScriptCacheLookup::Cached(value) => assert_eq!(value, vec![4, 5, 6]),
+            ScriptCacheLookup::Compile(reservation) => {
+                reservation.finish(None);
+                panic!("completed different source was not cached")
+            }
+        }
     }
 
     #[test]

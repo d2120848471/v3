@@ -67,3 +67,18 @@ func TestGenerateProfileDeterministicWithInjectedEntropy(t *testing.T) {
 		t.Fatalf("profiles differ:\n%+v\n%+v", left, right)
 	}
 }
+
+func TestProfileCloneDoesNotAliasSlices(t *testing.T) {
+	original := Profile{
+		UABrands:       []UABrand{{Brand: "brand", Version: "1"}},
+		UAFullVersions: []UABrand{{Brand: "brand", Version: "1.2.3"}},
+		Languages:      []string{"zh-CN", "zh"},
+	}
+	cloned := original.Clone()
+	cloned.UABrands[0].Brand = "changed"
+	cloned.UAFullVersions[0].Version = "changed"
+	cloned.Languages[0] = "changed"
+	if original.UABrands[0].Brand != "brand" || original.UAFullVersions[0].Version != "1.2.3" || original.Languages[0] != "zh-CN" {
+		t.Fatalf("Clone mutated original profile: %+v", original)
+	}
+}

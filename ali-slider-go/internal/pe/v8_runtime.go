@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"slices"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"github.com/d2120848471/v3/ali-slider-go/internal/device"
 	"github.com/d2120848471/v3/ali-slider-go/internal/protocol"
 	"github.com/d2120848471/v3/ali-slider-go/internal/runtimekit"
+	"github.com/d2120848471/v3/ali-slider-go/internal/track"
 	"github.com/d2120848471/v3/ali-slider-go/internal/v8runtime"
 )
 
@@ -34,6 +36,19 @@ type runtimeProfileBridgeOutput struct {
 	Data        string   `json:"data"`
 	PayloadKeys []string `json:"payloadKeys"`
 	TrackKeys   []string `json:"trackKeys"`
+}
+
+type profileParityClock struct{ now time.Time }
+
+func (clock profileParityClock) Now() time.Time { return clock.now }
+
+func (profileParityClock) Sleep(ctx context.Context, _ time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return nil
+	}
 }
 
 func cachedV8RuntimeBundles() v8RuntimeBundleSet {
@@ -96,6 +111,10 @@ func (resolver *KeyResolver) Close() error {
 	if resolver.v8Closed {
 		return nil
 	}
+	for _, engine := range resolver.v8PEIdle {
+		_ = engine.Close()
+	}
+	resolver.v8PEIdle = nil
 	if resolver.v8Library == nil {
 		resolver.v8Closed = true
 		return nil
@@ -106,6 +125,49 @@ func (resolver *KeyResolver) Close() error {
 	resolver.v8Library = nil
 	resolver.v8Closed = true
 	return nil
+}
+
+func (resolver *KeyResolver) acquireV8PEEngine(ctx context.Context) (*v8runtime.Runtime, error) {
+	resolver.v8Mu.Lock()
+	if resolver.v8Closed {
+		resolver.v8Mu.Unlock()
+		return nil, fmt.Errorf("%w: V8 library is closed", ErrKeyRuntime)
+	}
+	if last := len(resolver.v8PEIdle) - 1; last >= 0 {
+		engine := resolver.v8PEIdle[last]
+		resolver.v8PEIdle[last] = nil
+		resolver.v8PEIdle = resolver.v8PEIdle[:last]
+		resolver.v8Mu.Unlock()
+		return engine, nil
+	}
+	resolver.v8Mu.Unlock()
+
+	engine, err := resolver.newV8Engine(nil, runtimekit.NewSystemSources().Entropy, false)
+	if err != nil {
+		return nil, err
+	}
+	if err := loadV8RuntimeScripts(ctx, engine, true); err != nil {
+		_ = engine.Close()
+		return nil, err
+	}
+	return engine, nil
+}
+
+func (resolver *KeyResolver) releaseV8PEEngine(engine *v8runtime.Runtime, reusable bool) {
+	if engine == nil {
+		return
+	}
+	if reusable {
+		resolver.v8Mu.Lock()
+		if !resolver.v8Closed && len(resolver.v8PEIdle) < resolver.v8PELimit {
+			resolver.v8PEIdle = append(resolver.v8PEIdle, engine)
+			engine = nil
+		}
+		resolver.v8Mu.Unlock()
+	}
+	if engine != nil {
+		_ = engine.Close()
+	}
 }
 
 func (resolver *KeyResolver) newV8Engine(
@@ -201,7 +263,77 @@ func (resolver *KeyResolver) collectV8RuntimeProfile(
 	if err := decodeV8Result(result, &output); err != nil {
 		return RuntimeProfile{}, fmt.Errorf("%w: bridge output", ErrKeyRuntime)
 	}
-	return validateRuntimeProfileBridgeOutput(output)
+	resolved, err := validateRuntimeProfileBridgeOutput(output)
+	if err != nil {
+		return RuntimeProfile{}, err
+	}
+	resolved.PureGoCompatible = runtimeProfileMatchesPureGo(ctx, output, input, profile, resolved)
+	return resolved, nil
+}
+
+func runtimeProfileMatchesPureGo(
+	ctx context.Context,
+	output runtimeProfileBridgeOutput,
+	input bridgeInput,
+	profile device.Profile,
+	resolved RuntimeProfile,
+) bool {
+	decoded, err := protocol.UnpackData(output.Data)
+	if err != nil {
+		return false
+	}
+	trackStart, err := decimalInteger(decoded.Payload.TrackStartTime)
+	if err != nil || trackStart < 1 {
+		return false
+	}
+	verifyTime, err := decimalInteger(decoded.Payload.VerifyTime)
+	if err != nil || verifyTime < trackStart {
+		return false
+	}
+	trackValue := make([]track.Event, len(input.Track))
+	var durationMS int64
+	for index, event := range input.Track {
+		trackValue[index] = track.Event{
+			Type: event.Type, X: event.X, Y: event.Y, DT: event.DT,
+			Force: event.Force, RadiusX: event.RadiusX, RadiusY: event.RadiusY,
+		}
+		durationMS += int64(event.DT)
+	}
+	// 让 Builder 精确复用 V8 oracle 已产生的逻辑起点，避免
+	// 自校验本身的执行耗时造成墙钟假差异。
+	parityNowMS := trackStart + int64(input.FirstTouchAgeMS) + durationMS + freshnessMarginMS + 1_000
+	expectedX := input.ExpectedXPos
+	goResult, err := (Builder{
+		Profile: profile,
+		Sources: runtimekit.Sources{
+			Clock:   profileParityClock{now: time.UnixMilli(parityNowMS)},
+			Entropy: runtimekit.NewSystemSources().Entropy,
+		},
+	}).Build(ctx, Input{
+		SceneID: input.SceneID, CertifyID: input.CertifyID,
+		Dimensions: Dimensions{
+			RenderedWidth: input.Dimensions["renderedWidth"],
+			HandleWidth:   input.Dimensions["handleWidth"],
+		},
+		Track: trackValue, ArgumentKey: resolved.ArgumentKey,
+		IncludeScreenInfo: resolved.IncludeScreenInfo, ExpectedXPos: &expectedX,
+		InitBeginTimeMS: trackStart, FirstTouchAgeMS: input.FirstTouchAgeMS,
+	})
+	if err != nil {
+		return false
+	}
+	goDecoded, err := protocol.UnpackData(goResult.Data)
+	if err != nil || goDecoded.JSONText != decoded.JSONText {
+		return false
+	}
+	nativeEvents, err := parseNativeEvents(decoded.Payload.TrackList.MM)
+	if err != nil || len(nativeEvents) < len(goResult.InteractionEvents) ||
+		!slices.Equal(nativeEvents[:len(goResult.InteractionEvents)], goResult.InteractionEvents) {
+		return false
+	}
+	getterAtMS := float64(verifyTime - trackStart)
+	postInteractionDelayMS := getterAtMS - nativeEvents[len(goResult.InteractionEvents)-1].TimeStamp
+	return math.Abs(postInteractionDelayMS-goResult.PostInteractionDelayMS) < 0.001
 }
 
 func (resolver *KeyResolver) runV8PE(
@@ -251,14 +383,12 @@ func (resolver *KeyResolver) runV8PEBridge(
 	if err != nil {
 		return nil, fmt.Errorf("%w: encode device profile", ErrKeyRuntime)
 	}
-	engine, err := resolver.newV8Engine(nil, runtimekit.NewSystemSources().Entropy, false)
+	engine, err := resolver.acquireV8PEEngine(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer engine.Close()
-	if err := loadV8RuntimeScripts(ctx, engine, true); err != nil {
-		return nil, err
-	}
+	reusable := true
+	defer func() { resolver.releaseV8PEEngine(engine, reusable) }()
 	payload, err := json.Marshal(struct {
 		SDKSource     string          `json:"sdkSource"`
 		PESource      string          `json:"peSource"`
@@ -279,6 +409,7 @@ func (resolver *KeyResolver) runV8PEBridge(
 	}
 	result, err := engine.Call(ctx, "__aliV8PERun", payload)
 	if err != nil {
+		reusable = false
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -393,7 +524,8 @@ func (resolver *KeyResolver) openV8Device(
 		return nil, fmt.Errorf("%w: V8 Device init output", ErrKeyRuntime)
 	}
 	session := &DeviceRuntimeSession{
-		v8Engine: engine, options: options, sdkSource: bytes.Clone(sdkSource),
+		v8Engine: engine, v8Open: bytes.Clone(payload), profile: profile.Clone(), deviceSlots: resolver.deviceSlots,
+		options: options, sdkSource: bytes.Clone(sdkSource),
 	}
 	if err := session.acceptInitialStage(stage); err != nil {
 		return nil, err
@@ -408,14 +540,6 @@ func (session *DeviceRuntimeSession) completeV8Device(
 	payload []byte,
 	eventCount int,
 ) (device.Result, error) {
-	defer func() {
-		_ = engine.Close()
-		session.mu.Lock()
-		if session.v8Engine == engine {
-			session.v8Engine = nil
-		}
-		session.mu.Unlock()
-	}()
 	result, err := engine.Call(ctx, "__aliV8DeviceComplete", payload)
 	if err != nil {
 		if ctx.Err() != nil {

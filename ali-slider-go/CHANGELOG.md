@@ -2,7 +2,7 @@
 
 本文件记录 `ali-slider-go` 的用户可见变化。格式参考 Keep a Changelog，版本遵循语义化版本。
 
-> **发布状态**：`1.0.0` 仍为 Unreleased。2026-08-08 同机 A/B 证明历史 `d92c7d1` 保留了动态设备/PE 语义，而早期纯 Go 近似路径持续 `F001`。当前候选已改为 Go 进程内 V8 `149.4.0`，恢复同挑战持久 FeiLin 状态和当前动态 PE 原生执行，生产不启动 Node。Linux AMD64/ARM64 native/ABI 与 Linux AMD64 公开 Device/PE 组件探针已通过；Windows DLL 已交叉构建，待发布 commit CI 原生复验。完整 Solve 成功率/P95、HTTP 端到端、生产资源峰值和长时间稳定性压测仍未重测。
+> **发布状态**：`1.0.0` 仍为 Unreleased。候选使用 Go 进程内 V8 `149.4.0` 维持同挑战 FeiLin 状态，并以“精确 PE `StaticPath` 的当前 V8 oracle → 完整差分 → 纯 Go 快路或 V8 fallback”取代每挑战的无条件 V8 PE 执行，生产不启动 Node。最终安全候选真实50次为 `47/50`、mean `2562ms`、P50 `2157ms`、P95 `4910ms`；3次均为业务 `F015`，分类错误为0。正确性不低于 `46/50` 基线，但并发10下mean约1秒的目标仍未通过。HTTP端到端、生产资源峰值和长时间稳定性仍待验证。
 
 ## [1.0.0] - Unreleased
 
@@ -19,11 +19,11 @@
 - 增加 JS/RPC 编码、RPC v1 签名、AES-CBC、DeviceToken、data codec、Verify 参数和自校验。
 - 增加设备画像、浏览器头、指纹、Log1/2/3、首枚/刷新 token、getter/event 和单会话完成态。
 - 保留纯 Go PE builder 作为历史 oracle/离线兼容实现：轨迹字段、坐标、逻辑时钟、getter plan、交互事件及 Pack/Unpack 自检。
-- 增加动态 PE `KeyResolver`：公开 SDK 与精确 PE 源码/结构画像缓存 5 分钟；每轮用本轮挑战输入运行当前 PE 原生生成 `data`，再由 Go 独立解包并校验 schema、坐标、getter、事件和时钟合同。
+- 增加动态 PE `KeyResolver`：公开 SDK 与精确 PE 源码/profile 分层缓存；每个精确分片由当前 V8 采样并与纯 Go 完整差分，兼容后纯算本轮 `data`，不兼容则使用 V8 fallback；两者都校验 schema、坐标、getter、事件和时钟合同。
 - 增加持久 V8 设备会话：同一个公开 SDK/FeiLin Isolate 从 Log1/2/3 保留至 PE getter，回放本轮原生交互事件后生成同 session 的 Verify DeviceToken。
 - 增加 Captcha Init/Verify RPC client；每个 client 最多尝试一次 Verify，网络结果未知也不重发。
 - 增加 HTTP(S)、SOCKS4、SOCKS5、SOCKS5H 和按 proxy route 隔离的有界连接池。
-- 增加有界设备预热池：完整 key 隔离、20 秒默认年龄、并行 Prime、Lease、冷建、过期和异步补货。
+- 增加有界设备预热池：route/prefix/timing key隔离、每slot独立画像、20秒默认年龄、默认直连池最多保留4个VM、并行Prime、满池等待、Lease、过期和异步补货。
 - 增加固定 HTTPS CDN 的双图并发内存下载、逐跳重定向白名单和响应大小限制。
 - 增加纯 Go PNG 安全解码、缺口定位、困难 contour/chamfer fallback、置信度和几何换算。
 - 增加 embedded 轨迹 fixture、目标距离缩放、抽稀和有界扰动。
@@ -37,12 +37,18 @@
 - CI 增加 Windows 2025 原生 test/vet、PE 构建、最终 ZIP 解压 smoke 与单层 artifact 上传；官方 actions 使用完整 commit SHA 固定。
 - 增加 `docs/evidence/validation-2026-08-07.md`，固化命令、聚合数字、构建哈希与在线快照时序边界。
 - 增加 `docs/evidence/validation-2026-08-08-no-local-admission.md`，固化删除本地准入闸门后的离线合同、质量门禁、源码选择集摘要与临时 Linux 二进制哈希。
+- 增加 `docs/evidence/validation-2026-08-09-performance.md`，固化动态 PE 自校验、真实 50 次 A/B、Evidence → Finding → Path 与未达 1 秒的明确边界。
 - 增加 multi-stage `Dockerfile`：Go `1.26.5` launcher 构建、Rust `1.88.0` V8 构建/native 测试、Go→V8 ABI 测试、Debian bookworm-slim 非 root UID/GID `65532` 运行层。
 - 增加架构、API、配置、安全、测试、性能、迁移和排障文档。
 
 ### Changed
 
-- 生产设备/动态 PE 从 Node 子进程迁到同进程 V8：Device 从 Open 到 Complete 保持同一 Isolate，PE 每轮使用单独禁网 Isolate；Node 仅保留为可选测试 oracle。
+- 生产设备/动态 PE 从 Node 子进程迁到同进程 V8：Device 从 Open 到 Complete 保持同一 Isolate；PE 的首次画像与不兼容 fallback 使用单独禁网 context，已完整差分的分片使用纯 Go Builder；Node 仅保留为可选测试 oracle。
+- Device Complete 后可回收外层 V8 Isolate，下一轮仍重建独立浏览器 context、session ID、DeviceToken 和 FeiLin 状态；回收失败时关闭并冷补货。
+- PE 构建改为逐精确 `StaticPath` 的动态门禁：首次/到期时使用当前 V8 采样并与纯 Go 逐字段差分，仅完整一致才启用纯 Go 快路，其余保留 V8 fallback。
+- SDK 缓存改为 5 分钟字节复核；SDK 未变时延长精确分片软 TTL，但每个 PE/profile 最多 30 分钟强制重下与重做 V8 差分。
+- SDK 与同分片源码/profile miss 分别单飞，不同分片可并发；PE Prepare 与双图下载重叠。
+- 新增 `DeviceSessionReserve` / `--device-reserve` / `ALI_SLIDER_DEVICE_RESERVE` 的0..4有界A/B开关；`prewarm + reserve`硬限制不超过4，因reserve真实测试增加争用，默认为0。
 - 运行时配置改为 `--v8-library` / `ALI_SLIDER_V8_LIBRARY` / `V8RuntimeLibrary`；默认加载可执行文件同目录的平台 wrapper。
 - Docker 运行层改为 Debian bookworm-slim，包含 Go launcher 和同架构 V8 `.so`；Windows 包改为 EXE + 静态 CRT V8 DLL，两者均不含 Node。
 - 运行时从 Python/OpenCV/浏览器 worker 模型切换为 Go 主进程 + 进程内 V8 Isolate；公开脚本与结构画像按 5 分钟复用，挑战级状态逐轮生成。旧 Python 源码已从当前工作树删除，需要审计或回滚时从 Git 历史提交恢复。
@@ -53,7 +59,7 @@
 - 默认监听收紧为 `127.0.0.1:8000`；应用内仍不提供鉴权。
 - prefix 收紧为 1–32 个 ASCII 字母数字；proxy 必须使用支持的 scheme 且不含 path/query/fragment。
 - 普通日志只记录事件、traceId、HTTP 状态和耗时，不记录 token、`CertifyId`、代理凭据或正文。
-- 默认设备预热容量随 Client 连接/预热资源上限收敛；逐请求 proxy 因 route key 不同按设计冷建。
+- 默认设备预热容量改为4，并随更小的 `MaxConcurrency` 收敛；逐请求proxy因route key不同按设计冷建。
 - artifact 默认保留 7 天；服务启动时清理一次，此后每小时清理。
 - Windows Artifact 权限改为继承解压目录 NTFS ACL；Unix 继续强制 `0700/0600`。
 
@@ -64,7 +70,7 @@
 - 修复部署缺少/错架构 wrapper 时服务仍报告 ready：现在启动即失败，不再等到全部 Solve 返回 `InternalError`。
 - 修复把动态 PE 简化成静态 key + Go 近似构造导致新 `.058` 分片持续返回 `F001`：删除随机兜底，按每轮 `StaticPath`、`CertifyId`、DeviceConfig、轨迹和时钟执行当前 PE；同时兼容当前 10 字段与历史 11 字段 TrackList。
 - 修复纯 Go Device 指纹没有保持旧版 Init→Verify 的同一 FeiLin VM：设备 Node 会话跨阶段持久化，Init 固定验证 111 个字段，Verify 接受真实事件回放后动态扩展的安全字段数（实测 142），但仍独立验证 token、session、时钟和 action 序列。
-- 修复缓存边界：只缓存公开 SDK/PE 源码和结构画像 5 分钟；DeviceToken、`CertifyId`、轨迹、`data` 不进入分钟级缓存，预热设备会话仍是最多 20 秒的一次性资源。
+- 修复缓存边界：SDK 每 5 分钟做字节复核，精确 PE/profile 最多 30 分钟强制重采样；DeviceToken、`CertifyId`、轨迹、`data` 不进入分钟级缓存。预热会话的挑战状态最多空闲 20 秒且一次性消费，仅外层 Isolate 可回收。
 - 修复 HTTP(S) 与 SOCKS 代理下设备流量未统一路由：V8 JS 只能调用受限 Go HTTP host，全部请求复用本轮 Go transport，代理凭据不注入 JS。
 - 修复 Docker `scratch` 和旧 Windows 单 EXE 没有逐挑战运行时：容器切到 Debian/glibc 并携带 `.so`，Windows ZIP 携带静态 CRT DLL 与第三方 notices。
 - 修复 Linux ARM64 包曾混入 AMD64 Go launcher，以及 Alpine 构建层生成的 musl 解释器与 Debian 运行层不兼容：BuildKit 现使用真实 `TARGETARCH`，Go 构建层统一为 bookworm/glibc，CI 强制 launcher 与 `.so` 同架构。
@@ -76,6 +82,12 @@
 - 修复零值 `ClientOptions{}` 漏补默认设备预热容量；显式关闭预热仍通过 `DefaultClientOptions()` 后覆盖为零。
 - 修复 Windows 无法表达 POSIX `0700` 导致 Artifact 保存/清理失败；保留目录真实性、同文件复核、symlink 拒绝、排他创建和配额保护。
 - 修复 Darwin ARM64 race 插桩下 32 路离线正确性测试误触 5 秒 Solver 时限；只放宽测试时限，不改变生产 timeout 或性能门槛。
+- 修复同分片 profile 高并发下的 SDK 时间戳竞态和晚到 miss 重复采样；时间在获锁后读取，分片下载在进入 singleflight 后二次检查缓存。
+- Device Complete 成功后在 Verify 前提前 release，使新 context 回收与 Verify 网络重叠；`sync.Once` 保证任何返回路径只 release 一次。
+- Rust V8 wrapper 增加精确源码键的进程内 code cache，最多 64 项/64 MiB，不改变 child context 隔离或 ABI。
+- 修复进程级固定画像被全部预热会话共享：现在每个live slot生成独立画像，Solver以租到会话的实际画像统一构造RPC headers、图片请求和PE输入。
+- 修复大预热使Device VM同时Open/Complete后出现137/138字段或request sequence错误：默认直连公开组件A/B确认预热池库存边界为4，配置、Client、池和V8动作gate统一执行该边界。
+- 修复满池matching Lease绕过池额外冷建及release广播早于refill登记的竞态；现在等待已有slot recycle，并在广播前占住pending。
 
 ### Security
 
@@ -111,11 +123,14 @@
 - 困难视觉 benchmark 均值为 `53.10ms/op`；独立纯计算 200 样本 nearest-rank `P50=50.577458ms`、`P95=55.711708ms`、`P99=57.05075ms`、`max=60.337542ms`，满足 `P99<=100ms` 硬门槛。
 - 唯一授权候选批次恰好执行 200 个新挑战、并发 32、每个 job 一次 Solve、应用层零重试：严格成功 `196`、业务失败 `3`、`VisionError=1`、网络错误 `0`，成功率 `98%`。该批先于传输 one-shot 加固，最终源码受授权上限约束未再在线重跑。
 - 候选批次直接调用 `Client.Solve`；Client 完整求解链墙钟 `P50=816ms`、`P95=984ms`、`P99=1018ms`、`max=1555ms`，成功样本墙钟 `P95=989ms`，总批次约 `6.16s`；`>=190/200` 与 Client 完整链 `P95<=1000ms` 均通过。
-- 2026-08-08 旧运行时快照曾用 1 个新挑战、一次 Solve、并发 1、零重试得到 `1/1 T001`，墙钟约 `1579ms`；它只作历史对照。当前 V8 候选仅完成不含 Captcha Init/Verify 的生产组件探针。
+- 2026-08-08 旧运行时快照曾用 1 个新挑战、一次 Solve、并发 1、零重试得到 `1/1 T001`，墙钟约 `1579ms`；它只作历史对照。
+- 2026-08-09 当前路径强制 V8/纯 Go 差分为 0；V8 约 `530ms`，纯 Go 约 `0.364ms`。
+- 快路后中间候选真实50次为 `49/50`、mean `2007ms`，`buildVerifyData` mean `2ms`；随后 `48/50`、mean `1890ms` 的中间批次发生在live Device边界确认之前，不是最终安全默认路径。
+- 最终安全候选真实50次为 `47/50`、mean `2562ms`、P50 `2157ms`、P95 `4910ms`；32/32精确分片通过完整V8/纯Go差分，后25次mean `2232ms`。默认直连公开Device组件以4个池槽服务10个job全部通过；5个对齐存活会话已复现字段合同失败。
 
 ### Known limitations
 
-- 1 秒仅为 Client 完整求解链 P95 目标；本批 `P99=1018ms`、`max=1555ms`，没有 P99 或全部调用小于 1 秒的承诺。
+- 本次1秒是并发10、50次Client完整求解链算术平均目标；最终安全候选mean `2562ms`，明确未通过。后25次mean `2232ms`不能冒充全批结果，也不能提高默认直连池4槽边界换速度。
 - 候选批次未经过 HTTP Handler，HTTP 端到端真实 P95 尚未单独测量。
 - 候选批次没有保留精确起止时间或阶段聚合，不能事后补造；后续发布批次必须在发送首个挑战前启用完整审计采集。
 - 已有离线 Mock 的短时 maxRSS 记录，但生产形态 32 路 RSS、GC、goroutine 峰值和长时间稳定性压测尚未执行。

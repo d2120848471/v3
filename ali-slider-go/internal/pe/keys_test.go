@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -73,7 +74,8 @@ func (transport *scriptTransport) callCount(host string) int {
 func TestKeyResolverCachesExactPathsAndRefreshesSDKOnMiss(t *testing.T) {
 	transport := newScriptTransport()
 	resolver := NewKeyResolver("node")
-	now := time.Date(2026, time.August, 8, 12, 0, 0, 0, time.UTC)
+	baseTime := time.Date(2026, time.August, 8, 12, 0, 0, 0, time.UTC)
+	now := baseTime
 	resolver.now = func() time.Time { return now }
 	var collections atomic.Int32
 	resolver.collect = func(_ context.Context, _ string, _ device.Profile, sdkSource, peSource []byte, _ time.Time) (RuntimeProfile, error) {
@@ -104,8 +106,8 @@ func TestKeyResolverCachesExactPathsAndRefreshesSDKOnMiss(t *testing.T) {
 		t.Fatalf("collections=%d, want 2", got)
 	}
 
-	// 非版本化 SDK 可能在同一 PE 路径存活期间改变 Track schema，因此 key+schema
-	// 只缓存五分钟；到期后同时重取 SDK/PE 并重新采样。
+	// 软 TTL 到期后重取非版本化 SDK。字节未变则延长精确
+	// 内容路径的已验证画像，不重下 PE、不重跑 V8。
 	now = now.Add(keyProfileCacheTTL + time.Second)
 	if _, err := resolver.Resolve(context.Background(), transport, device.Profile{}, testDynamicPath); err != nil {
 		t.Fatal(err)
@@ -113,11 +115,27 @@ func TestKeyResolverCachesExactPathsAndRefreshesSDKOnMiss(t *testing.T) {
 	if got := transport.callCount("o.alicdn.com"); got != 2 {
 		t.Fatalf("refreshed SDK downloads=%d, want 2", got)
 	}
+	if got := transport.callCount(keyPEHost); got != 2 {
+		t.Fatalf("PE downloads=%d, want 2", got)
+	}
+	if got := collections.Load(); got != 2 {
+		t.Fatalf("collections=%d, want 2", got)
+	}
+
+	// 硬 TTL 到期后，即使 SDK 字节不变也必须重下该 PE
+	// 并重做完整动态差分。
+	now = baseTime.Add(keyProfileHardTTL + time.Second)
+	if _, err := resolver.Resolve(context.Background(), transport, device.Profile{}, testDynamicPath); err != nil {
+		t.Fatal(err)
+	}
+	if got := transport.callCount("o.alicdn.com"); got != 3 {
+		t.Fatalf("hard refresh SDK downloads=%d, want 3", got)
+	}
 	if got := transport.callCount(keyPEHost); got != 3 {
-		t.Fatalf("PE downloads=%d, want 3", got)
+		t.Fatalf("hard refresh PE downloads=%d, want 3", got)
 	}
 	if got := collections.Load(); got != 3 {
-		t.Fatalf("collections=%d, want 3", got)
+		t.Fatalf("hard refresh collections=%d, want 3", got)
 	}
 }
 
@@ -162,6 +180,151 @@ func TestKeyResolverSerializesConcurrentMiss(t *testing.T) {
 	}
 	if got := transport.callCount(keyPEHost); got != 1 {
 		t.Fatalf("PE downloads=%d, want 1", got)
+	}
+}
+
+func TestKeyResolverPrepareCachesSourcesAndSamplesProfileOnce(t *testing.T) {
+	transport := newScriptTransport()
+	resolver := NewKeyResolver("node")
+	var collections atomic.Int32
+	resolver.collect = func(context.Context, string, device.Profile, []byte, []byte, time.Time) (RuntimeProfile, error) {
+		collections.Add(1)
+		return RuntimeProfile{ArgumentKey: testArgumentKey}, nil
+	}
+
+	for range 2 {
+		if err := resolver.Prepare(context.Background(), transport, device.Profile{}, testDynamicPath); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := collections.Load(); got != 1 {
+		t.Fatalf("profile collections=%d, want 1", got)
+	}
+	if got := transport.callCount("o.alicdn.com"); got != 1 {
+		t.Fatalf("SDK downloads=%d, want 1", got)
+	}
+	if got := transport.callCount(keyPEHost); got != 1 {
+		t.Fatalf("PE downloads=%d, want 1", got)
+	}
+
+	profile, err := resolver.Resolve(context.Background(), transport, device.Profile{}, testDynamicPath)
+	if err != nil || profile.ArgumentKey != testArgumentKey {
+		t.Fatalf("Resolve after Prepare: profile=%+v err=%v", profile, err)
+	}
+	if got := collections.Load(); got != 1 {
+		t.Fatalf("cached profile collections=%d, want 1", got)
+	}
+	if transport.callCount("o.alicdn.com") != 1 || transport.callCount(keyPEHost) != 1 {
+		t.Fatal("explicit Resolve downloaded already prepared scripts")
+	}
+}
+
+func TestKeyResolverPrepareCachesProfileFailureForV8Fallback(t *testing.T) {
+	transport := newScriptTransport()
+	resolver := NewKeyResolver("node")
+	var collections atomic.Int32
+	resolver.collect = func(context.Context, string, device.Profile, []byte, []byte, time.Time) (RuntimeProfile, error) {
+		collections.Add(1)
+		return RuntimeProfile{}, fmt.Errorf("%w: parity mismatch", ErrUnsupportedPE)
+	}
+	for range 2 {
+		if err := resolver.Prepare(context.Background(), transport, device.Profile{}, testDynamicPath); err != nil {
+			t.Fatalf("Prepare() should preserve V8 fallback: %v", err)
+		}
+	}
+	if got := collections.Load(); got != 1 {
+		t.Fatalf("failed profile collections=%d, want 1", got)
+	}
+	path, _ := normalizeStaticPath(testDynamicPath)
+	profile, profileErr, sampled := resolver.cachedProfileState(path, resolver.now())
+	if !sampled || !errors.Is(profileErr, ErrUnsupportedPE) || profile.PureGoCompatible {
+		t.Fatalf("fallback profile state: sampled=%t profile=%+v err=%v", sampled, profile, profileErr)
+	}
+}
+
+type blockingPETransport struct {
+	base    *scriptTransport
+	started chan string
+	release chan struct{}
+}
+
+func (transport *blockingPETransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.URL.Hostname() == keyPEHost {
+		transport.started <- request.URL.Path
+		select {
+		case <-transport.release:
+		case <-request.Context().Done():
+			return nil, request.Context().Err()
+		}
+	}
+	return transport.base.RoundTrip(request)
+}
+
+func TestKeyResolverPrepareAllowsDifferentPathsInParallel(t *testing.T) {
+	base := newScriptTransport()
+	transport := &blockingPETransport{
+		base: base, started: make(chan string, 2), release: make(chan struct{}),
+	}
+	resolver := NewKeyResolver("node")
+	paths := []string{testDynamicPath, "3.29.0/pe.059.aaaaaaaaaaaaaaaa"}
+	errorsByPath := make(chan error, len(paths))
+	for _, path := range paths {
+		go func() {
+			errorsByPath <- resolver.Prepare(context.Background(), transport, device.Profile{}, path)
+		}()
+	}
+	for range paths {
+		select {
+		case <-transport.started:
+		case <-time.After(time.Second):
+			close(transport.release)
+			t.Fatal("different PE paths were serialized")
+		}
+	}
+	close(transport.release)
+	for range paths {
+		if err := <-errorsByPath; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := base.callCount("o.alicdn.com"); got != 1 {
+		t.Fatalf("SDK downloads=%d, want 1", got)
+	}
+	if got := base.callCount(keyPEHost); got != len(paths) {
+		t.Fatalf("PE downloads=%d, want %d", got, len(paths))
+	}
+}
+
+func TestKeyResolverSamplesDifferentProfilesInParallel(t *testing.T) {
+	transport := newScriptTransport()
+	resolver := NewKeyResolver("node")
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	resolver.collect = func(context.Context, string, device.Profile, []byte, []byte, time.Time) (RuntimeProfile, error) {
+		started <- struct{}{}
+		<-release
+		return RuntimeProfile{ArgumentKey: testArgumentKey}, nil
+	}
+	paths := []string{testDynamicPath, "3.29.0/pe.059.aaaaaaaaaaaaaaaa"}
+	errorsByPath := make(chan error, len(paths))
+	for _, path := range paths {
+		go func() {
+			errorsByPath <- resolver.Prepare(context.Background(), transport, device.Profile{}, path)
+		}()
+	}
+	for range paths {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			close(release)
+			t.Fatal("different profile paths were serialized")
+		}
+	}
+	close(release)
+	for range paths {
+		if err := <-errorsByPath; err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

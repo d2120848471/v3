@@ -1,6 +1,6 @@
 # Ali Slider Go
 
-`ali-slider-go` 是原 Python 实现的 Go 重写：Go 主进程负责编排、RPC、图片下载、缺口识别、轨迹和唯一一次 Verify；设备 SDK 和动态 PE 在同进程的 V8 `149.4.0` Isolate 中执行，不启动 Node 子进程。设备侧从 Init 到 Complete 保持同一个 FeiLin/V8 Isolate，PE 侧按本轮 `StaticPath`、`CertifyId`、轨迹、时钟和 DeviceConfig 原生生成 `data`。公开 SDK/PE 源码及结构画像缓存 5 分钟，挑战级 token、`CertifyId`、轨迹和 `data` 不跨轮复用。旧 Python 实现已从当前工作树删除；审计或回滚时可从 Git 历史提交 `0509bfd` 恢复。
+`ali-slider-go` 是原 Python 实现的 Go 重写：Go 主进程负责编排、RPC、图片下载、缺口识别、轨迹和唯一一次 Verify；动态 Device SDK 和 PE oracle 在同进程 V8 `149.4.0` 中执行，不启动 Node 子进程。设备侧从 Init 到 Complete 保持同一个 FeiLin/V8 会话；PE 侧按精确 `StaticPath` 用当前 V8 采样，与纯 Go Builder 的 payload、事件和时钟做完整差分，仅差分为零时在 TTL 内纯算本轮 `data`，其余保留 V8 fallback。SDK 每 5 分钟字节复核，PE 最多 30 分钟强制重采样；token、`CertifyId`、轨迹和 `data` 不跨轮复用。旧 Python 实现已从当前工作树删除；审计或回滚时可从 Git 历史提交 `0509bfd` 恢复。
 
 > 仅限自有系统或获得明确授权的测试环境。服务没有应用内鉴权，默认只监听 `127.0.0.1:8000`；不要把未加保护的端口暴露到公网。
 
@@ -11,11 +11,11 @@
 - 每个 `CertifyId` 最多尝试一次 Verify；网络结果未知也不重试。
 - 通过浏览器跨源与输入校验的 GET/POST Solve 请求直接进入 Solver；HTTP 层不设置本地 admission gate，也不因在途请求数主动返回 `429` 或 `Retry-After`。
 - HTTP(S)、SOCKS4、SOCKS5、SOCKS5H 代理；同一轮 V8 设备会话、Init、公开脚本、图片与 Verify 固定同一路由。
-- 双图并发下载、纯 Go 视觉、动态 PE 原生执行、PE/DeviceToken 合同自检、可选设备会话预热和共享连接池。
+- 双图并发下载、纯 Go 视觉、精确 PE 动态自校验 + 纯算快路/V8 fallback、PE/DeviceToken 合同自检、可选设备会话预热和共享连接池。
 - 失败/低置信图片与脱敏指标私有落盘；服务启动时及每小时清理，library 调用方负责定期调用 `PurgeArtifacts`，默认保留 7 天；成功路径不落图。
 - 普通文本日志只记录事件、trace、状态和耗时，不记录 token、`CertifyId`、代理凭据或原始正文。
 
-当前 V8 迁移验证：Linux AMD64/ARM64 均已通过 Rust wrapper 单测和 Go→V8 实际 ABI 测试；Windows AMD64 DLL 已交叉构建，导出符号与系统 DLL 依赖已检查，原生执行由 Windows CI 门禁负责。生产 `KeyResolver` 的公开 Device/PE 组件探针在 Linux AMD64 最终包中以 `2.78s` 通过：`dataLength=1164`、142 个指纹字段、4 个请求。该探针不创建 Captcha Init/Verify，因此不是完整成功率证据。Mac ARM64 纯 Go/视觉 200 样本 `P99=57.05075ms` 及 2026-08-07 在线批次都属于旧近似 PE 路径，只保留为历史基线；当前内嵌 V8 生产链的正式成功率和性能仍需单独授权测量。
+当前运行时验证：Linux AMD64/ARM64 均已通过 Rust wrapper 单测和 Go→V8 实际 ABI 测试；Windows AMD64 DLL 已交叉构建，原生执行由 Windows CI 门禁负责。Linux AMD64 当前公开分片的强制 V8/纯 Go解包、事件和时钟差分为0；最终安全候选真实50次为 `47/50`、mean `2562ms`、P50 `2157ms`、P95 `4910ms`，3次非成功结果均为业务 `F015`，分类错误为0。P50显著快于优化前 `4722ms` 基线，但并发10下平均仍未达到约1秒。
 
 2026-08-07 唯一授权候选批次已按冻结上限一次性完成：harness 直接调用 `pkg/slider.Client.Solve`，恰好处理 200 个新挑战、并发 32、每个 job 一次 Solve、应用层零重试；严格成功 `196`、业务失败 `3`、`VisionError=1`、网络错误 `0`，成功率 `98%`。Client 完整求解链墙钟 `P50=816ms`、`P95=984ms`、`P99=1018ms`、`max=1555ms`，成功样本墙钟 `P95=989ms`，整批约 `6.16s`。该候选批次达到 `>=190/200` 和 Client 完整链 `P95<=1000ms`；1 秒是 P95 目标，不是 P99 或最大耗时保证。该批不经过 HTTP Handler，不能作为 HTTP 端到端 P95 证据。
 
@@ -134,15 +134,16 @@ go run ./cmd/server \
   --port=8000 \
   --max-concurrency=32 \
   --timeout=25s \
-  --device-prewarm=32 \
+  --device-prewarm=4 \
+  --device-reserve=0 \
   --v8-library=/opt/ali-slider/libali_slider_v8_runtime.so
 ```
 
-`--max-concurrency` 是兼容旧配置名，只限定 Client 每个 route/host 的出站连接数，并作为设备会话预热资源预算；它不限制 HTTP 在途请求数，也不会触发本地 `429`。`--device-prewarm` 必须位于 `0..max-concurrency`。
+`--max-concurrency` 是兼容旧配置名，只限定 Client 每个 route/host 的出站连接数和 PE 资源预算；它不限制 HTTP 在途请求数，也不会触发本地 `429`。`--device-prewarm` 必须位于 `0..min(max-concurrency,4)`。`--device-reserve` 为 `0..4`，要求prewarm非0且两者之和不得超过4；真实A/B显示reserve会加重争用，因此默认0。
 
-预热会提前建立含 FeiLin 状态的 V8 设备 Isolate 和 Log1/2/3 会话，但启动时会产生对应外部请求，并固定进程画像。预热会话默认最多空闲 20 秒且一次性消费，不会把 DeviceToken 缓存几分钟；设置 `--device-prewarm=0` 可完全关闭。所有参数、环境变量与边界见 [docs/configuration.md](docs/configuration.md)。
+预热会提前建立含 FeiLin 状态的 V8 设备 Isolate 和 Log1/2/3 会话，因此启动时会产生对应外部请求。每个 live slot 使用独立画像；同一 slot 内画像只读，Complete 后只回收外层 Isolate，下一轮重建独立浏览器 context、session ID 和 token。默认直连池满4槽时，新请求等待已有槽位 recycle，不会额外创建同池 Device VM，也不会把 DeviceToken 缓存几分钟。代理或非默认 prefix 不跨池复用，而是走本轮冷会话。预热会话默认最多空闲20秒；设置 `--device-prewarm=0` 可完全关闭。所有参数、环境变量与边界见 [docs/configuration.md](docs/configuration.md)。
 
-`--v8-library` 指向当前平台的 wrapper：Linux 为 `libali_slider_v8_runtime.so`，Windows 为 `ali_slider_v8_runtime.dll`。服务通过同一路由访问严格 HTTPS 白名单内的公开 SDK/PE；公开源码及精确 `StaticPath` 结构画像缓存 5 分钟。每轮仍新建或租用短龄设备 Isolate，并用本轮 `CertifyId`、DeviceConfig、轨迹和时钟运行当前 PE，因此不是把设备或 `data` 写死。
+`--v8-library` 指向当前平台的 wrapper：Linux 为 `libali_slider_v8_runtime.so`，Windows 为 `ali_slider_v8_runtime.dll`。服务通过同一路由访问严格 HTTPS 白名单内的公开 SDK/PE；SDK 软 TTL 为 5 分钟，精确 PE/profile 硬 TTL 为 30 分钟。未知或到期分片先用当前 V8 运行假输入，只有与纯 Go 完整差分一致才开启快路。每轮仍使用本轮 `CertifyId`、DeviceConfig、轨迹和时钟，因此不是把设备、key 或 `data` 写死。
 
 ## Docker
 
@@ -215,15 +216,17 @@ ali-slider-go/
 - [Python → Go 迁移](docs/migration.md)
 - [故障排查](docs/troubleshooting.md)
 - [2026-08-08 无本地 admission 历史快照证据](docs/evidence/validation-2026-08-08-no-local-admission.md)
+- [2026-08-09 动态 PE 与完整 Solve 性能证据](docs/evidence/validation-2026-08-09-performance.md)
 - [2026-08-07 脱敏验证证据](docs/evidence/validation-2026-08-07.md)
 - [变更记录](CHANGELOG.md)
 
 ## 验收边界
 
-- 历史纯 Go/视觉计算基线：Mac ARM64、200 样本 nearest-rank `P99=57.05075ms`，当时满足 `P99<=100ms`；该测试不包含当前逐挑战 V8 PE Isolate，不能作为当前生产链性能结论。
+- 历史纯 Go/视觉计算基线：Mac ARM64、200 样本 nearest-rank `P99=57.05075ms`，当时满足 `P99<=100ms`；该测试不包含当前精确分片首次 V8 自校验、Device 或网络，不能作为完整生产链性能结论。
 - 历史热态、直连、无排队 Client 完整链：2026-08-07 旧近似 PE 路径墙钟 `P95=984ms`、`P99=1018ms`、`max=1555ms`；不得改写成当前架构或 HTTP 端到端 P95 已通过。
 - 2026-08-07 历史授权候选批次：恰好 200 个新挑战、并发 32、每个 job 一次 Solve、应用层零重试，严格成功 `196/200`。这些数字属于后来证明缺少动态 Device/PE 边界的实现，只保留作对照。
 - 2026-08-08 针对当前动态 PE 修复快照执行了 1 个新挑战、一次 Solve、零重试，得到 `T001`、`VerifyResult=true` 和非空 token；该单次 smoke 只证明当前 Device/PE 合同恢复，不构成成功率或性能报告。
+- 2026-08-09 最终安全候选真实50次为 `47/50`、mean `2562ms`、P50 `2157ms`、P95 `4910ms`；3次均为业务 `F015`，协议/网络/视觉错误为0；32/32精确分片通过V8/纯Go差分。默认直连组件A/B同时证明5个对齐存活的Device VM已破坏字段合同，因此预热池默认和硬上限为4，不能用扩大同池VM数量换速度。
 - 普通单测、CI、Docker 构建都不得运行挑战批次；公开 CDN/Device 组件探针也必须用独立环境变量显式启用。
 
-2026-08-07 的短批次只证明旧实现当时达到冻结的成功率和 Client 完整链 P95 目标；当前内嵌 V8 Device/PE 架构仍缺正式成功率、P95/P99、RSS、GC、goroutine/线程峰值及长时间稳定性报告。不得从历史约 6.16 秒批次或离线 Mock 外推当前容量，也不得把并发 32 解释为 HTTP admission 上限。
+2026-08-07 的短批次只证明旧实现当时达到冻结的成功率和 Client 完整链 P95 目标。2026-08-09 当前路径已有 50 次 Client 冷态数据，但仍缺 HTTP 端到端、RSS、GC、goroutine/线程峰值及长时间稳定性报告。不得从历史批次、后半稳定窗口或离线 Mock 外推当前容量，也不得把并发 32 解释为 HTTP admission 上限。

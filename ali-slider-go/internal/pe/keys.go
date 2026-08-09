@@ -28,6 +28,7 @@ const (
 	keySDKURL          = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js"
 	keyPEHost          = "g.alicdn.com"
 	keyProfileCacheTTL = 5 * time.Minute
+	keyProfileHardTTL  = 30 * time.Minute
 	keySDKCacheTTL     = keyProfileCacheTTL
 	keyScriptMaxBytes  = int64(2 << 20)
 	keyBridgeMaxBytes  = 64 << 10
@@ -35,6 +36,8 @@ const (
 	keyBridgeOrigin    = "http://localhost:38185"
 	keyBridgeReferer   = keyBridgeOrigin + "/"
 	dummyCertifyID     = "0123456789abcdef"
+	maxV8PEIdle        = 32
+	maxV8DeviceActive  = 4
 )
 
 var (
@@ -60,15 +63,29 @@ var peKeyBridgeSource []byte
 type RuntimeProfile struct {
 	ArgumentKey       string
 	IncludeScreenInfo bool
+	// PureGoCompatible 只能由当前 SDK + 精确 PE 分片的
+	// V8 oracle 与纯 Go Builder 完整差分通过后置为 true。
+	PureGoCompatible bool
+}
+
+// ProfileCacheStats 是不含路径、key 或挑战字段的脱敏缓存计数。
+type ProfileCacheStats struct {
+	SourcePaths int
+	Sampled     int
+	Compatible  int
+	Failed      int
 }
 
 type keyCollector func(context.Context, string, device.Profile, []byte, []byte, time.Time) (RuntimeProfile, error)
 
 type cachedRuntimeProfile struct {
-	profile   RuntimeProfile
-	sdkSource []byte
-	peSource  []byte
-	sampledAt time.Time
+	profile         RuntimeProfile
+	profileSampled  bool
+	profileErr      error
+	sdkSource       []byte
+	peSource        []byte
+	sampledAt       time.Time
+	sourceFetchedAt time.Time
 }
 
 type cachedSDK struct {
@@ -76,34 +93,57 @@ type cachedSDK struct {
 	fetchedAt time.Time
 }
 
-// KeyResolver 按精确 StaticPath 缓存公开 SDK/PE 源码和结构画像五分钟。
-// Resolve 的缓存命中不启动 VM；Build 仍在每轮挑战的隔离 V8 Isolate 内运行缓存脚本。
+type pendingScriptLoad struct {
+	done chan struct{}
+	err  error
+}
+
+// KeyResolver 按精确 StaticPath 缓存公开 SDK/PE 源码和结构画像。
+// SDK 每五分钟字节复核，PE/profile 最多三十分钟强制重采样。
+// Resolve 的缓存命中不启动 VM；Build 在自校验兼容时纯 Go 构造，
+// 否则独占一个预加载 Isolate 并在新浏览器 context 中运行。
 type KeyResolver struct {
 	v8LibraryPath string
 	nodeBinary    string // 仅供 Node oracle 测试路径使用。
 	now           func() time.Time
 	collect       keyCollector
 
-	v8Mu      sync.Mutex
-	v8Library *v8runtime.Library
-	v8Closed  bool
+	v8Mu        sync.Mutex
+	v8Library   *v8runtime.Library
+	v8PEIdle    []*v8runtime.Runtime
+	v8PELimit   int
+	v8Closed    bool
+	deviceSlots chan struct{}
 
-	mu   sync.RWMutex
-	keys map[string]cachedRuntimeProfile
-	sdk  cachedSDK
-	miss sync.Mutex
+	mu           sync.RWMutex
+	keys         map[string]cachedRuntimeProfile
+	sdk          cachedSDK
+	sdkLoad      *pendingScriptLoad
+	peLoads      map[string]*pendingScriptLoad
+	profileLoads map[string]*pendingScriptLoad
 }
 
 // NewKeyResolver 创建进程级内嵌 V8 resolver。libraryPath 为空时从服务
 // 可执行文件所在目录加载当前平台的默认 wrapper 文件。
 func NewKeyResolver(libraryPath string) *KeyResolver {
+	return NewKeyResolverWithCapacity(libraryPath, 1)
+}
+
+// NewKeyResolverWithCapacity 创建最多保留 capacity 个预加载 PE Isolate 的 resolver。
+// 活跃调用仍各用独立 Isolate；这里只限制任务结束后的空闲保留量。
+func NewKeyResolverWithCapacity(libraryPath string, capacity int) *KeyResolver {
 	if strings.TrimSpace(libraryPath) == "" {
 		libraryPath = v8runtime.DefaultLibraryPath()
 	}
+	capacity = max(1, min(capacity, maxV8PEIdle))
 	return &KeyResolver{
 		v8LibraryPath: libraryPath,
+		v8PELimit:     capacity,
+		deviceSlots:   make(chan struct{}, min(capacity, maxV8DeviceActive)),
 		now:           time.Now,
 		keys:          make(map[string]cachedRuntimeProfile),
+		peLoads:       make(map[string]*pendingScriptLoad),
+		profileLoads:  make(map[string]*pendingScriptLoad),
 	}
 }
 
@@ -132,103 +172,321 @@ func (resolver *KeyResolver) Resolve(ctx context.Context, transport http.RoundTr
 	if err != nil {
 		return RuntimeProfile{}, err
 	}
-	now := resolver.now()
-	if cached, ok := resolver.cachedKey(path, now); ok {
-		return cached, nil
+	return resolver.ensureRuntimeProfile(ctx, transport, profile, path)
+}
+
+// Prepare 下载并缓存当轮精确 SDK/PE 源码，并在软/硬 TTL
+// 要求时为该精确分片执行一次 V8/纯 Go 差分。差分不通过
+// 不会让 Prepare 失败；Build 会自动保留原 V8 路径。
+func (resolver *KeyResolver) Prepare(ctx context.Context, transport http.RoundTripper, profile device.Profile, staticPath string) error {
+	if resolver == nil {
+		return fmt.Errorf("%w: resolver is nil", ErrKeyRuntime)
+	}
+	if ctx == nil {
+		return fmt.Errorf("%w: context is nil", ErrKeyRuntime)
+	}
+	path, err := normalizeStaticPath(staticPath)
+	if err != nil {
+		return err
+	}
+	if transport == nil {
+		return fmt.Errorf("%w: transport is nil", ErrKeyNetwork)
+	}
+	if err := resolver.prepareRuntimeSources(ctx, transport, profile, path); err != nil {
+		return err
+	}
+	_, err = resolver.ensureRuntimeProfile(ctx, transport, profile, path)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	// 采样/差分失败只关闭该分片快路，不影响原生 V8 Build。
+	return nil
+}
+
+func (resolver *KeyResolver) ensureRuntimeProfile(
+	ctx context.Context,
+	transport http.RoundTripper,
+	profile device.Profile,
+	path string,
+) (RuntimeProfile, error) {
+	if cached, cachedErr, sampled := resolver.cachedProfileState(path, resolver.now()); sampled {
+		return cached, cachedErr
 	}
 	if transport == nil {
 		return RuntimeProfile{}, fmt.Errorf("%w: transport is nil", ErrKeyNetwork)
 	}
-
-	// 新分片很少出现；串行化 miss 可以同时避免重复下载 SDK、重复启动 V8，
-	// 而所有稳定流量仍只走上面的读锁命中路径。
-	resolver.miss.Lock()
-	defer resolver.miss.Unlock()
-	now = resolver.now()
-	if cached, ok := resolver.cachedKey(path, now); ok {
-		return cached, nil
-	}
-	if err := ctx.Err(); err != nil {
+	if err := resolver.prepareRuntimeSources(ctx, transport, profile, path); err != nil {
 		return RuntimeProfile{}, err
 	}
+	if cached, cachedErr, sampled := resolver.cachedProfileState(path, resolver.now()); sampled {
+		return cached, cachedErr
+	}
 
-	sdkSource, err := resolver.sdkSource(ctx, transport, profile, now)
+	resolver.mu.Lock()
+	if cached, cachedErr, sampled := resolver.cachedProfileStateLocked(path, resolver.now()); sampled {
+		resolver.mu.Unlock()
+		return cached, cachedErr
+	}
+	if pending := resolver.profileLoads[path]; pending != nil {
+		done := pending.done
+		resolver.mu.Unlock()
+		select {
+		case <-done:
+			if cached, cachedErr, sampled := resolver.cachedProfileState(path, resolver.now()); sampled {
+				return cached, cachedErr
+			}
+			if pending.err != nil {
+				return RuntimeProfile{}, pending.err
+			}
+			return RuntimeProfile{}, fmt.Errorf("%w: runtime profile missing after sample", ErrKeyRuntime)
+		case <-ctx.Done():
+			return RuntimeProfile{}, ctx.Err()
+		}
+	}
+	pending := &pendingScriptLoad{done: make(chan struct{})}
+	resolver.profileLoads[path] = pending
+	resolver.mu.Unlock()
+
+	now := resolver.now()
+	sdkSource, peSource, ok := resolver.cachedRuntimeSources(path, now)
+	var resolved RuntimeProfile
+	var sampleErr error
+	if !ok {
+		sampleErr = fmt.Errorf("%w: runtime scripts missing", ErrKeyRuntime)
+	} else if resolver.collect != nil {
+		resolved, sampleErr = resolver.collect(ctx, resolver.nodeBinary, profile, sdkSource, peSource, now)
+	} else {
+		resolved, sampleErr = resolver.collectV8RuntimeProfile(ctx, profile, sdkSource, peSource, now)
+	}
+	if sampleErr == nil && !argumentKeyPattern.MatchString(resolved.ArgumentKey) {
+		sampleErr = fmt.Errorf("%w: invalid argument key", ErrUnsupportedPE)
+	}
+
+	resolver.mu.Lock()
+	cached, stillCurrent := resolver.keys[path]
+	if stillCurrent {
+		stillCurrent = bytes.Equal(cached.sdkSource, sdkSource) && bytes.Equal(cached.peSource, peSource)
+	}
+	cacheFailure := sampleErr != nil && !errors.Is(sampleErr, context.Canceled) && !errors.Is(sampleErr, context.DeadlineExceeded)
+	if stillCurrent && (sampleErr == nil || cacheFailure) {
+		cached.profileSampled = true
+		cached.profile = resolved
+		cached.profileErr = sampleErr
+		resolver.keys[path] = cached
+	} else if sampleErr == nil {
+		sampleErr = fmt.Errorf("%w: runtime scripts expired", ErrKeyRuntime)
+	}
+	pending.err = sampleErr
+	delete(resolver.profileLoads, path)
+	close(pending.done)
+	resolver.mu.Unlock()
+	return resolved, sampleErr
+}
+
+func (resolver *KeyResolver) prepareRuntimeSources(ctx context.Context, transport http.RoundTripper, profile device.Profile, path string) error {
+	if _, _, ok := resolver.cachedRuntimeSources(path, resolver.now()); ok {
+		return nil
+	}
+	sdkSource, err := resolver.sdkSource(ctx, transport, profile, resolver.now())
 	if err != nil {
-		return RuntimeProfile{}, err
+		return err
 	}
+	if _, _, ok := resolver.cachedRuntimeSources(path, resolver.now()); ok {
+		return nil
+	}
+
+	resolver.mu.Lock()
+	if _, _, ok := resolver.cachedRuntimeSourcesLocked(path, resolver.now()); ok {
+		resolver.mu.Unlock()
+		return nil
+	}
+	if pending := resolver.peLoads[path]; pending != nil {
+		done := pending.done
+		resolver.mu.Unlock()
+		select {
+		case <-done:
+			return pending.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	pending := &pendingScriptLoad{done: make(chan struct{})}
+	resolver.peLoads[path] = pending
+	resolver.mu.Unlock()
+
 	peURL := (&url.URL{
 		Scheme: "https",
 		Host:   keyPEHost,
 		Path:   "/captcha-frontend/dynamicJS/" + path + ".js",
 	}).String()
-	peSource, err := downloadPublicScript(ctx, transport, profile, peURL, map[string]bool{keyPEHost: true}, keyScriptMaxBytes)
-	if err != nil {
-		return RuntimeProfile{}, err
+	peSource, loadErr := downloadPublicScript(ctx, transport, profile, peURL, map[string]bool{keyPEHost: true}, keyScriptMaxBytes)
+	if loadErr == nil && (len(peSource) < 1_000 || !bytes.Contains(peSource, []byte("CaptchaConstructor"))) {
+		loadErr = fmt.Errorf("%w: PE script structure mismatch", ErrUnsupportedPE)
 	}
-	if len(peSource) < 1_000 || !bytes.Contains(peSource, []byte("CaptchaConstructor")) {
-		return RuntimeProfile{}, fmt.Errorf("%w: PE script structure mismatch", ErrUnsupportedPE)
-	}
-	var resolved RuntimeProfile
-	if resolver.collect != nil {
-		resolved, err = resolver.collect(ctx, resolver.nodeBinary, profile, sdkSource, peSource, now)
-	} else {
-		resolved, err = resolver.collectV8RuntimeProfile(ctx, profile, sdkSource, peSource, now)
-	}
-	if err != nil {
-		return RuntimeProfile{}, err
-	}
-	if !argumentKeyPattern.MatchString(resolved.ArgumentKey) {
-		return RuntimeProfile{}, fmt.Errorf("%w: invalid argument key", ErrUnsupportedPE)
-	}
+
 	resolver.mu.Lock()
-	resolver.keys[path] = cachedRuntimeProfile{
-		profile: resolved, sdkSource: bytes.Clone(sdkSource), peSource: bytes.Clone(peSource), sampledAt: now,
+	if loadErr == nil {
+		// SDK 可在 PE 下载期间到期刷新；只有当前 SDK
+		// 仍是本轮快照时才将二者绑在同一缓存项。
+		if !bytes.Equal(resolver.sdk.source, sdkSource) {
+			loadErr = fmt.Errorf("%w: SDK changed while loading PE", ErrKeyRuntime)
+		} else {
+			storedAt := resolver.now()
+			resolver.keys[path] = cachedRuntimeProfile{
+				sdkSource: bytes.Clone(sdkSource), peSource: bytes.Clone(peSource),
+				sampledAt: storedAt, sourceFetchedAt: storedAt,
+			}
+		}
 	}
+	pending.err = loadErr
+	delete(resolver.peLoads, path)
+	close(pending.done)
 	resolver.mu.Unlock()
-	return resolved, nil
+	return loadErr
 }
 
 func (resolver *KeyResolver) cachedKey(path string, now time.Time) (RuntimeProfile, bool) {
-	resolver.mu.RLock()
-	defer resolver.mu.RUnlock()
-	cached, ok := resolver.keys[path]
-	if !ok {
-		return RuntimeProfile{}, false
-	}
-	age := now.Sub(cached.sampledAt)
-	if age < 0 || age >= keyProfileCacheTTL {
-		return RuntimeProfile{}, false
-	}
-	return cached.profile, true
+	cached, err, sampled := resolver.cachedProfileState(path, now)
+	return cached, sampled && err == nil && argumentKeyPattern.MatchString(cached.ArgumentKey)
 }
 
-func (resolver *KeyResolver) sdkSource(ctx context.Context, transport http.RoundTripper, profile device.Profile, now time.Time) ([]byte, error) {
+// ProfileCacheStats 返回当前 TTL 内的脱敏分片统计。
+func (resolver *KeyResolver) ProfileCacheStats() ProfileCacheStats {
+	if resolver == nil {
+		return ProfileCacheStats{}
+	}
+	now := resolver.now()
 	resolver.mu.RLock()
+	defer resolver.mu.RUnlock()
+	var stats ProfileCacheStats
+	for _, cached := range resolver.keys {
+		if !runtimeProfileCacheFresh(cached, now) {
+			continue
+		}
+		stats.SourcePaths++
+		if !cached.profileSampled {
+			continue
+		}
+		stats.Sampled++
+		if cached.profileErr != nil {
+			stats.Failed++
+		} else if cached.profile.PureGoCompatible {
+			stats.Compatible++
+		}
+	}
+	return stats
+}
+
+func (resolver *KeyResolver) cachedProfileState(path string, now time.Time) (RuntimeProfile, error, bool) {
+	resolver.mu.RLock()
+	defer resolver.mu.RUnlock()
+	return resolver.cachedProfileStateLocked(path, now)
+}
+
+// cachedProfileStateLocked 要求调用方已持有 resolver.mu 的读锁或写锁。
+func (resolver *KeyResolver) cachedProfileStateLocked(path string, now time.Time) (RuntimeProfile, error, bool) {
+	cached, ok := resolver.keys[path]
+	if !ok {
+		return RuntimeProfile{}, nil, false
+	}
+	if !runtimeProfileCacheFresh(cached, now) {
+		return RuntimeProfile{}, nil, false
+	}
+	if !cached.profileSampled {
+		return RuntimeProfile{}, nil, false
+	}
+	return cached.profile, cached.profileErr, true
+}
+
+func runtimeProfileCacheFresh(cached cachedRuntimeProfile, now time.Time) bool {
+	age := now.Sub(cached.sampledAt)
+	if age < 0 || age >= keyProfileCacheTTL {
+		return false
+	}
+	sourceAt := cached.sourceFetchedAt
+	if sourceAt.IsZero() {
+		// 兼容旧单测 fixture 和进程内已有项。
+		sourceAt = cached.sampledAt
+	}
+	sourceAge := now.Sub(sourceAt)
+	return sourceAge >= 0 && sourceAge < keyProfileHardTTL
+}
+
+func (resolver *KeyResolver) sdkSource(ctx context.Context, transport http.RoundTripper, profile device.Profile, _ time.Time) ([]byte, error) {
+	resolver.mu.Lock()
+	// 必须在获锁后取时间：否则晚获锁的 goroutine 可能拿着
+	// 比新 `fetchedAt` 更旧的 now，把刚写入的 SDK 缓存误判为未命中。
+	now := resolver.now()
 	if len(resolver.sdk.source) > 0 && now.Sub(resolver.sdk.fetchedAt) >= 0 && now.Sub(resolver.sdk.fetchedAt) < keySDKCacheTTL {
 		cached := bytes.Clone(resolver.sdk.source)
-		resolver.mu.RUnlock()
+		resolver.mu.Unlock()
 		return cached, nil
 	}
-	resolver.mu.RUnlock()
+	if pending := resolver.sdkLoad; pending != nil {
+		done := pending.done
+		resolver.mu.Unlock()
+		select {
+		case <-done:
+			if pending.err != nil {
+				return nil, pending.err
+			}
+			resolver.mu.RLock()
+			cached := bytes.Clone(resolver.sdk.source)
+			resolver.mu.RUnlock()
+			if len(cached) == 0 {
+				return nil, fmt.Errorf("%w: SDK cache missing after load", ErrKeyRuntime)
+			}
+			return cached, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	pending := &pendingScriptLoad{done: make(chan struct{})}
+	resolver.sdkLoad = pending
+	resolver.mu.Unlock()
 
-	source, err := downloadPublicScript(ctx, transport, profile, keySDKURL, map[string]bool{
+	source, loadErr := downloadPublicScript(ctx, transport, profile, keySDKURL, map[string]bool{
 		"o.alicdn.com": true,
 		"g.alicdn.com": true,
 	}, keyScriptMaxBytes)
-	if err != nil {
-		return nil, err
+	if loadErr == nil && (len(source) < 1_000 || !bytes.Contains(source, []byte("AliyunCaptcha"))) {
+		loadErr = fmt.Errorf("%w: SDK script structure mismatch", ErrUnsupportedPE)
 	}
-	if len(source) < 1_000 || !bytes.Contains(source, []byte("AliyunCaptcha")) {
-		return nil, fmt.Errorf("%w: SDK script structure mismatch", ErrUnsupportedPE)
-	}
+
 	resolver.mu.Lock()
-	if len(resolver.sdk.source) > 0 && !bytes.Equal(resolver.sdk.source, source) {
+	refreshedAt := resolver.now()
+	sameSDK := loadErr == nil && len(resolver.sdk.source) > 0 && bytes.Equal(resolver.sdk.source, source)
+	if loadErr == nil && len(resolver.sdk.source) > 0 && !sameSDK {
 		// 每份结构画像都依赖采样时的非版本化 SDK；SDK 内容改变时，旧路径
 		// 即使自身 TTL 尚未到期也不能继续和新 Device VM 混用。
 		resolver.keys = make(map[string]cachedRuntimeProfile)
 	}
-	resolver.sdk = cachedSDK{source: bytes.Clone(source), fetchedAt: now}
+	if sameSDK {
+		// 精确 PE 路径含内容版本。SDK 字节未变时，延长已验证
+		// 画像的软 TTL，避免每五分钟对几十个分片重跑 V8。
+		// 硬 TTL 到期后仍必须重下 PE 并完整采样。
+		for path, cached := range resolver.keys {
+			sourceAt := cached.sourceFetchedAt
+			if sourceAt.IsZero() {
+				sourceAt = cached.sampledAt
+			}
+			sourceAge := refreshedAt.Sub(sourceAt)
+			if sourceAge >= 0 && sourceAge < keyProfileHardTTL {
+				cached.sampledAt = refreshedAt
+				resolver.keys[path] = cached
+			}
+		}
+	}
+	if loadErr == nil {
+		resolver.sdk = cachedSDK{source: bytes.Clone(source), fetchedAt: refreshedAt}
+	}
+	pending.err = loadErr
+	resolver.sdkLoad = nil
+	close(pending.done)
 	resolver.mu.Unlock()
+	if loadErr != nil {
+		return nil, loadErr
+	}
 	return source, nil
 }
 

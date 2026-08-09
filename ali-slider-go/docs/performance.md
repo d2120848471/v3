@@ -1,16 +1,17 @@
 # 性能测试与容量口径
 
-> **当前结论**：生产运行时已改为同进程 V8 `149.4.0`。Linux AMD64 最终包的 Device/PE 组件探针以 `2.78s` 通过，但它不创建 Captcha Init/Verify，不能计算完整 Solve 的 P95/P99 或成功率。原 Mac ARM64 纯 Go 200 样本 `P99=57.05075ms`、2026-08-07 Client `196/200`、`P95=984ms` 及旧单挑战 `1579ms` 都属于旧运行时路径；它们保留为历史基线，不再视为当前生产路径的性能验收。当前 HTTP 端到端、V8 Isolate/Go 资源峰值和长时间稳定性仍待正式授权测量。
+> **当前结论**：生产运行时使用同进程V8 `149.4.0`采集动态Device，并对每个精确PE `StaticPath`做V8 oracle与纯Go完整差分。最终安全候选真实50次为 `47/50`、mean `2562ms`、P50 `2157ms`、P95 `4910ms`，3次均为业务 `F015`，分类错误0；后25次mean `2232ms`。默认直连组件A/B证明5个对齐存活的Device VM已破坏字段合同，所以预热池默认和硬上限均为4。相较基线P50 `4722ms`已明显改善，但并发10下平均仍未达到约1秒；HTTP端到端、资源峰值和长稳也尚无结论。
 
 ## 性能目标
 
 | 维度 | 冻结口径 | 性质 | 当前状态 |
 |---|---:|---|---|
-| 生产 Vision/Track/动态 PE 本地阶段 P99 | `<=100 ms` | 原硬门槛，需按新架构复核 | 未测；旧纯 Go oracle 路径 `57.05075ms` 不适用 |
-| 热态直连 Client 完整求解链 P95 | `<=1000 ms` | 优化目标 | 当前未测；单次功能 smoke `1579ms` 不是 P95 |
+| 已自校验 PE 的 `buildVerifyData` | 尽可能 `<=100 ms` | 本地计算目标 | 真实 50 次 mean `1–2ms`；强制 V8 约 `530ms` |
+| 热态直连 Client 完整求解链 | mean 约 `1000 ms` | 本次优化目标 | 最终50次mean `2562ms`；后25次mean `2232ms`，未通过 |
 | HTTP 同时在途挑战 | 无本地硬上限 | 服务合同 | 64 个并发合法请求全部进入 Solver；不是生产容量结论 |
-| Client 每 route/host 连接与预热预算 | `1..32` | 兼容配置边界 | `MaxConcurrency` 只约束出站 Transport 与预热资源，不是 HTTP admission |
-| 授权在线成功率 | `>=190/200` | 正确性门槛 | 当前未测；`1/1 T001` 只作功能 smoke，历史旧路径为 `196/200` |
+| Client每route/host连接与PE预算 | `1..32` | 兼容配置边界 | `MaxConcurrency`只约束Transport/PE，不是HTTP admission |
+| 默认直连池保留的Device VM | 最多 `4` | 公开SDK/上游正确性边界 | 4-slot/10-job组件探针通过；5个对齐存活会话字段不完整 |
+| 本次真实50次成功率 | 不低于基线 `46/50` | 正确性门槛 | 最终候选 `47/50`，通过 |
 
 `P95 <=1000 ms` 不表示每个请求都必须低于 1 秒。设备 RPC、Captcha Init/Verify、TLS、CDN、DNS 和代理均可能产生不可控尾延迟；报告必须同时给出分位数、失败分类和网络环境。
 
@@ -23,12 +24,12 @@
 | `setup` | 请求校验后到客户端准备完成 | 画像选择、route/transport、设备与 Captcha client 构造 |
 | `deviceSession` | Lease/Open 开始到首枚 token 可用 | 预热 V8 Device Isolate 命中，或冷建同一 FeiLin 状态的 Log1/2/3 |
 | `init` | Captcha Init 请求往返 | InitCaptchaV3 |
-| `resolvePEKey` | Init 后到当前 PE 结构画像可用 | 5 分钟缓存命中，或公开 SDK/PE 下载与画像采样 |
+| `resolvePEKey` | Init 后到当前 PE 结构画像可用 | 缓存命中，或公开 SDK/PE 下载、V8 采样与纯 Go 完整差分；SDK 软 TTL 5 分钟，PE 硬 TTL 30 分钟 |
 | `downloadAssets` | 两图下载整体墙钟 | 背景图和 shadow 并行下载 |
 | `downloadBackground` | 单图下载 | 背景图 |
 | `downloadShadow` | 单图下载 | shadow |
 | `vision` | 两张 PNG 到识别结果 | PNG 解码、缺口定位、置信度和几何 |
-| `buildVerifyData` | 轨迹到 PE data | 启动当前禁网 V8 PE Isolate、逻辑时钟、原生 data/getter/events、Go Pack/Unpack 合同自检 |
+| `buildVerifyData` | 轨迹到 PE data | 已验证分片使用动态 profile + 纯 Go Builder；其余使用禁网 V8 fallback；两者都做 Pack/Unpack、getter、事件和时钟合同自检 |
 | `completeDevice` | 设备完成态 | 同一 FeiLin VM 事件回放/getter、Verify token 和最终 Log2 |
 | `verify` | Captcha Verify 请求往返 | 唯一一次 VerifyCaptchaV3 |
 | `clientCleanup` | release 开始到返回 | 关闭已消费会话并触发有界补货 |
@@ -43,13 +44,13 @@
 | 指标 | 起点与终点 | 包含 | 不包含 |
 |---|---|---|---|
 | 视觉算法 | PNG bytes 进入 `vision.Solve` 到返回 | 解码、图像操作、fallback、坐标 | 轨迹、PE、网络 |
-| 生产本地构建链 | 已取得两张 PNG 到动态 PE/Data 自检完成 | vision、track、V8 PE Isolate、协议解包/合同自检 | Device Complete、Captcha Verify、其他网络与图片下载 |
+| 生产本地构建链 | 已取得两张 PNG 到 PE/Data 自检完成 | vision、track、已验证纯 Go Builder 或 V8 fallback、协议解包/合同自检 | 首次分片画像若已在前置 `resolvePEKey` 计时；Device Complete、Captcha Verify、其他网络与图片下载 |
 | Solver total | `challenge.Solver.Solve` 进入到清理完成 | 本地计算与全部上游等待 | HTTP parse/write 和客户端网络 |
 | 完整请求 | 负载发生器发出 HTTP 到读完 response | 服务 HTTP、Solver、上游等待 | 负载发生器准备数据的时间 |
 | 吞吐 | 窗口内完成响应数 / 墙钟秒数 | 成功、业务失败、技术失败分别计数 | 不能只统计成功响应 |
 | 在途并发 | 合法请求进入 `Solve` 到 Solver 返回 | Solver 运行及上游等待 | 跨源边界、JSON/query/字段校验在 Solver 前拒绝的请求；外层代理在到达本进程前拒绝的请求 |
 
-`internal/challenge/performance_test.go` 仍提供显式启用的 200 样本纯 Go oracle/视觉回归。历史 Mac ARM64 结果为 `P50=50.577458ms`、`P95=55.711708ms`、`P99=57.05075ms`、`max=60.337542ms`；但该测试使用 fake PE resolver/旧本地 builder，不包含当前逐挑战 V8 PE Isolate，因此只能继续作为视觉/纯 Go 回归，不能证明当前生产 `buildVerifyData` 的 P99。
+`internal/challenge/performance_test.go` 仍提供显式启用的 200 样本纯 Go oracle/视觉回归。历史 Mac ARM64 结果为 `P50=50.577458ms`、`P95=55.711708ms`、`P99=57.05075ms`、`max=60.337542ms`。它可用于监测视觉/纯 Go Builder 回归，但不包含新分片首次 V8 自校验、Device 和任何网络，因此不能代替完整 Solve 验收。
 
 ## 统计定义
 
@@ -116,14 +117,16 @@ GOMAXPROCS=16 go test ./internal/vision \
 
 ## 设备预热的性能含义
 
-兼容字段 `MaxConcurrency` 控制 Client 每个 route/host 的出站连接与预热资源预算，保持 `1..32` 校验；默认预热容量随该资源预算收敛，默认会话最大空闲年龄为 20 秒。它不限制 HTTP 在途请求。启动器先完成 `net.Listen` 绑定，再在开始 `Serve` 前调用 `Client.Prime`，把设备 Log1/2/3 尽量移出请求关键路径，同时避免端口占用时先访问上游。
+兼容字段 `MaxConcurrency` 控制Client每个route/host的出站连接与PE资源预算，保持 `1..32`校验。Device prewarm默认和硬上限为4，并随更小的MaxConcurrency收敛；默认会话最大空闲年龄为20秒。它不限制HTTP在途请求。启动器先完成 `net.Listen`绑定，再在开始 `Serve`前调用 `Client.Prime`，把设备Log1/2/3尽量移出请求关键路径，同时避免端口占用时先访问上游。
 
 必须同时报告两种模式：
 
 - 冷建：`--device-prewarm=0`，`deviceSession` 包含完整设备初始化。
 - 热态：预热完成、key 匹配且会话未过期，`deviceSession` 主要为 Lease。
 
-预热池只在 endpoint、prefix、region、route、profile ID、timeout 和设备时序范围完全一致时复用。逐请求代理与默认直连池 key 不同，会走冷建；这属于安全隔离，不应通过跨 route 复用来“优化”。消费后会话立即关闭，再异步有界补货；`ready + pending + leased` 不超过容量。
+预热池只在endpoint、prefix、region、route、timeout和设备时序范围一致时复用；每个slot自行持有独立画像，租出后整轮HTTP/PE/Device都使用该实际画像。逐请求代理与默认直连池key不同，会走冷建。Complete后挑战态被消费，外层Isolate原位回收并重建浏览器context、session ID和token。资源边界为 `ready + pending + leased <= capacity + reserve <= 4`；满池matching请求等待现有slot recycle，不绕过池额外冷建。reserve默认0。
+
+`reserve=4` 和 `reserve=1` 的真实 50 次 A/B 都没有改善总耗时：虽然 Device 等待下降，但新 Device 采集与冷 PE 采样/Complete 争用 CPU 和网络。因此默认为 0；只有在目标服务器上完成同口径 A/B 后才应显式开启。
 
 预热失败会记录 warning，成功库存仍保留，后续请求可冷建兜底。不得把 Prime 失败隐藏为性能成功。
 
@@ -150,7 +153,7 @@ ALI_SLIDER_PERF=1 GOMAXPROCS=16 \
 7. 至少重复 5 轮；任一正式轮次 P99 超过 100 ms，则硬门槛失败。
 8. race detector 单独用于正确性，不把插桩后的耗时作为性能数据。
 
-当前架构需新增包含 V8 PE Isolate 的同口径 200 样本门禁；在此之前，旧 200 样本只用于纯 Go/视觉回归趋势。
+当前架构的正式本地门禁还应分别覆盖：已验证纯 Go 快路、首次 V8 画像和不兼容分片 V8 fallback。在此之前，旧 200 样本只用于纯 Go/视觉回归趋势。
 
 ## Mock Solver/HTTP 分层容量方法
 
@@ -168,6 +171,28 @@ ALI_SLIDER_PERF=1 GOMAXPROCS=16 \
 离线 `TestSolverOffline32ConcurrentSuccess` 证明状态隔离；历史 Client harness 以 32 并发完成 200 轮。热构建缓存下的 Mock 与 `200×32=6,400` 次离线 Solve 都使用 fake PE runtime，不启动 production V8 Isolate；这些数字只证明 Go 编排和池状态，不是当前 V8 的吞吐、RSS 或泄漏证明。生产形态的 V8/Go RSS、heap、GC、goroutine/原生线程峰值、持续吞吐和长时间稳定性仍待测。
 
 取消本地 HTTP admission 后，Handler goroutine 与已进入的 Solve 数可随来流增长；Transport 连接数和预热库存有界，并不能把 HTTP 在途数变成有界。当前尚未验证生产流量下请求堆积、上游连接等待、超时风暴、RSS/GC 峰值或进程耗尽边界，因此 64 并发回归不得写成“服务支持无界并发”或生产容量结论。需要保护生产实例时，应在外层反向代理、负载均衡或 API 网关配置容量与速率策略，并把其 429 单独统计。
+
+## 2026-08-09 当前路径真实验收
+
+口径为 Linux AMD64 最终 V8 wrapper、同一 `slider.Client`、直连、并发 10、每个 job 一次 Solve、应用层零重试，每个新 `CertifyId` 最多一次 Verify。严格成功要求 `T001`、`VerifyResult=true` 且 token 非空。数字为 Client Solve 墙钟，不经 HTTP Handler。
+
+| 版本/模式 | 成功 | mean | P50 | P95 | max | 主要观察 |
+|---|---:|---:|---:|---:|---:|---|
+| 优化前基线 | `46/50` | 未记录 | `4722ms` | `7136ms` | `8578ms` | Device/PE 外层运行时每轮重建 |
+| Device recycle + PE runtime 池 | `47/50` | `3040ms` | `3070ms` | `4663ms` | `5397ms` | `resolvePEKey` mean `1054ms`，V8 Build `608ms` |
+| 精确分片自校验纯 Go 快路 | `49/50` | `2007ms` | `1771ms` | `3217ms` | `3258ms` | Build mean `2ms`，瓶颈转为冷分片画像 |
+| 默认 `reserve=0` + 脱敏分片计数 | `48/50` | `1890ms` | `1909ms` | `2996ms` | `3154ms` | 32 个精确分片，32/32 兼容；后 25 mean `1376ms` |
+| `reserve=1` A/B | `47/50` | `2112ms` | `2127ms` | `3135ms` | — | 总耗时反而上升 |
+| `reserve=4` A/B | `47/50` | `2305ms` | — | `4027ms` | — | Device 等待下降，PE/Complete 争用上升 |
+| prewarm16错误实验 | `33/50` | `2047ms` | `2167ms` | `3100ms` | `3255ms` | 16个预热会话全部在Complete报协议错，不可用 |
+| 4-live冷溢出候选 | `48/50` | `2657ms` | `2760ms` | `4356ms` | `4711ms` | F015=2，分类错误0 |
+| 最终4-live满池等待 | `47/50` | `2562ms` | `2157ms` | `4910ms` | `5859ms` | F015=3，分类错误0；后25 mean2232ms |
+
+最终安全候选将P50从 `4722ms`降到 `2157ms`，约下降54%；成功率从92%到94%。但mean `2562ms`明确未达到约1秒。最终阶段mean中 `buildVerifyData=1ms`、`resolvePEKey=204ms`，主瓶颈是默认直连池4槽安全边界下的 `deviceSession=1644ms`；不能通过恢复同池5+会话规避排队。
+
+长时运行的缓存现采用两层时限：每 5 分钟重下 SDK 并比较字节；SDK 未变时延长已验证分片的软 TTL；任一分片超过 30 分钟仍强制重下 PE 和完整 V8 差分。SDK 字节变化则立即清空所有画像。这能避免稳定服务每 5 分钟重复采样 32 个分片，但不会改善全新进程的首批冷启动。
+
+完整 Evidence → Finding → Path、时间线和验收边界见 [2026-08-09 性能证据](./evidence/validation-2026-08-09-performance.md)。
 
 ## 2026-08-08 历史功能 smoke
 
@@ -225,11 +250,12 @@ ALI_SLIDER_PERF=1 GOMAXPROCS=16 \
 |---|---|---|
 | `internal/challenge/solver.go:107`、`:149`、`:431` | 完整 Solver 已实现，并固定 12 个阶段耗时 key。 | Solve → stage timings → Result |
 | `internal/challenge/solver_test.go` · `TestSolverOfflineCompleteSuccess` | 完整离线链成功路径和阶段输出已有 Mock 证据。 | device/init/assets/vision/PE/verify → outcome |
-| `internal/challenge/device_pool.go:15`、`:22`、`:190` | 预热池有 20s 默认年龄、完整 key 隔离和有界 Lease/补货。 | Prime → Lease or cold open → release/refill |
+| `internal/challenge/device_pool.go` · `NewRuntimeDeviceSessionPoolWithReserve` / `LeaseRuntime` / `runRecycle` | 预热池有20s默认年龄、4槽库存硬边界、独立slot画像和满池等待；Complete后外层Isolate可回收，挑战状态不复用。 | Prime → Lease/wait → Complete → fresh-context recycle or cold refill |
 | `internal/server/server.go` · `decodeQueryRequest` / `handleSolve`；`internal/server/server_test.go` · `TestLegacyGETQueryCompatibility` / `TestSolveParameterSourcesStaySeparated` / `TestConcurrentRequestsAlwaysEnterSolver` | Handler 同时兼容 deprecated GET query 与 POST JSON，两者共用 Solver 链但不合并参数源；64 个并发合法 POST 全部进入 Solver。 | valid request → timeout context → Solve |
 | `internal/server/openapi.go` · `legacyQueryParameters` / `solveResponses`；`internal/server/server_test.go` · `TestOnlyFrozenRoutesAreExposed` | OpenAPI 在四路径内同时声明 Solve POST/deprecated GET，两者只有 200/400/403/500，并回归禁止 429 与旧本地过载字段。 | API document → response contract → no local 429 |
 | `pkg/slider/client.go:183` | 公共 Result 的 elapsedMs 来自 Solver total，而非客户端完整 HTTP 墙钟。 | Solver timings → library result |
 | `internal/vision/solver_test.go:260`、`:271` | 视觉 benchmark 只提供均值/并行趋势；项目 P99 结论来自独立逐次纯计算门禁。 | repeated vision Solve → mean throughput only |
 | `internal/challenge/performance_test.go:21`、`:65`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 32 路 Mock 正确性通过；200 样本纯计算 `P99=57.05075ms`，达到硬门槛；6,400 次离线 Solve 压力通过。 | concurrent mock / explicit local sampler / repeated stress → verified compute and capacity gates |
+| `internal/pe/keys.go` · `Prepare` / `runtimeProfileCacheFresh` / `ProfileCacheStats`；`internal/pe/v8_runtime.go` · `runtimeProfileMatchesPureGo`；`pkg/slider/online_acceptance_test.go` | 精确分片只有经当前V8完整差分后才走纯Go；软5/硬30分钟且统计不暴露路径/key。最终50次mean `2562ms`，未达1s。 | StaticPath → source/profile singleflight → V8 oracle → verified pure-Go or V8 fallback → one Verify |
 | `pkg/slider/online_acceptance_test.go:37`、`:49`、`:98`、`:128`、`:147`、`:165`、`:168`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 200/32/应用层零重试候选批次成功率 `98%`、Client 完整求解链 P95 `984ms`，两项门槛通过；不经过 HTTP Handler，最终 one-shot 加固后未再在线重跑。 | authorized jobs → one Solve each → aggregate percentiles → bounded acceptance |
 | `go.mod:3`；`Dockerfile:3` | 正式构建工具链固定 Go `1.26.5`。 | source → pinned build → comparable baseline |

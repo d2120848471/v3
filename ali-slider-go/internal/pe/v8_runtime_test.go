@@ -1,11 +1,16 @@
 package pe
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/d2120848471/v3/ali-slider-go/internal/protocol"
+	"github.com/d2120848471/v3/ali-slider-go/internal/v8runtime"
 )
 
 func TestCachedV8RuntimeBundles(t *testing.T) {
@@ -16,6 +21,41 @@ func TestCachedV8RuntimeBundles(t *testing.T) {
 	}
 	if first.sdk == "" || first.pe == "" || first.sdk != second.sdk || first.pe != second.pe {
 		t.Fatal("cached V8 bundles are empty or unstable")
+	}
+}
+
+func TestV8PEEnginePoolReusesAndBounds(t *testing.T) {
+	libraryPath := os.Getenv("ALI_SLIDER_V8_TEST_LIBRARY")
+	if libraryPath == "" {
+		t.Skip("ALI_SLIDER_V8_TEST_LIBRARY is not set")
+	}
+	resolver := NewKeyResolverWithCapacity(libraryPath, 1)
+	first, err := resolver.acquireV8PEEngine(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver.releaseV8PEEngine(first, true)
+	second, err := resolver.acquireV8PEEngine(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second != first {
+		t.Fatal("PE pool did not reuse the preloaded runtime")
+	}
+	third, err := resolver.acquireV8PEEngine(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver.releaseV8PEEngine(second, true)
+	resolver.releaseV8PEEngine(third, true)
+	if _, err := third.Eval(context.Background(), "true", "closed.js"); !errors.Is(err, v8runtime.ErrClosed) {
+		t.Fatalf("runtime above idle capacity remained open: %v", err)
+	}
+	if err := resolver.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Eval(context.Background(), "true", "closed.js"); !errors.Is(err, v8runtime.ErrClosed) {
+		t.Fatalf("resolver Close left idle runtime open: %v", err)
 	}
 }
 
@@ -84,5 +124,58 @@ func TestValidateRuntimeProfileBridgeOutputRejectsMalformedData(t *testing.T) {
 		Key: "dmmlums5zuewlgt7", Argument: "wrong", Data: "wrong",
 	}); !errors.Is(err, ErrUnsupportedPE) || !strings.Contains(err.Error(), "independent key check") {
 		t.Fatalf("mismatched argument error = %v", err)
+	}
+}
+
+func TestRuntimeProfilePureGoParityGate(t *testing.T) {
+	profile := oracleProfile()
+	input := bridgeInput{
+		SceneID: "1ug4aptr", CertifyID: dummyCertifyID,
+		Dimensions:      map[string]int{"renderedWidth": 300, "handleWidth": 40},
+		ExpectedXPos:    29,
+		InitBeginTime:   1_999_999_994_250,
+		FirstTouchAgeMS: 700,
+	}
+	for _, event := range oracleTrack() {
+		input.Track = append(input.Track, bridgeTrackEvent{
+			Type: event.Type, X: event.X, Y: event.Y, DT: event.DT,
+			Force: 0.5, RadiusX: 5, RadiusY: 5,
+		})
+	}
+	result, err := builderWithEntropy(&byteEntropy{data: make([]byte, 15)}, 2_000_000_000_000).Build(
+		context.Background(),
+		Input{
+			SceneID: input.SceneID, CertifyID: input.CertifyID,
+			Dimensions: Dimensions{RenderedWidth: 300, HandleWidth: 40},
+			Track:      oracleTrack(), ArgumentKey: testArgumentKey, ExpectedXPos: &input.ExpectedXPos,
+			InitBeginTimeMS: input.InitBeginTime, FirstTouchAgeMS: input.FirstTouchAgeMS,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := protocol.UnpackData(result.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := runtimeProfileBridgeOutput{
+		Key: testArgumentKey, Argument: decoded.Payload.Arg, Data: result.Data,
+		PayloadKeys: result.PayloadKeys, TrackKeys: result.TrackKeys,
+	}
+	resolved, err := validateRuntimeProfileBridgeOutput(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !runtimeProfileMatchesPureGo(context.Background(), output, input, profile, resolved) {
+		t.Fatal("equivalent V8 payload did not enable the pure-Go path")
+	}
+
+	decoded.Payload.SlidePos = "81"
+	output.Data, err = protocol.PackData(decoded.Payload, "00112233445566778899aabbccddeeff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtimeProfileMatchesPureGo(context.Background(), output, input, profile, resolved) {
+		t.Fatal("payload drift incorrectly enabled the pure-Go path")
 	}
 }

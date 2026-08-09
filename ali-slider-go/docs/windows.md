@@ -4,7 +4,7 @@ GitHub Actions 在 Linux quality、Darwin race 与 Linux V8 双架构门禁通�
 
 平台下限依据 Go 1.26 的官方 [Minimum Requirements](https://go.dev/wiki/MinimumRequirements)。
 
-> 本程序是本机控制台 HTTP 服务，不是桌面图形应用，但内置浏览器 API 测试页。当前包只支持 Windows AMD64/x64。默认启动会访问外部 Device RPC 做会话预热；测试页手工求解还会访问 Captcha RPC 和图片 CDN。仅限自有系统或获得明确授权的测试环境。
+> 本程序是本机控制台HTTP服务，不是桌面图形应用，但内置浏览器API测试页。当前包只支持Windows AMD64/x64。默认启动会访问外部Device RPC建立4个独立画像slot；测试页手工求解还会访问Captcha RPC和图片CDN。仅限自有系统或明确授权环境，不能提高默认预热池4槽边界。
 
 测试页需要现代 Edge、Chrome 或 Firefox，不支持 Internet Explorer。没有现代浏览器时，Go 服务和 PowerShell/API 仍可使用；包内 V8 DLL 由 Go 服务在进程内加载，不会启动 Node 子进程或打开窗口。
 
@@ -42,7 +42,7 @@ ali-slider-go-windows-amd64.zip
 ```
 
 - `ali-slider-go.exe` 是 `CGO_ENABLED=0` 的 Windows AMD64 console PE；默认触摸轨迹已经嵌入 EXE。
-- `ali_slider_v8_runtime.dll` 是 V8 `149.4.0`/ICU 77 的 C ABI wrapper，用于逐挑战设备 SDK/FeiLin 和动态 PE；公开脚本/画像缓存 5 分钟，但 token/data 不跨轮复用。
+- `ali_slider_v8_runtime.dll` 是 V8 `149.4.0`/ICU 77 的 C ABI wrapper，用于逐挑战设备 SDK/FeiLin、精确 PE oracle 和不兼容分片 fallback；SDK 软 TTL 5 分钟、PE/profile 硬 TTL 30 分钟，token/data 不跨轮复用。
 - `THIRD-PARTY-NOTICES.txt` 包含 rusty_v8、V8、ICU 与对应数据许可说明。
 - `start.bat` 先切换到自身目录，再提供回环地址、端口、`var\artifacts` 路径与包内 DLL 的安全默认值；缺少 EXE 或 DLL 都会在启动前停止，异常退出时保留窗口显示错误。
 - `README-Windows.txt` 是可脱离仓库阅读的最终用户说明；打包时写为 UTF-8 BOM，便于 Windows Server 2016 旧记事本正确识别中文。

@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -82,6 +83,10 @@ type solverTransport struct {
 	verifyMalformed bool
 	deviceMalformed bool
 	staticPath      string
+	beforeVerify    func() error
+	initUserAgent   string
+	verifyUserAgent string
+	assetUserAgents []string
 }
 
 func newSolverTransport(t *testing.T, fixture string) *solverTransport {
@@ -107,6 +112,9 @@ func newSolverTransport(t *testing.T, fixture string) *solverTransport {
 
 func (transport *solverTransport) RoundTrip(request *http.Request) (*http.Response, error) {
 	if request.Method == http.MethodGet {
+		transport.mu.Lock()
+		transport.assetUserAgents = append(transport.assetUserAgents, request.UserAgent())
+		transport.mu.Unlock()
 		if request.URL.Hostname() != assetHost {
 			return nil, errors.New("unexpected asset host")
 		}
@@ -132,6 +140,7 @@ func (transport *solverTransport) RoundTrip(request *http.Request) (*http.Respon
 	case "InitCaptchaV3":
 		transport.mu.Lock()
 		transport.initCount++
+		transport.initUserAgent = request.UserAgent()
 		identifier := fmt.Sprintf("fixture-certify-%04d", transport.initCount)
 		transport.mu.Unlock()
 		if transport.initMalformed {
@@ -147,8 +156,14 @@ func (transport *solverTransport) RoundTrip(request *http.Request) (*http.Respon
 			"StaticPath": staticPath, "CaptchaType": "slider",
 		})
 	case "VerifyCaptchaV3":
+		if transport.beforeVerify != nil {
+			if err := transport.beforeVerify(); err != nil {
+				return nil, err
+			}
+		}
 		transport.mu.Lock()
 		transport.verifyCount++
+		transport.verifyUserAgent = request.UserAgent()
 		verifyError, verifySuccess := transport.verifyError, transport.verifySuccess
 		transport.mu.Unlock()
 		if verifyError != nil {
@@ -245,23 +260,55 @@ func newIntegrationSolverWithPEKeys(t *testing.T, transport *solverTransport, mi
 }
 
 type staticPEKeyResolver struct {
-	mu      sync.Mutex
-	profile pe.RuntimeProfile
-	err     error
-	paths   []string
+	mu                sync.Mutex
+	profile           pe.RuntimeProfile
+	err               error
+	paths             []string
+	prepareProfileIDs []string
+	buildProfileIDs   []string
 }
 
-func (resolver *staticPEKeyResolver) Resolve(_ context.Context, _ http.RoundTripper, _ device.Profile, staticPath string) (pe.RuntimeProfile, error) {
+type completedDeviceSession struct{}
+
+func (*completedDeviceSession) InitToken() (string, error) { return "fixture-device-token", nil }
+func (*completedDeviceSession) PEDeviceConfig() (protocol.DeviceConfig, error) {
+	return protocol.DeviceConfig{Key: solverFixtureKey, SessionID: "fixture-session"}, nil
+}
+func (*completedDeviceSession) TargetFirstTouchAgeMS() (int, error) { return 700, nil }
+func (*completedDeviceSession) Complete(_ context.Context, _ string, interactions []device.InteractionEvent, _ int) (device.Result, error) {
+	return device.Result{
+		VerifyToken:           "fixture-verify-token",
+		GetterArgumentCount:   1,
+		InteractionEventCount: len(interactions),
+		RequestActions:        []string{"Log1", "Log2", "Log3", "Log2"},
+	}, nil
+}
+func (*completedDeviceSession) Close() {}
+
+type profiledCompletedDeviceSession struct {
+	completedDeviceSession
+	profile device.Profile
+}
+
+func (session *profiledCompletedDeviceSession) DeviceProfile() device.Profile {
+	return session.profile.Clone()
+}
+
+func (resolver *staticPEKeyResolver) Prepare(_ context.Context, _ http.RoundTripper, profile device.Profile, staticPath string) error {
 	resolver.mu.Lock()
 	resolver.paths = append(resolver.paths, staticPath)
+	resolver.prepareProfileIDs = append(resolver.prepareProfileIDs, profile.ProfileID)
 	resolver.mu.Unlock()
-	return resolver.profile, resolver.err
+	return resolver.err
 }
 
-func (resolver *staticPEKeyResolver) Build(_ context.Context, _ http.RoundTripper, _ device.Profile, _ string, input pe.RuntimeInput) (pe.Result, error) {
+func (resolver *staticPEKeyResolver) Build(_ context.Context, _ http.RoundTripper, profile device.Profile, _ string, input pe.RuntimeInput) (pe.Result, error) {
 	if resolver.err != nil {
 		return pe.Result{}, resolver.err
 	}
+	resolver.mu.Lock()
+	resolver.buildProfileIDs = append(resolver.buildProfileIDs, profile.ProfileID)
+	resolver.mu.Unlock()
 	if len(input.Track) < 3 || input.DeviceConfig.SessionID == "" {
 		return pe.Result{}, errors.New("invalid fixture PE runtime input")
 	}
@@ -319,7 +366,72 @@ func TestSolverOfflineCompleteSuccess(t *testing.T) {
 	}
 }
 
-func TestSolverUsesResolvedDynamicPEKey(t *testing.T) {
+func TestSolverReleasesCompletedDeviceBeforeVerifyOnce(t *testing.T) {
+	transport := newSolverTransport(t, "gap")
+	var releases atomic.Int32
+	transport.beforeVerify = func() error {
+		if got := releases.Load(); got != 1 {
+			return fmt.Errorf("release count at Verify=%d, want 1", got)
+		}
+		return nil
+	}
+	solver, _ := newIntegrationSolver(t, transport, 0.45)
+	solver.options.OpenDevice = func(context.Context, http.RoundTripper, device.Profile, SolveRequest) (DeviceSession, func(), error) {
+		return &completedDeviceSession{}, func() { releases.Add(1) }, nil
+	}
+	outcome, err := solver.Solve(context.Background(), SolveRequest{SceneID: "scene", Prefix: "prefix1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !outcome.OK || releases.Load() != 1 {
+		t.Fatalf("outcome=%+v releases=%d", outcome, releases.Load())
+	}
+}
+
+func TestSolverUsesLeasedDeviceProfileForWholeRound(t *testing.T) {
+	transport := newSolverTransport(t, "gap")
+	resolver := &staticPEKeyResolver{profile: pe.RuntimeProfile{
+		ArgumentKey: "0kd8i0mclivjow32", IncludeScreenInfo: true,
+	}}
+	solver, _ := newIntegrationSolverWithPEKeys(t, transport, 0.45, 5*time.Second, resolver)
+	profile, err := device.GenerateProfile(&byteEntropy{next: 9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile.ProfileID = "leased-profile"
+	profile.UserAgent = "leased-device-user-agent"
+	solver.options.OpenDevice = func(context.Context, http.RoundTripper, device.Profile, SolveRequest) (DeviceSession, func(), error) {
+		return &profiledCompletedDeviceSession{profile: profile}, func() {}, nil
+	}
+	outcome, err := solver.Solve(context.Background(), SolveRequest{SceneID: "scene", Prefix: "prefix1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !outcome.OK {
+		t.Fatalf("outcome=%+v", outcome)
+	}
+	transport.mu.Lock()
+	initUserAgent, verifyUserAgent := transport.initUserAgent, transport.verifyUserAgent
+	assetUserAgents := append([]string(nil), transport.assetUserAgents...)
+	transport.mu.Unlock()
+	if initUserAgent != profile.UserAgent || verifyUserAgent != profile.UserAgent || len(assetUserAgents) != 2 {
+		t.Fatalf("HTTP profile mismatch: init=%q verify=%q assets=%v", initUserAgent, verifyUserAgent, assetUserAgents)
+	}
+	for _, userAgent := range assetUserAgents {
+		if userAgent != profile.UserAgent {
+			t.Fatalf("asset used profile %q, want %q", userAgent, profile.UserAgent)
+		}
+	}
+	resolver.mu.Lock()
+	prepareIDs := append([]string(nil), resolver.prepareProfileIDs...)
+	buildIDs := append([]string(nil), resolver.buildProfileIDs...)
+	resolver.mu.Unlock()
+	if strings.Join(prepareIDs, ",") != profile.ProfileID || strings.Join(buildIDs, ",") != profile.ProfileID {
+		t.Fatalf("PE profiles: prepare=%v build=%v want=%q", prepareIDs, buildIDs, profile.ProfileID)
+	}
+}
+
+func TestSolverPreparesExactDynamicPESources(t *testing.T) {
 	transport := newSolverTransport(t, "gap")
 	transport.staticPath = "3.29.0/pe.058.77d5c01b1737016e.js"
 	resolver := &staticPEKeyResolver{profile: pe.RuntimeProfile{ArgumentKey: "dmmlums5zuewlgt7"}}
@@ -335,11 +447,11 @@ func TestSolverUsesResolvedDynamicPEKey(t *testing.T) {
 	paths := append([]string(nil), resolver.paths...)
 	resolver.mu.Unlock()
 	if len(paths) != 1 || paths[0] != transport.staticPath {
-		t.Fatalf("resolved paths=%v", paths)
+		t.Fatalf("prepared paths=%v", paths)
 	}
 }
 
-func TestSolverClassifiesPEKeyFailuresBeforeAssetsAndVerify(t *testing.T) {
+func TestSolverClassifiesPEPrepareFailuresBeforeVerify(t *testing.T) {
 	tests := []struct {
 		name string
 		err  error

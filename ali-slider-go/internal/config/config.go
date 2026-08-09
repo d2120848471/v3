@@ -17,15 +17,17 @@ import (
 )
 
 const (
-	DefaultSceneID = "1ug4aptr"
-	DefaultPrefix  = "fsgtmi"
+	DefaultSceneID           = "1ug4aptr"
+	DefaultPrefix            = "fsgtmi"
+	MaxDevicePrewarmCapacity = 4
+	MaxDeviceSessionReserve  = 4
 )
 
 // Config 只包含部署和算法边界；逐轮 SceneId、prefix、AaduaneId、proxy 不在此共享。
 type Config struct {
 	Host string
 	Port int
-	// MaxConcurrency 是兼容旧名：用于 Client 每 route/host 出站连接与预热资源边界，不限制 HTTP 请求进入。
+	// MaxConcurrency 是兼容旧名：用于 Client 每 route/host 出站连接与 PE 资源预算，不限制 HTTP 请求进入。
 	MaxConcurrency        int
 	Timeout               time.Duration
 	MinimumConfidence     float64
@@ -40,6 +42,7 @@ type Config struct {
 	AssetMaxBytes         int64
 	AssetMaxDimension     int
 	DevicePrewarmCapacity int
+	DeviceSessionReserve  int
 	V8RuntimeLibrary      string
 }
 
@@ -61,7 +64,8 @@ func Defaults() Config {
 		ArtifactRetention:     7 * 24 * time.Hour,
 		AssetMaxBytes:         8 << 20,
 		AssetMaxDimension:     16_384,
-		DevicePrewarmCapacity: 32,
+		DevicePrewarmCapacity: 4,
+		DeviceSessionReserve:  0,
 		V8RuntimeLibrary:      v8runtime.DefaultLibraryPath(),
 	}
 }
@@ -122,6 +126,9 @@ func Parse(args []string, getenv func(string) string) (Config, error) {
 	if cfg.DevicePrewarmCapacity, err = envInt(getenv, "ALI_SLIDER_DEVICE_PREWARM", cfg.DevicePrewarmCapacity); err != nil {
 		return Config{}, err
 	}
+	if cfg.DeviceSessionReserve, err = envInt(getenv, "ALI_SLIDER_DEVICE_RESERVE", cfg.DeviceSessionReserve); err != nil {
+		return Config{}, err
+	}
 	if cfg.V8RuntimeLibrary, err = envString(getenv, "ALI_SLIDER_V8_LIBRARY", cfg.V8RuntimeLibrary); err != nil {
 		return Config{}, err
 	}
@@ -129,7 +136,7 @@ func Parse(args []string, getenv func(string) string) (Config, error) {
 	set := flag.NewFlagSet("ali-slider-go", flag.ContinueOnError)
 	set.StringVar(&cfg.Host, "host", cfg.Host, "监听地址")
 	set.IntVar(&cfg.Port, "port", cfg.Port, "监听端口")
-	set.IntVar(&cfg.MaxConcurrency, "max-concurrency", cfg.MaxConcurrency, "Client 每 route/host 出站连接与预热资源上限（不限制 HTTP 请求数）")
+	set.IntVar(&cfg.MaxConcurrency, "max-concurrency", cfg.MaxConcurrency, "Client 每 route/host 出站连接与 PE 资源上限（不限制 HTTP 请求数）")
 	set.DurationVar(&cfg.Timeout, "timeout", cfg.Timeout, "单轮总超时")
 	set.Float64Var(&cfg.MinimumConfidence, "min-confidence", cfg.MinimumConfidence, "最低视觉置信度")
 	set.StringVar(&cfg.SceneID, "scene-id", cfg.SceneID, "默认 SceneId")
@@ -143,6 +150,7 @@ func Parse(args []string, getenv func(string) string) (Config, error) {
 	set.Int64Var(&cfg.AssetMaxBytes, "asset-max-bytes", cfg.AssetMaxBytes, "单张图片最大字节数")
 	set.IntVar(&cfg.AssetMaxDimension, "asset-max-dimension", cfg.AssetMaxDimension, "图片最大边长")
 	set.IntVar(&cfg.DevicePrewarmCapacity, "device-prewarm", cfg.DevicePrewarmCapacity, "设备会话预热容量")
+	set.IntVar(&cfg.DeviceSessionReserve, "device-reserve", cfg.DeviceSessionReserve, "租出期设备会话备用容量")
 	set.StringVar(&cfg.V8RuntimeLibrary, "v8-library", cfg.V8RuntimeLibrary, "设备与动态 PE 使用的内嵌 V8 动态库")
 	if err := set.Parse(args); err != nil {
 		return Config{}, err
@@ -199,8 +207,17 @@ func (c Config) Validate() error {
 	if c.AssetMaxBytes < 1 || c.AssetMaxBytes > 64<<20 || c.AssetMaxDimension < 1 || c.AssetMaxDimension > 16_384 {
 		return errors.New("invalid asset limits")
 	}
-	if c.DevicePrewarmCapacity < 0 || c.DevicePrewarmCapacity > c.MaxConcurrency {
-		return errors.New("device prewarm must be within 0..max-concurrency")
+	if c.DevicePrewarmCapacity < 0 || c.DevicePrewarmCapacity > min(c.MaxConcurrency, MaxDevicePrewarmCapacity) {
+		return fmt.Errorf("device prewarm must be within 0..min(max-concurrency,%d)", MaxDevicePrewarmCapacity)
+	}
+	if c.DeviceSessionReserve < 0 || c.DeviceSessionReserve > MaxDeviceSessionReserve {
+		return fmt.Errorf("device reserve must be within 0..%d", MaxDeviceSessionReserve)
+	}
+	if c.DevicePrewarmCapacity == 0 && c.DeviceSessionReserve != 0 {
+		return errors.New("device reserve requires a non-zero device prewarm capacity")
+	}
+	if c.DevicePrewarmCapacity+c.DeviceSessionReserve > MaxDevicePrewarmCapacity {
+		return fmt.Errorf("device prewarm plus reserve must not exceed %d", MaxDevicePrewarmCapacity)
 	}
 	if c.V8RuntimeLibrary == "" || len(c.V8RuntimeLibrary) > 4_096 || strings.ContainsRune(c.V8RuntimeLibrary, 0) || !utf8.ValidString(c.V8RuntimeLibrary) {
 		return errors.New("V8 runtime library path must contain 1..4096 valid UTF-8 bytes")

@@ -13,7 +13,11 @@ import (
 const (
 	// DefaultDeviceSessionMaxAge 限制预热会话的空闲时间，避免使用即将过期的设备配置。
 	DefaultDeviceSessionMaxAge = 20 * time.Second
-	maxDeviceSessionCapacity   = 32
+	maxDeviceSessionCapacity   = 4
+	maxDeviceSessionReserve    = 4
+	// 池内最多保留 4 个会话；同时限制 Open/Recycle，避免启动或
+	// 回收尖峰再次突破公开组件已验证的并发边界。
+	maxDeviceSessionOpenConcurrency = 4
 )
 
 // ErrDeviceSessionPoolClosed 表示已关闭的池不再接受 Prime。
@@ -70,27 +74,35 @@ type DeviceSessionOpener func(context.Context) (*device.Session, error)
 // RuntimeDeviceSessionOpener 支持保持动态 SDK VM 的设备会话。
 type RuntimeDeviceSessionOpener func(context.Context) (DeviceSession, error)
 
+// recyclableDeviceSession 可在同一宿主 runtime 内丢弃已完成的挑战环境并建立
+// 新环境。新一轮仍必须生成独立 session/token；失败时池会关闭它并冷建补货。
+type recyclableDeviceSession interface {
+	Recycle(context.Context) error
+}
+
 type preparedDeviceSession struct {
 	session   DeviceSession
 	createdAt time.Time
 }
 
-// DeviceSessionPool 持有一组已完成 Log1/2/3 的一次性设备会话。
+// DeviceSessionPool 持有一组已完成 Log1/2/3 的设备会话。
 //
 // 池跟踪尚未 release 的所有会话；Lease 成功后，调用方必须延迟调用 release。
 // 作为 opener 传入的函数必须遵守 context 取消。
 type DeviceSessionPool struct {
-	mu       sync.Mutex
-	capacity int
-	maxAge   time.Duration
-	key      DevicePoolKey
-	open     RuntimeDeviceSessionOpener
-	ready    []preparedDeviceSession
-	leased   map[DeviceSession]struct{}
-	pending  int
-	waiters  int
-	closed   bool
-	notify   chan struct{}
+	mu        sync.Mutex
+	capacity  int
+	reserve   int
+	maxAge    time.Duration
+	key       DevicePoolKey
+	open      RuntimeDeviceSessionOpener
+	openSlots chan struct{}
+	ready     []preparedDeviceSession
+	leased    map[DeviceSession]struct{}
+	pending   int
+	waiters   int
+	closed    bool
+	notify    chan struct{}
 
 	lifecycle context.Context
 	cancel    context.CancelFunc
@@ -117,17 +129,27 @@ func NewDeviceSessionPool(capacity int, maxAge time.Duration, key DevicePoolKey,
 			return session, err
 		}
 	}
-	return newRuntimeDeviceSessionPool(capacity, maxAge, key, runtimeOpen)
+	return newRuntimeDeviceSessionPool(capacity, 0, maxAge, key, runtimeOpen)
 }
 
 // NewRuntimeDeviceSessionPool 创建可保存动态 SDK VM 会话的同语义预热池。
 func NewRuntimeDeviceSessionPool(capacity int, maxAge time.Duration, key DevicePoolKey, open RuntimeDeviceSessionOpener) (*DeviceSessionPool, error) {
-	return newRuntimeDeviceSessionPool(capacity, maxAge, key, open)
+	return newRuntimeDeviceSessionPool(capacity, 0, maxAge, key, open)
 }
 
-func newRuntimeDeviceSessionPool(capacity int, maxAge time.Duration, key DevicePoolKey, open RuntimeDeviceSessionOpener) (*DeviceSessionPool, error) {
+// NewRuntimeDeviceSessionPoolWithReserve 在有会话租出时最多投机补足
+// reserve 个备用会话。Prime 仍只补 capacity，无租约时也会自动
+// 收缩回 capacity，避免长期空闲时保留额外 V8 Isolate。
+func NewRuntimeDeviceSessionPoolWithReserve(capacity, reserve int, maxAge time.Duration, key DevicePoolKey, open RuntimeDeviceSessionOpener) (*DeviceSessionPool, error) {
+	return newRuntimeDeviceSessionPool(capacity, reserve, maxAge, key, open)
+}
+
+func newRuntimeDeviceSessionPool(capacity, reserve int, maxAge time.Duration, key DevicePoolKey, open RuntimeDeviceSessionOpener) (*DeviceSessionPool, error) {
 	if capacity < 0 || capacity > maxDeviceSessionCapacity {
 		return nil, fmt.Errorf("device session capacity must be within 0..%d", maxDeviceSessionCapacity)
+	}
+	if reserve < 0 || reserve > maxDeviceSessionReserve || capacity == 0 && reserve != 0 || capacity+reserve > maxDeviceSessionCapacity {
+		return nil, fmt.Errorf("device session reserve must be within 0..%d, requires a non-zero capacity, and total live capacity must not exceed %d", maxDeviceSessionReserve, maxDeviceSessionCapacity)
 	}
 	if maxAge < 0 {
 		return nil, errors.New("device session max age must not be negative")
@@ -144,13 +166,17 @@ func newRuntimeDeviceSessionPool(capacity int, maxAge time.Duration, key DeviceP
 		}
 	}
 	lifecycle, cancel := context.WithCancel(context.Background())
-	return &DeviceSessionPool{
-		capacity: capacity, maxAge: maxAge, key: key, open: open,
-		ready: make([]preparedDeviceSession, 0, capacity), leased: make(map[DeviceSession]struct{}, capacity),
+	pool := &DeviceSessionPool{
+		capacity: capacity, reserve: reserve, maxAge: maxAge, key: key, open: open,
+		ready: make([]preparedDeviceSession, 0, capacity+reserve), leased: make(map[DeviceSession]struct{}, capacity+reserve),
 		notify: make(chan struct{}), lifecycle: lifecycle, cancel: cancel,
 		now: time.Now, closeSession: func(session *device.Session) { session.Close() },
 		closeRuntimeSession: func(session DeviceSession) { session.Close() },
-	}, nil
+	}
+	if capacity > 0 {
+		pool.openSlots = make(chan struct{}, min(capacity+reserve, maxDeviceSessionOpenConcurrency))
+	}
+	return pool, nil
 }
 
 // Prime 并行补足至容量。已就绪和正在构建的会话都会计入上限。
@@ -209,8 +235,9 @@ func (pool *DeviceSessionPool) Prime(ctx context.Context) error {
 // Lease 仅在 key 完全相等时租用新鲜预热会话。禁用、已关闭或
 // key 不等时通过本次请求的 opener 冷建，因此不会跨代理/画像复用。
 // 命中 key 但 ready 为空且 pending>0 时，Lease 在请求 context 内等待这批
-// 构建完成，避免与投机补货同时再冷建一整批。
-// 调用方必须且只需调用一次 release；它先关闭消费的会话，再按需异步补一个。
+// 构建完成；库存全部租出时等待现有槽位回收，避免额外 live Device VM。
+// 调用方必须且只需调用一次 release；可回收会话会重建新挑战环境，
+// 其他会话关闭后再按需异步补一个。
 func (pool *DeviceSessionPool) Lease(ctx context.Context, key DevicePoolKey, open DeviceSessionOpener) (*device.Session, func(), error) {
 	if open == nil {
 		return nil, nil, errors.New("device session opener is required")
@@ -295,7 +322,8 @@ func (pool *DeviceSessionPool) LeaseRuntime(ctx context.Context, key DevicePoolK
 			pool.broadcastLocked()
 		}
 
-		if pool.pending > 0 {
+		full := len(pool.ready)+len(pool.leased)+pool.pending >= pool.targetSizeLocked()
+		if pool.pending > 0 || full && len(pool.leased) > 0 {
 			notify := pool.notify
 			lifecycle := pool.lifecycle
 			pool.waiters++
@@ -325,7 +353,7 @@ func (pool *DeviceSessionPool) LeaseRuntime(ctx context.Context, key DevicePoolK
 
 		// 只有当前批次全部完成且仍无 ready 时，才由第一个抢到锁的
 		// Lease 预留一个冷建槽位。它随后填满 pending，其他 Lease 会继续等待。
-		reserved := len(pool.ready)+len(pool.leased)+pool.pending < pool.capacity
+		reserved := len(pool.ready)+len(pool.leased)+pool.pending < pool.targetSizeLocked()
 		if reserved {
 			pool.pending++
 			pool.tasks.Add(1)
@@ -370,7 +398,7 @@ func (pool *DeviceSessionPool) Close() {
 }
 
 func (pool *DeviceSessionPool) startRefillLocked() {
-	if pool.closed || pool.capacity == 0 || len(pool.ready)+len(pool.leased)+pool.pending >= pool.capacity {
+	if pool.closed || pool.capacity == 0 || len(pool.ready)+len(pool.leased)+pool.pending >= pool.targetSizeLocked() {
 		return
 	}
 	pool.pending++
@@ -384,17 +412,22 @@ func (pool *DeviceSessionPool) startRefillLocked() {
 	}()
 }
 
-// refillToCapacityLocked 只为当前可见缺口启动一批任务。单个任务失败后
+// refillToCapacityLocked 只为当前可见缺口启动一批任务。有租约时
+// 目标最多为 capacity+reserve，无租约时仍是 capacity。单个任务失败后
 // 不会在这里自行重试，因此无定时器、无无限补货循环。
 func (pool *DeviceSessionPool) refillToCapacityLocked() {
-	for !pool.closed && len(pool.ready)+len(pool.leased)+pool.pending < pool.capacity {
+	for !pool.closed && len(pool.ready)+len(pool.leased)+pool.pending < pool.targetSizeLocked() {
 		pool.startRefillLocked()
 	}
 }
 
+func (pool *DeviceSessionPool) targetSizeLocked() int {
+	return pool.capacity + min(pool.reserve, len(pool.leased))
+}
+
 func (pool *DeviceSessionPool) runOpen(ctx context.Context, open RuntimeDeviceSessionOpener, result chan<- error) {
 	defer pool.tasks.Done()
-	session, err := open(ctx)
+	session, err := pool.openRuntimeSession(ctx, open)
 	if err == nil && session == nil {
 		err = errors.New("device session opener returned nil")
 	}
@@ -404,7 +437,7 @@ func (pool *DeviceSessionPool) runOpen(ctx context.Context, open RuntimeDeviceSe
 
 	pool.mu.Lock()
 	pool.pending--
-	store := err == nil && !pool.closed && len(pool.ready)+len(pool.leased) < pool.capacity
+	store := err == nil && !pool.closed && len(pool.ready)+len(pool.leased) < pool.targetSizeLocked()
 	if store {
 		pool.ready = append(pool.ready, preparedDeviceSession{session: session, createdAt: pool.now()})
 	}
@@ -421,7 +454,7 @@ func (pool *DeviceSessionPool) runOpen(ctx context.Context, open RuntimeDeviceSe
 
 func (pool *DeviceSessionPool) leaseReservedCold(ctx, lifecycle context.Context, open RuntimeDeviceSessionOpener) (DeviceSession, func(), error) {
 	leaseContext, cancel := linkedDevicePoolContext(ctx, lifecycle)
-	session, err := open(leaseContext)
+	session, err := pool.openRuntimeSession(leaseContext, open)
 	if err == nil && session == nil {
 		err = errors.New("device session opener returned nil")
 	}
@@ -440,7 +473,7 @@ func (pool *DeviceSessionPool) leaseReservedCold(ctx, lifecycle context.Context,
 	if err == nil && callerContextErr != nil {
 		err = callerContextErr
 	}
-	store := err == nil && !closed && len(pool.ready)+len(pool.leased) < pool.capacity
+	store := err == nil && !closed && len(pool.ready)+len(pool.leased) < pool.targetSizeLocked()
 	if store {
 		pool.leased[session] = struct{}{}
 	}
@@ -511,23 +544,87 @@ func (pool *DeviceSessionPool) pooledRelease(session DeviceSession) func() {
 		once.Do(func() {
 			pool.mu.Lock()
 			_, owned := pool.leased[session]
+			recycler, recyclable := session.(recyclableDeviceSession)
+			recycle := recyclable && !pool.closed
 			if owned {
 				delete(pool.leased, session)
 				// 与 Close 在同一把锁下登记，保证 Close 不会在会话真正关闭前返回。
 				pool.tasks.Add(1)
+				// recycle 或“关闭旧会话→冷补货”都先占住容量，避免等待者
+				// 在 leased 删除与 refill 登记之间误走额外冷建。
+				pool.pending++
 				pool.broadcastLocked()
 			}
 			pool.mu.Unlock()
 			if !owned {
 				return
 			}
+			if recycle {
+				go pool.runRecycle(session, recycler)
+				return
+			}
 			defer pool.tasks.Done()
 			pool.closeOne(session)
 			pool.mu.Lock()
+			pool.pending--
 			pool.refillToCapacityLocked()
+			pool.broadcastLocked()
 			pool.mu.Unlock()
 		})
 	}
+}
+
+func (pool *DeviceSessionPool) runRecycle(session DeviceSession, recycler recyclableDeviceSession) {
+	defer pool.tasks.Done()
+	ctx, cancel := context.WithTimeout(pool.lifecycle, pool.key.Timeout)
+	err := pool.recycleRuntimeSession(ctx, recycler)
+	cancel()
+
+	pool.mu.Lock()
+	pool.pending--
+	store := err == nil && !pool.closed && len(pool.ready)+len(pool.leased) < pool.targetSizeLocked()
+	if store {
+		pool.ready = append(pool.ready, preparedDeviceSession{session: session, createdAt: pool.now()})
+	}
+	pool.broadcastLocked()
+	if !store {
+		pool.refillToCapacityLocked()
+	}
+	pool.mu.Unlock()
+	if !store {
+		pool.closeOne(session)
+	}
+}
+
+func (pool *DeviceSessionPool) openRuntimeSession(ctx context.Context, open RuntimeDeviceSessionOpener) (DeviceSession, error) {
+	if err := pool.acquireOpenSlot(ctx); err != nil {
+		return nil, err
+	}
+	defer pool.releaseOpenSlot()
+	return open(ctx)
+}
+
+func (pool *DeviceSessionPool) recycleRuntimeSession(ctx context.Context, recycler recyclableDeviceSession) error {
+	if err := pool.acquireOpenSlot(ctx); err != nil {
+		return err
+	}
+	defer pool.releaseOpenSlot()
+	return recycler.Recycle(ctx)
+}
+
+func (pool *DeviceSessionPool) acquireOpenSlot(ctx context.Context) error {
+	select {
+	case pool.openSlots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-pool.lifecycle.Done():
+		return ErrDeviceSessionPoolClosed
+	}
+}
+
+func (pool *DeviceSessionPool) releaseOpenSlot() {
+	<-pool.openSlots
 }
 
 // broadcastLocked 在池状态世代变化时关闭旧通知通道并创建新通道。
