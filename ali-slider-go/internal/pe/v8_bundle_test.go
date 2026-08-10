@@ -71,6 +71,17 @@ func TestExtractV8BridgeCoreRejectsChangedBoundaries(t *testing.T) {
 	}
 }
 
+func TestExtractV8BridgeCoreAcceptsCRLF(t *testing.T) {
+	source := strings.ReplaceAll("header\nconst X = 1;\n\nexport {\n  X,\n};\n", "\n", "\r\n")
+	core, err := extractV8BridgeCore([]byte(source), "const X")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if core != "const X = 1;" {
+		t.Fatalf("core=%q", core)
+	}
+}
+
 func TestV8BundlesParseInNativeEngine(t *testing.T) {
 	path := os.Getenv("ALI_SLIDER_V8_TEST_LIBRARY")
 	if path == "" {

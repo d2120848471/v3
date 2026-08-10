@@ -303,7 +303,7 @@ true;
 `
 
 func extractV8BridgeCore(source []byte, startMarker string) (string, error) {
-	text := string(source)
+	text := strings.ReplaceAll(string(source), "\r\n", "\n")
 	start := strings.Index(text, startMarker)
 	if start < 0 {
 		return "", fmt.Errorf("V8 bridge start marker %q is missing", startMarker)
