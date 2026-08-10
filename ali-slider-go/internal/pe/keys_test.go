@@ -242,6 +242,37 @@ func TestKeyResolverPrepareCachesProfileFailureForV8Fallback(t *testing.T) {
 	}
 }
 
+func TestKeyResolverProfileCacheStats(t *testing.T) {
+	if got := (*KeyResolver)(nil).ProfileCacheStats(); got != (ProfileCacheStats{}) {
+		t.Fatalf("nil resolver stats=%+v", got)
+	}
+
+	now := time.Date(2026, time.August, 10, 2, 0, 0, 0, time.UTC)
+	resolver := NewKeyResolver("")
+	resolver.now = func() time.Time { return now }
+	resolver.keys = map[string]cachedRuntimeProfile{
+		"source-only": {
+			sampledAt: now,
+		},
+		"compatible": {
+			profile: RuntimeProfile{PureGoCompatible: true}, profileSampled: true, sampledAt: now,
+		},
+		"failed": {
+			profileSampled: true, profileErr: ErrUnsupportedPE, sampledAt: now,
+		},
+		"incompatible": {
+			profileSampled: true, sampledAt: now,
+		},
+		"expired": {
+			profileSampled: true, sampledAt: now.Add(-keyProfileCacheTTL),
+		},
+	}
+	want := ProfileCacheStats{SourcePaths: 4, Sampled: 3, Compatible: 1, Failed: 1}
+	if got := resolver.ProfileCacheStats(); got != want {
+		t.Fatalf("stats=%+v, want %+v", got, want)
+	}
+}
+
 type blockingPETransport struct {
 	base    *scriptTransport
 	started chan string
