@@ -195,7 +195,7 @@ func (resolver *KeyResolver) Prepare(ctx context.Context, transport http.RoundTr
 	if err := resolver.prepareRuntimeSources(ctx, transport, profile, path); err != nil {
 		return err
 	}
-	_, err = resolver.ensureRuntimeProfile(ctx, transport, profile, path)
+	_, _ = resolver.ensureRuntimeProfile(ctx, transport, profile, path)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
 	}
