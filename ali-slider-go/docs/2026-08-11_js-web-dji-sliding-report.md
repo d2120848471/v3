@@ -1,5 +1,7 @@
 # DJI SLIDING 拖动验证码适配报告
 
+> 后续性能优化已让 `Date/performance/event.timeStamp` 同步推进逻辑轨迹，回放循环不使用真实 timer/macrotask；无 Node 的 Linux ARM64 生产 V8 单挑战已通过。本报告中的 `5.58s` 保留为适配期历史快照，新数据与限制见 [TRACELESS / SLIDING 运行时性能优化报告](./2026-08-11_js-web-captcha-runtime-performance-report.md)。
+
 > 风险提示：本报告只覆盖用户明确授权的 DJI 登录页验证码观察、阿里验证码公开组件单次探针和本地项目兼容修复。全过程未输入或提交 DJI 账号、手机号、短信验证码、Cookie 或登录请求，未调用 DJI 短信接口，也未保存 `CertifyId`、DeviceToken、`securityToken` 或 `captchaVerifyParam` 原值。
 
 | 项目 | 值 |

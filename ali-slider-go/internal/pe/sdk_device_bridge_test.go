@@ -182,6 +182,45 @@ func TestNodeSDKBridgeTracelessContracts(t *testing.T) {
       outsideRejected = true;
     }
     globalThis.fetch = originalFetch;
+    let tracelessDelayBeforeSuccess = null;
+    const tracelessContext = bridge.makeBrowserContext({
+      prefix: "1ohgtl",
+      region: "cn",
+      timeoutMs: 2000,
+      networkEnabled: true,
+      deviceProfile: %s,
+      mode: "challenge-worker",
+    }, () => {});
+    tracelessContext.initAliyunCaptcha = (options) => {
+      tracelessDelayBeforeSuccess = options.delayBeforeSuccess;
+      tracelessContext.document.querySelector(options.button).addEventListener(
+        "click",
+        () => {
+          tracelessContext.__ALI_SDK_INIT__.consumed = true;
+          tracelessContext.__ALI_SDK_INIT__.observedDeviceToken = "fixture-device-token";
+          tracelessContext.__ALI_SDK_INIT__.verifyResult = {
+            verifyCode: "T001",
+            verifyResult: true,
+            securityToken: "fixture-security-token",
+            certifyId: "fixture-certify",
+          };
+          options.success("fixture-success");
+        },
+      );
+      options.getInstance({destroy() {}});
+    };
+    const tracelessResult = await bridge.runTracelessCaptcha(
+      tracelessContext,
+      {},
+      {prefix:"1ohgtl", timeoutMs:2000},
+      {
+        sceneId:"wa3238du",
+        certifyId:"fixture-certify",
+        staticPath:"3.29.0/pe.072.64e9154e3053635f.js",
+        captchaType:"TRACELESS",
+        deviceToken:"fixture-device-token",
+      },
+    );
     const secret = "must-not-reflect";
     const fixedFailure = bridge.safeDeviceBridgeFailureMessage(new Error(secret));
     const codedError = new Error(secret);
@@ -230,13 +269,18 @@ func TestNodeSDKBridgeTracelessContracts(t *testing.T) {
       styleAssignmentString,
       adjacentBeforeBegin,
       duplicateVerifyBlocked,
+      tracelessDelayBeforeSuccess,
+      tracelessResultValid: (
+        tracelessResult.captchaVerifyParam === "fixture-success"
+        && tracelessResult.deviceToken === "fixture-device-token"
+      ),
       reflected: (
         fixedFailure.includes(secret)
         || codedFailure.includes(secret)
         || slidingCodedFailure.includes(secret)
       ),
     }));
-  `, bridgeURL, profileJSON, profileJSON)
+  `, bridgeURL, profileJSON, profileJSON, profileJSON)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	output, err := exec.CommandContext(ctx, nodePath, "--input-type=module", "--eval", script).CombinedOutput()
@@ -260,20 +304,22 @@ func TestNodeSDKBridgeTracelessContracts(t *testing.T) {
 			SecurityToken string `json:"securityToken"`
 			CertifyID     string `json:"certifyId"`
 		} `json:"verify"`
-		VerifyMismatchRejected bool   `json:"verifyMismatchRejected"`
-		InvalidRejected        bool   `json:"invalidRejected"`
-		LinkLoaded             bool   `json:"linkLoaded"`
-		FetchedURL             string `json:"fetchedURL"`
-		OutsideRejected        bool   `json:"outsideRejected"`
-		FixedFailure           string `json:"fixedFailure"`
-		CodedFailure           string `json:"codedFailure"`
-		SlidingCodedFailure    string `json:"slidingCodedFailure"`
-		ElementEventCount      int    `json:"elementEventCount"`
-		StyleDefaultEmpty      bool   `json:"styleDefaultEmpty"`
-		StyleAssignmentString  bool   `json:"styleAssignmentString"`
-		AdjacentBeforeBegin    bool   `json:"adjacentBeforeBegin"`
-		DuplicateVerifyBlocked bool   `json:"duplicateVerifyBlocked"`
-		Reflected              bool   `json:"reflected"`
+		VerifyMismatchRejected      bool   `json:"verifyMismatchRejected"`
+		InvalidRejected             bool   `json:"invalidRejected"`
+		LinkLoaded                  bool   `json:"linkLoaded"`
+		FetchedURL                  string `json:"fetchedURL"`
+		OutsideRejected             bool   `json:"outsideRejected"`
+		FixedFailure                string `json:"fixedFailure"`
+		CodedFailure                string `json:"codedFailure"`
+		SlidingCodedFailure         string `json:"slidingCodedFailure"`
+		ElementEventCount           int    `json:"elementEventCount"`
+		StyleDefaultEmpty           bool   `json:"styleDefaultEmpty"`
+		StyleAssignmentString       bool   `json:"styleAssignmentString"`
+		AdjacentBeforeBegin         bool   `json:"adjacentBeforeBegin"`
+		DuplicateVerifyBlocked      bool   `json:"duplicateVerifyBlocked"`
+		TracelessDelayBeforeSuccess *bool  `json:"tracelessDelayBeforeSuccess"`
+		TracelessResultValid        bool   `json:"tracelessResultValid"`
+		Reflected                   bool   `json:"reflected"`
 	}
 	if err := json.Unmarshal(output, &result); err != nil {
 		t.Fatalf("decode Node SDK bridge result: %v: %q", err, output)
@@ -286,6 +332,9 @@ func TestNodeSDKBridgeTracelessContracts(t *testing.T) {
 	}
 	if result.ParsedSlidingMode != "sliding" || result.ParsedSlidingType != "SLIDING" || result.ParsedSlidingDistance != 370 || result.ElementEventCount != 1 || !result.StyleDefaultEmpty || !result.StyleAssignmentString || !result.AdjacentBeforeBegin || !result.DuplicateVerifyBlocked {
 		t.Fatalf("sliding completion/DOM contract=%+v", result)
+	}
+	if result.TracelessDelayBeforeSuccess == nil || *result.TracelessDelayBeforeSuccess || !result.TracelessResultValid {
+		t.Fatalf("traceless fast-success contract=%+v", result)
 	}
 	if result.Verify.VerifyCode != "T001" || !result.Verify.VerifyResult || result.Verify.SecurityToken == "" || result.Verify.CertifyID != "fixture-certify" || !result.VerifyMismatchRejected {
 		t.Fatalf("official Verify contract=%+v", result)
@@ -333,6 +382,14 @@ func TestNodeSDKBridgeSlidingInteractionContract(t *testing.T) {
     let endCount = 0;
     let lastX = 0;
     let verifyFetchCount = 0;
+    const logicalDateSamples = [];
+    const logicalPerformanceSamples = [];
+    const eventTimeSamples = [];
+    const recordClock = (event) => {
+      logicalDateSamples.push(context.Date.now());
+      logicalPerformanceSamples.push(context.performance.now());
+      eventTimeSamples.push(event.timeStamp);
+    };
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async () => {
       verifyFetchCount += 1;
@@ -357,15 +414,18 @@ func TestNodeSDKBridgeSlidingInteractionContract(t *testing.T) {
         slider.addEventListener("mousedown", (event) => {
           startCount += 1;
           lastX = event.clientX;
+          recordClock(event);
           event.preventDefault();
         });
         context.document.addEventListener("mousemove", (event) => {
           moveCount += 1;
           lastX = event.clientX;
+          recordClock(event);
         });
         context.document.addEventListener("mouseup", (event) => {
           endCount += 1;
           lastX = event.clientX;
+          recordClock(event);
           const verifyXHR = new context.XMLHttpRequest();
           verifyXHR.open("POST", "https://1ulc59.captcha-open.aliyuncs.com/", true);
           verifyXHR.onload = () => {
@@ -391,6 +451,7 @@ func TestNodeSDKBridgeSlidingInteractionContract(t *testing.T) {
         DeviceToken: context.__ALI_SDK_INIT__.observedDeviceToken || "fixture-device-token",
       }).toString());
     };
+    const startedAt = performance.now();
     const result = await bridge.runSlidingCaptcha(
       context,
       {},
@@ -405,9 +466,9 @@ func TestNodeSDKBridgeSlidingInteractionContract(t *testing.T) {
         handleWidth:48,
         track:[
           {type:"touchstart",x:0,y:1,dt:0,force:0.6,radiusX:12,radiusY:11},
-          {type:"touchmove",x:180,y:2,dt:10,force:0.62,radiusX:13,radiusY:12},
-          {type:"touchmove",x:370,y:1,dt:10,force:0.58,radiusX:12,radiusY:12},
-          {type:"touchend",x:370,y:1,dt:10,force:0.55,radiusX:12,radiusY:11},
+          {type:"touchmove",x:180,y:2,dt:600,force:0.62,radiusX:13,radiusY:12},
+          {type:"touchmove",x:370,y:1,dt:600,force:0.58,radiusX:12,radiusY:12},
+          {type:"touchend",x:370,y:1,dt:600,force:0.55,radiusX:12,radiusY:11},
         ],
       },
     );
@@ -428,6 +489,15 @@ func TestNodeSDKBridgeSlidingInteractionContract(t *testing.T) {
       },
       actions: requests.map((request) => new URLSearchParams(request.body).get("Action")),
       verifyFetchCount,
+      wallElapsedMs: performance.now() - startedAt,
+      zeroWallSourceContract: !/(?:wait|nextHostTurn|setTimeout)\s*\(/.test(
+        bridge.replaySlidingTrack.toString(),
+      ),
+      logicalDateDeltaMs: logicalDateSamples.at(-1) - logicalDateSamples[0],
+      logicalPerformanceDeltaMs: (
+        logicalPerformanceSamples.at(-1) - logicalPerformanceSamples[0]
+      ),
+      eventTimeDeltaMs: eventTimeSamples.at(-1) - eventTimeSamples[0],
     }));
   `, bridgeURL, profileJSON)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -449,8 +519,13 @@ func TestNodeSDKBridgeSlidingInteractionContract(t *testing.T) {
 			Sign           bool     `json:"sign"`
 			TokenMatches   bool     `json:"tokenMatches"`
 		} `json:"decoded"`
-		Actions          []string `json:"actions"`
-		VerifyFetchCount int      `json:"verifyFetchCount"`
+		Actions                   []string `json:"actions"`
+		VerifyFetchCount          int      `json:"verifyFetchCount"`
+		WallElapsedMS             float64  `json:"wallElapsedMs"`
+		ZeroWallSourceContract    bool     `json:"zeroWallSourceContract"`
+		LogicalDateDeltaMS        float64  `json:"logicalDateDeltaMs"`
+		LogicalPerformanceDeltaMS float64  `json:"logicalPerformanceDeltaMs"`
+		EventTimeDeltaMS          float64  `json:"eventTimeDeltaMs"`
 	}
 	if err := json.Unmarshal(output, &result); err != nil {
 		t.Fatalf("decode Node sliding result: %v: %q", err, output)
@@ -464,4 +539,17 @@ func TestNodeSDKBridgeSlidingInteractionContract(t *testing.T) {
 	if strings.Join(result.Actions, ",") != "InitCaptchaV3,VerifyCaptchaV3" || result.VerifyFetchCount != 1 {
 		t.Fatalf("request actions=%v", result.Actions)
 	}
+	if !result.ZeroWallSourceContract || result.WallElapsedMS >= 250 {
+		t.Fatalf("sliding replay used logical duration as wall time: %.0fms", result.WallElapsedMS)
+	}
+	if result.LogicalDateDeltaMS < 1_800 || result.LogicalDateDeltaMS >= 1_900 || result.LogicalPerformanceDeltaMS < 1_800 || result.LogicalPerformanceDeltaMS >= 1_900 || result.EventTimeDeltaMS != 1_800 {
+		t.Fatalf("sliding logical clock mismatch: %+v", result)
+	}
+	t.Logf(
+		"SLIDING zero-wall replay: wall=%.1fms logicalDate=%.1fms logicalPerformance=%.1fms eventTime=%.1fms",
+		result.WallElapsedMS,
+		result.LogicalDateDeltaMS,
+		result.LogicalPerformanceDeltaMS,
+		result.EventTimeDeltaMS,
+	)
 }

@@ -144,7 +144,7 @@ func runV8ContextProbe(
 			t.Errorf("Library.Close() error = %v", err)
 		}
 	}()
-	host := newV8HostHandler(nil, sources.Entropy, false)
+	host := newV8HostHandler(nil, sources.Entropy, false, nil)
 	engine, err := library.NewWithHost(host)
 	if err != nil {
 		t.Fatal(err)

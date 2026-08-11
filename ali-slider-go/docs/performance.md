@@ -194,6 +194,12 @@ ALI_SLIDER_PERF=1 GOMAXPROCS=16 \
 
 完整 Evidence → Finding → Path、时间线和验收边界见 [2026-08-09 性能证据](./evidence/validation-2026-08-09-performance.md)。
 
+## 2026-08-11 TRACELESS / SLIDING 小样本诊断
+
+阶段计时证明，自动读取 `CaptchaType` 不是 4–5 秒的瓶颈：测试冷启动和外部 Init/资源/Verify 是公共成本，SLIDING 旧实现还把 86 点、2233ms 的逻辑轨迹按真实墙钟逐点休眠。最终实现不再做轨迹 timer/macrotask 等待，而是同步推进验证码上下文的 `Date.now()`、`performance.now()` 和事件 `timeStamp`；1800ms 逻辑轨迹离线约 `2.6–3.0ms`。TRACELESS 同时关闭官方 success 延迟。
+
+无 Node 的 Linux ARM64 容器加载生产 V8 `149.4.0` wrapper 后，各执行一个真实挑战：SLIDING `success=1`、类型阶段 `1390ms`、完整 Solve `2750ms`；TRACELESS `success=1`、类型阶段 `1168ms`、完整 Solve `2488ms`。这是两个单样本，不是成功率或 P95/P99；同 engine 动态资源缓存命中收益仍未单独测量。完整阶段、缓存边界、失败实验与命令见 [2026-08-11 运行时性能优化报告](./2026-08-11_js-web-captcha-runtime-performance-report.md)。
+
 ## 2026-08-08 历史功能 smoke
 
 当时的动态修复快照只执行 1 个新挑战、并发 1、一次 Solve、零重试：严格成功 `1/1`，墙钟 `1579ms`。该数字属于本次内嵌 V8 迁移之前的运行时，只作历史对照，不是当前均值、P50、P95 或 P99。

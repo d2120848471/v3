@@ -179,7 +179,13 @@ func (resolver *KeyResolver) newV8Engine(
 	if err != nil {
 		return nil, err
 	}
-	engine, err := library.NewWithHost(newV8HostHandler(transport, entropy, networkEnabled))
+	var assetCache *v8AssetCache
+	if networkEnabled {
+		// Cache 生命周期绑定当前 Device engine；Recycle 会复用，同一份静态
+		// 字节不会跨代理、画像或独立 Isolate 混用。
+		assetCache = newV8AssetCache()
+	}
+	engine, err := library.NewWithHost(newV8HostHandler(transport, entropy, networkEnabled, assetCache))
 	if err != nil {
 		return nil, fmt.Errorf("%w: create V8 runtime: %v", ErrKeyRuntime, err)
 	}

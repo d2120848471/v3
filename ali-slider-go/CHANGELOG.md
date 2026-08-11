@@ -45,6 +45,8 @@
 
 ### Changed
 
+- TRACELESS 显式关闭官方 success 回调延迟；SLIDING 让 `Date.now()`、`performance.now()` 与事件 `timeStamp` 同步推进逻辑轨迹，回放循环只清空 microtask，不使用真实 timer/macrotask 等待。
+- Device V8 engine 增加30秒、8项的版本化组件 JS/CSS 响应缓存；仅允许指定阿里 CDN 动态资源路径的安全 GET，挑战 API、Cookie/Authorization、不可缓存响应及不同代理/画像/Isolate 均严格隔离。
 - 生产设备/动态 PE 从 Node 子进程迁到同进程 V8：Device 从 Open 到 Complete 保持同一 Isolate；PE 的首次画像与不兼容 fallback 使用单独禁网 context，已完整差分的分片使用纯 Go Builder；Node 仅保留为可选测试 oracle。
 - Device Complete 后可回收外层 V8 Isolate，下一轮仍重建独立浏览器 context、session ID、DeviceToken 和 FeiLin 状态；回收失败时关闭并冷补货。
 - PE 构建改为逐精确 `StaticPath` 的动态门禁：首次/到期时使用当前 V8 采样并与纯 Go 逐字段差分，仅完整一致才启用纯 Go 快路，其余保留 V8 fallback。

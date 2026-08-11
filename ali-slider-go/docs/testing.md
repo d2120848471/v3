@@ -335,6 +335,8 @@ env \
 
 2026-08-11 的最终干净脱敏快照输出为 `SLIDING completed: code=T001 result=true requests=7`，用例约 `5.58s`。`requests=7` 是 bridge 记录数，包含 Device、被本地绑定的 SDK Init、动态资源和真实 Verify，不等于 7 次网络 Verify；运行时严格确认 `InitCaptchaV3` 与 `VerifyCaptchaV3` 记录各出现一次且顺序正确，SDK Init 不产生第二次真实网络 Init。该最终快照的单次结果只证明当前 `SceneId=159tlu75`、`prefix=1ulc59` 的组件合同可以完成；开发期 first-divergence 探针也不构成成功率、性能或容量报告。生产 `slider.Client` 使用同进程 V8；本机没有可加载的 Darwin V8 wrapper，因此在线部分验证 Node bridge，V8 completion 分流和 Go stage 由离线测试覆盖。
 
+上述 `5.58s` 是适配完成时的历史 cold smoke，不随之后的性能改动重写。后续 first-divergence 先把约 1.79–2.86 秒真实轨迹 sleep 压到 600ms；最终确认早期 zero-wall 失败是 `event.timeStamp` 与 SDK `Date/performance` 时钟不一致。修正为三者同步推进后，轨迹循环不再调用 timer/macrotask，1800ms 逻辑轨迹离线约 `2.6–3.0ms`。无 Node 的 Linux ARM64 生产 V8 单挑战得到 SLIDING `success=1 / stage=1390ms / total=2750ms`，TRACELESS `success=1 / stage=1168ms / total=2488ms`。完整方法、TRACELESS fast-success、缓存边界和限制见[运行时性能优化报告](./2026-08-11_js-web-captcha-runtime-performance-report.md)。
+
 ## 2026-08-07 历史授权候选批次结果
 
 历史候选批次已在明确授权下恰好执行一次，参数和结果如下；它先于本次 Device/PE 动态边界修复，不得外推到当前架构：

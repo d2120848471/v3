@@ -10,7 +10,11 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/d2120848471/v3/ali-slider-go/internal/runtimekit"
 	"github.com/d2120848471/v3/ali-slider-go/internal/v8runtime"
@@ -20,7 +24,28 @@ const (
 	v8HostRequestMaxBytes = 4 << 20
 	v8HostHeaderMaxBytes  = 64 << 10
 	v8RandomMaxBytes      = 65_536
+	v8AssetCacheTTL       = 30 * time.Second
+	v8AssetCacheMaxItems  = 8
 )
+
+type v8AssetCacheEntry struct {
+	response  v8HostHTTPResponse
+	expiresAt time.Time
+}
+
+// v8AssetCache 只保存公开 CDN 静态响应字节。挑战 Init/Verify、token、DOM 和
+// VM 状态都不进入缓存；短 TTL 仅覆盖 Device pool 的热回收窗口。
+type v8AssetCache struct {
+	mu      sync.Mutex
+	now     func() time.Time
+	entries map[string]v8AssetCacheEntry
+}
+
+func newV8AssetCache() *v8AssetCache {
+	return &v8AssetCache{
+		now: time.Now, entries: make(map[string]v8AssetCacheEntry),
+	}
+}
 
 type v8HostRequest struct {
 	Op      string             `json:"op"`
@@ -49,9 +74,10 @@ func newV8HostHandler(
 	transport http.RoundTripper,
 	entropy runtimekit.Entropy,
 	networkEnabled bool,
+	assetCache *v8AssetCache,
 ) v8runtime.HostFunc {
 	return func(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
-		return handleV8HostRequest(ctx, transport, entropy, networkEnabled, raw)
+		return handleV8HostRequestWithCache(ctx, transport, entropy, networkEnabled, assetCache, raw)
 	}
 }
 
@@ -60,6 +86,17 @@ func handleV8HostRequest(
 	transport http.RoundTripper,
 	entropy runtimekit.Entropy,
 	networkEnabled bool,
+	raw json.RawMessage,
+) (json.RawMessage, error) {
+	return handleV8HostRequestWithCache(ctx, transport, entropy, networkEnabled, nil, raw)
+}
+
+func handleV8HostRequestWithCache(
+	ctx context.Context,
+	transport http.RoundTripper,
+	entropy runtimekit.Entropy,
+	networkEnabled bool,
+	assetCache *v8AssetCache,
 	raw json.RawMessage,
 ) (json.RawMessage, error) {
 	if ctx == nil {
@@ -101,7 +138,24 @@ func handleV8HostRequest(
 		if !networkEnabled || transport == nil {
 			return nil, errors.New("V8 HTTP host is disabled")
 		}
-		response, err := roundTripV8HostRequest(ctx, transport, *request.Request)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		requestValue := *request.Request
+		var response v8HostHTTPResponse
+		var err error
+		if cacheKey, ok := cacheableV8AssetRequest(requestValue); ok && assetCache != nil {
+			if cached, hit := assetCache.get(cacheKey); hit {
+				response = cached
+			} else {
+				response, err = roundTripV8HostRequest(ctx, transport, requestValue)
+				if err == nil {
+					assetCache.put(cacheKey, response)
+				}
+			}
+		} else {
+			response, err = roundTripV8HostRequest(ctx, transport, requestValue)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -110,6 +164,128 @@ func handleV8HostRequest(
 	default:
 		return nil, errors.New("V8 host operation is unsupported")
 	}
+}
+
+func cacheableV8AssetRequest(input v8HostHTTPRequest) (string, bool) {
+	method := strings.ToUpper(strings.TrimSpace(input.Method))
+	if method == "" {
+		method = http.MethodGet
+	}
+	if method != http.MethodGet || input.Body != nil || input.Redirect != "manual" {
+		return "", false
+	}
+	parsed, err := allowedV8NetworkURL(input.URL)
+	if err != nil || !strings.EqualFold(parsed.Hostname(), keyPEHost) && !strings.EqualFold(parsed.Hostname(), keyCaptchaAssetHost) {
+		return "", false
+	}
+	assetPath := parsed.EscapedPath()
+	assetSuffix := strings.ToLower(assetPath)
+	if !strings.HasPrefix(assetPath, "/captcha-frontend/dynamicJS/") ||
+		!strings.HasSuffix(assetSuffix, ".js") && !strings.HasSuffix(assetSuffix, ".css") {
+		return "", false
+	}
+	headerLines := make([]string, 0, len(input.Headers))
+	for name, value := range input.Headers {
+		normalizedName := strings.ToLower(strings.TrimSpace(name))
+		if normalizedName == "authorization" || normalizedName == "cookie" {
+			return "", false
+		}
+		headerLines = append(headerLines, normalizedName+"\x00"+value)
+	}
+	sort.Strings(headerLines)
+	return parsed.String() + "\n" + strings.Join(headerLines, "\n"), true
+}
+
+func (cache *v8AssetCache) get(key string) (v8HostHTTPResponse, bool) {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	now := cache.now()
+	cache.evictExpiredLocked(now)
+	if cached, ok := cache.entries[key]; ok {
+		return cloneV8HostHTTPResponse(cached.response), true
+	}
+	return v8HostHTTPResponse{}, false
+}
+
+func (cache *v8AssetCache) put(key string, response v8HostHTTPResponse) {
+	ttl := cacheableV8AssetResponseTTL(response)
+	if ttl <= 0 {
+		return
+	}
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	now := cache.now()
+	cache.evictExpiredLocked(now)
+	if _, exists := cache.entries[key]; !exists {
+		cache.evictOneLocked()
+	}
+	cache.entries[key] = v8AssetCacheEntry{
+		response:  cloneV8HostHTTPResponse(response),
+		expiresAt: now.Add(ttl),
+	}
+}
+
+func cacheableV8AssetResponseTTL(response v8HostHTTPResponse) time.Duration {
+	if response.Status != http.StatusOK || strings.TrimSpace(response.Headers["set-cookie"]) != "" {
+		return 0
+	}
+	for _, field := range strings.Split(response.Headers["vary"], ",") {
+		if strings.TrimSpace(field) == "*" {
+			return 0
+		}
+	}
+	ttl := v8AssetCacheTTL
+	for _, directive := range strings.Split(strings.ToLower(response.Headers["cache-control"]), ",") {
+		directive = strings.TrimSpace(directive)
+		name, value, hasValue := strings.Cut(directive, "=")
+		switch strings.TrimSpace(name) {
+		case "no-store", "no-cache", "private":
+			return 0
+		case "max-age":
+			if !hasValue {
+				return 0
+			}
+			seconds, err := strconv.ParseInt(strings.Trim(value, `"`), 10, 64)
+			if err != nil || seconds <= 0 {
+				return 0
+			}
+			if seconds < int64(ttl/time.Second) {
+				ttl = time.Duration(seconds) * time.Second
+			}
+		}
+	}
+	return ttl
+}
+
+func cloneV8HostHTTPResponse(response v8HostHTTPResponse) v8HostHTTPResponse {
+	cloned := response
+	cloned.Headers = make(map[string]string, len(response.Headers))
+	for name, value := range response.Headers {
+		cloned.Headers[name] = value
+	}
+	return cloned
+}
+
+func (cache *v8AssetCache) evictExpiredLocked(now time.Time) {
+	for key, entry := range cache.entries {
+		if !now.Before(entry.expiresAt) {
+			delete(cache.entries, key)
+		}
+	}
+}
+
+func (cache *v8AssetCache) evictOneLocked() {
+	if len(cache.entries) < v8AssetCacheMaxItems {
+		return
+	}
+	var oldestKey string
+	var oldestExpiry time.Time
+	for key, entry := range cache.entries {
+		if oldestKey == "" || entry.expiresAt.Before(oldestExpiry) {
+			oldestKey, oldestExpiry = key, entry.expiresAt
+		}
+	}
+	delete(cache.entries, oldestKey)
 }
 
 func allowedV8NetworkURL(value string) (*url.URL, error) {

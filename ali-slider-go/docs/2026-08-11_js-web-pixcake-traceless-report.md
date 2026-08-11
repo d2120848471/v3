@@ -1,5 +1,7 @@
 # PixCake TRACELESS 无痕验证码适配报告
 
+> 后续性能优化已显式关闭官方 success 延迟，并在无 Node 的 Linux ARM64 生产 V8 中完成单挑战验证；本报告中的适配期单次结果保留为历史快照。新数据与限制见 [TRACELESS / SLIDING 运行时性能优化报告](./2026-08-11_js-web-captcha-runtime-performance-report.md)。
+
 > 风险提示：本报告只覆盖用户明确授权的 PixCake 页面观察、阿里验证码公开组件探针和本地项目兼容修复。全过程未提交手机号、短信验证码、Cookie 或站点登录请求，未调用 PixCake 短信接口，也未保存 `CertifyId`、DeviceToken、`securityToken` 或业务提交参数原值。
 
 | 项目 | 值 |

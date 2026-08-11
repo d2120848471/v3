@@ -131,6 +131,7 @@ func TestOnlineNodeTracelessRuntime(t *testing.T) {
 	defer cancel()
 	resolver := newNodeKeyResolver(os.Getenv("ALI_SLIDER_PE_KEY_NODE"))
 	defer resolver.Close()
+	startedAt := time.Now()
 	session, err := resolver.OpenDevice(ctx, transport, profile, DeviceRuntimeOptions{
 		Prefix: prefix, Region: "cn", Timeout: 12 * time.Second,
 		GatherCostMin: 180, GatherCostMax: 260, FirstTouchAgeMin: 650, FirstTouchAgeMax: 850,
@@ -139,6 +140,7 @@ func TestOnlineNodeTracelessRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	openedAt := time.Now()
 	defer session.Close()
 	deviceToken, err := session.InitToken()
 	if err != nil {
@@ -148,6 +150,7 @@ func TestOnlineNodeTracelessRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	initializedAt := time.Now()
 	result, err := session.SolveTraceless(ctx, input)
 	if err != nil {
 		session.mu.Lock()
@@ -164,7 +167,15 @@ func TestOnlineNodeTracelessRuntime(t *testing.T) {
 	if !result.Succeeded() || result.CertifyID != input.CertifyID {
 		t.Fatal("traceless result contract mismatch")
 	}
-	t.Logf("TRACELESS completed: code=%s result=%t requests=%d", result.VerifyCode, result.VerifyResult, len(result.RequestActions))
+	solvedAt := time.Now()
+	t.Logf(
+		"TRACELESS completed: code=%s result=%t requests=%d open=%s init=%s solve=%s total=%s",
+		result.VerifyCode, result.VerifyResult, len(result.RequestActions),
+		openedAt.Sub(startedAt).Round(time.Millisecond),
+		initializedAt.Sub(openedAt).Round(time.Millisecond),
+		solvedAt.Sub(initializedAt).Round(time.Millisecond),
+		solvedAt.Sub(startedAt).Round(time.Millisecond),
+	)
 }
 
 // TestOnlineNodeSlidingRuntime 只访问阿里验证码公开 Init/Verify/资源/采集端点；
@@ -193,6 +204,7 @@ func TestOnlineNodeSlidingRuntime(t *testing.T) {
 	defer cancel()
 	resolver := newNodeKeyResolver(os.Getenv("ALI_SLIDER_PE_KEY_NODE"))
 	defer resolver.Close()
+	startedAt := time.Now()
 	session, err := resolver.OpenDevice(ctx, transport, profile, DeviceRuntimeOptions{
 		Prefix: prefix, Region: "cn", Timeout: 18 * time.Second,
 		GatherCostMin: 180, GatherCostMax: 260, FirstTouchAgeMin: 650, FirstTouchAgeMax: 850,
@@ -201,6 +213,7 @@ func TestOnlineNodeSlidingRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	openedAt := time.Now()
 	defer session.Close()
 	deviceToken, err := session.InitToken()
 	if err != nil {
@@ -210,6 +223,7 @@ func TestOnlineNodeSlidingRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	initializedAt := time.Now()
 	result, err := session.SolveSliding(ctx, input)
 	if err != nil {
 		session.mu.Lock()
@@ -226,7 +240,15 @@ func TestOnlineNodeSlidingRuntime(t *testing.T) {
 	if !result.Succeeded() || result.CertifyID != input.CertifyID {
 		t.Fatal("sliding result contract mismatch")
 	}
-	t.Logf("SLIDING completed: code=%s result=%t requests=%d", result.VerifyCode, result.VerifyResult, len(result.RequestActions))
+	solvedAt := time.Now()
+	t.Logf(
+		"SLIDING completed: code=%s result=%t requests=%d open=%s init=%s solve=%s total=%s",
+		result.VerifyCode, result.VerifyResult, len(result.RequestActions),
+		openedAt.Sub(startedAt).Round(time.Millisecond),
+		initializedAt.Sub(openedAt).Round(time.Millisecond),
+		solvedAt.Sub(initializedAt).Round(time.Millisecond),
+		solvedAt.Sub(startedAt).Round(time.Millisecond),
+	)
 }
 
 type onlineImageLessChallenge struct {

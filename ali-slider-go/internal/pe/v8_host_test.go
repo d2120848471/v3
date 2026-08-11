@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 type v8HostEntropy struct {
@@ -169,5 +170,105 @@ func TestV8HostHTTPResponseLimitAndCancellation(t *testing.T) {
 	})
 	if _, err := roundTripV8HostRequest(ctx, transport, request); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled response error = %v", err)
+	}
+}
+
+func TestV8HostStaticAssetCache(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	cache := newV8AssetCache()
+	cache.now = func() time.Time { return now }
+	calls := 0
+	transport := v8RoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Cache-Control": {"public, max-age=120"},
+				"Content-Type":  {"application/javascript"},
+			},
+			Body:    io.NopCloser(strings.NewReader("asset")),
+			Request: request,
+		}, nil
+	})
+	handler := newV8HostHandler(transport, v8HostEntropy{}, true, cache)
+	encode := func(rawURL, language string) json.RawMessage {
+		t.Helper()
+		raw, err := json.Marshal(v8HostRequest{
+			Op: "http",
+			Request: &v8HostHTTPRequest{
+				URL: rawURL, Method: http.MethodGet,
+				Headers:  map[string]string{"Accept-Language": language},
+				Redirect: "manual",
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	asset := encode("https://x.alicdn.com/captcha-frontend/dynamicJS/versioned.js", "zh-CN")
+	for range 2 {
+		if _, err := handler(context.Background(), asset); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("cached asset requests = %d, want 1", calls)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := handler(cancelled, asset); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled cached request error = %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("cancelled cached request reached transport: calls=%d", calls)
+	}
+	if _, err := handler(context.Background(), encode("https://x.alicdn.com/captcha-frontend/dynamicJS/versioned.js", "en-US")); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("header-specific asset requests = %d, want 2", calls)
+	}
+	now = now.Add(v8AssetCacheTTL + time.Second)
+	if _, err := handler(context.Background(), asset); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 3 {
+		t.Fatalf("expired asset requests = %d, want 3", calls)
+	}
+	api := encode("https://prefix.captcha-open.aliyuncs.com/", "zh-CN")
+	for range 2 {
+		if _, err := handler(context.Background(), api); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls != 5 {
+		t.Fatalf("captcha API requests = %d, want 5", calls)
+	}
+}
+
+func TestV8HostStaticAssetCachePolicy(t *testing.T) {
+	for _, request := range []v8HostHTTPRequest{
+		{URL: "https://prefix.captcha-open.aliyuncs.com/", Method: "GET", Redirect: "manual"},
+		{URL: "https://x.alicdn.com/captcha-frontend/dynamicJS/asset.js", Method: "POST", Redirect: "manual"},
+		{URL: "https://x.alicdn.com/captcha-frontend/dynamicJS/asset.js", Method: "GET", Headers: map[string]string{"Cookie": "secret"}, Redirect: "manual"},
+		{URL: "https://x.alicdn.com/captcha-frontend/dynamicJS/asset.js", Method: "GET", Headers: map[string]string{"Authorization": "secret"}, Redirect: "manual"},
+		{URL: "https://x.alicdn.com/not-a-captcha-asset.js", Method: "GET", Redirect: "manual"},
+		{URL: "https://x.alicdn.com/captcha-frontend/dynamicJS/asset.json", Method: "GET", Redirect: "manual"},
+	} {
+		if _, ok := cacheableV8AssetRequest(request); ok {
+			t.Fatalf("sensitive request became cacheable: %#v", request)
+		}
+	}
+	for name, response := range map[string]v8HostHTTPResponse{
+		"non-200":    {Status: http.StatusNotModified},
+		"no-store":   {Status: http.StatusOK, Headers: map[string]string{"cache-control": "no-store"}},
+		"private":    {Status: http.StatusOK, Headers: map[string]string{"cache-control": `private="set-cookie"`}},
+		"set-cookie": {Status: http.StatusOK, Headers: map[string]string{"set-cookie": "secret"}},
+		"vary-all":   {Status: http.StatusOK, Headers: map[string]string{"vary": "Accept-Encoding, *"}},
+	} {
+		if ttl := cacheableV8AssetResponseTTL(response); ttl != 0 {
+			t.Fatalf("%s response TTL = %s, want 0", name, ttl)
+		}
 	}
 }

@@ -64,7 +64,7 @@ flowchart LR
     failure -.-> verify
 ```
 
-`TRACELESS` 与 `SLIDING` 的 Init 响应都不含背景图或滑块图，因此不会进入资产、视觉或 Puzzle PE 分支。运行桥在同一 SDK/FeiLin VM 内复用已签发挑战：SDK 发起的 Init 被本地绑定响应拦截，不产生第二次真实 Init；随后只允许一次真实 Verify。`SLIDING` 使用独立 `418×48` 组件合同、`48px` 手柄和 `370px` 目标轨迹，并把内部 touch 轨迹映射成页面实测的 `mousedown/mousemove/mouseup`。Go 同时复核 SDK success Base64 与 Verify 响应的场景、挑战 ID、token 和 `T001`；公共结果与图片拼图合同一致。
+`TRACELESS` 与 `SLIDING` 的 Init 响应都不含背景图或滑块图，因此不会进入资产、视觉或 Puzzle PE 分支。运行桥在同一 SDK/FeiLin VM 内复用已签发挑战：SDK 发起的 Init 被本地绑定响应拦截，不产生第二次真实 Init；随后只允许一次真实 Verify。`SLIDING` 使用独立 `418×48` 组件合同、`48px` 手柄和 `370px` 目标轨迹，并把内部 touch 轨迹映射成页面实测的 `mousedown/mousemove/mouseup`；`Date.now()`、`performance.now()` 与事件 `timeStamp` 同步推进逻辑轨迹，回放循环不使用真实 timer/macrotask。Go 同时复核 SDK success Base64 与 Verify 响应的场景、挑战 ID、token 和 `T001`；公共结果与图片拼图合同一致。
 
 HTTP 层先完成浏览器跨源和输入校验；合法 `POST /api/slider` JSON 与 deprecated `GET /api/slider?...` query 都不经过本地 admission gate，直接调用 Solver，也不因本机在途请求数主动返回 `429` 或 `Retry-After`。GET 与 POST 不合并参数源，form body 不受支持。Handler 和 concrete Client 都会传播超时 context；Solver 必须尊重 context，不使用无界 goroutine 伪造“强制取消”。Client 连接池或预热池的资源预算不等于 HTTP 请求上限。
 
@@ -135,6 +135,7 @@ stateDiagram-v2
 | HTTP 请求、trace、请求 DTO、结果 DTO | 单请求 | `net/http` 按请求调度；POST JSON 或 deprecated GET query 输入合法后直接进入 Solver，无本地 admission 槽 | 响应后 |
 | Device VM Session / DeviceToken / CertifyId / Verify 位 | 单轮 | Init 与 Complete 保持同一 VM；不跨挑战复用 | Solve 返回时 close/release |
 | 预热V8 Device Session | DeviceSessionPool | `ready + pending + leased <= capacity + reserve <= 4`；每slot独立画像，reserve默认0；默认最多空闲20秒 | 满池等待；Complete后回收外层Isolate，重建独立context/session/token再入池；失败则关闭并冷补货 |
+| 版本化组件 JS/CSS 响应字节 | 单个 Device V8 engine | 只缓存 `g/x.alicdn.com` 指定动态资源路径的安全 GET；精确 URL+headers 隔离；TTL 最多30秒、最多8项；不含挑战 API/token/DOM/VM 状态 | engine 关闭时整体释放；不跨代理、画像或 Isolate |
 | HTTP transport | TransportPool | 按规范 route 隔离；直连保留；有界 LRU；每 route/host 连接受 Client `MaxConcurrency` 预算约束，但不限制 Solve 调用数 | Client.Close 关闭空闲连接并清表 |
 | 公开 SDK/PE 源码与结构画像 | KeyResolver | 完整 `StaticPath` 隔离；SDK 单飞、同路径 PE/profile 单飞、不同路径可并发；SDK 软 TTL 5 分钟、PE/profile 硬 TTL 30 分钟；不含 token/CertifyId/轨迹/data | SDK 字节变更立即清空；硬 TTL 或 Client 关闭时替换/释放 |
 | PE 构造运行时 | KeyResolver / 单轮 | 新精确分片在禁网 V8 context 中采样并与纯 Go 逐字段差分；兼容后每轮纯 Go，不兼容则每轮 V8；外层 V8 runtime 和精确源码 code cache 均有界 | 单轮输入/输出阶段结束即释放；idle runtime 由 Resolver.Close 关闭 |

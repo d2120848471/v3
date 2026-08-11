@@ -41,6 +41,7 @@ const HOST_MAX_VM_COUNT = 8;
 const BRIDGE_EVENT_STATE = Symbol("bridgeEventState");
 const DEVICE_PROFILE_MAX_BYTES = 8 * 1024;
 const DYNAMIC_ASSET_MAX_BYTES = 2 * 1024 * 1024;
+const BROWSER_LOGICAL_CLOCKS = new WeakMap();
 
 
 /**
@@ -1141,12 +1142,46 @@ function makeBrowserContext(options, onRequest) {
   const documentElement = makeElement("html");
   const eventRegistrations = [];
   const eventListeners = new Map();
+  const HostDate = globalThis.Date;
+  const hostPerformance = globalThis.performance;
+  let logicalTimeOffsetMs = 0;
   let contextReference = null;
   let timerSequence = 1;
   const timeoutHandles = new Map();
   const intervalHandles = new Map();
   documentElement.clientWidth = screenProfile.innerWidth;
   documentElement.clientHeight = screenProfile.innerHeight;
+
+  const virtualNow = () => HostDate.now() + logicalTimeOffsetMs;
+  function BrowserDate(...arguments_) {
+    if (new.target) {
+      return new HostDate(
+        ...(arguments_.length ? arguments_ : [virtualNow()]),
+      );
+    }
+    return new HostDate(virtualNow()).toString();
+  }
+  Object.setPrototypeOf(BrowserDate, HostDate);
+  BrowserDate.prototype = HostDate.prototype;
+  BrowserDate.now = virtualNow;
+  const browserPerformance = new Proxy(hostPerformance, {
+    get(target, property) {
+      if (property === "now") {
+        return () => target.now() + logicalTimeOffsetMs;
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const logicalClock = Object.freeze({
+    advanceBy(deltaMs) {
+      if (!Number.isFinite(deltaMs) || deltaMs < 0) {
+        throw new Error("浏览器逻辑时钟增量无效");
+      }
+      logicalTimeOffsetMs += deltaMs;
+      return logicalTimeOffsetMs;
+    },
+  });
 
   function listenerBucket(target, type) {
     if (!eventListeners.has(target)) {
@@ -2087,7 +2122,8 @@ function makeBrowserContext(options, onRequest) {
       URLSearchParams,
       TextEncoder,
       TextDecoder,
-      performance: globalThis.performance,
+      Date: BrowserDate,
+      performance: browserPerformance,
       Intl,
       crypto: webcrypto,
       document: childDocument,
@@ -2219,7 +2255,7 @@ function makeBrowserContext(options, onRequest) {
     WeakSet,
     Symbol,
     Math,
-    Date,
+    Date: BrowserDate,
     JSON,
     RegExp,
     Error,
@@ -2238,7 +2274,7 @@ function makeBrowserContext(options, onRequest) {
     setInterval: browserSetInterval,
     clearInterval: browserClearInterval,
     queueMicrotask,
-    performance: globalThis.performance,
+    performance: browserPerformance,
     Intl,
     crypto: webcrypto,
     document,
@@ -2401,6 +2437,7 @@ function makeBrowserContext(options, onRequest) {
     },
   });
   contextReference = vm.createContext(context);
+  BROWSER_LOGICAL_CLOCKS.set(contextReference, logicalClock);
   Object.setPrototypeOf(
     contextReference.HTMLElement.prototype,
     contextReference.Element.prototype,
@@ -2922,6 +2959,7 @@ async function runTracelessCaptcha(
           language: "cn",
           timeout: Math.min(options.timeoutMs, 5_000),
           rem: 1,
+          delayBeforeSuccess: false,
           success(value) {
             context.__ALI_SDK_INIT__.phase = "success";
             if (
@@ -3118,10 +3156,12 @@ async function replaySlidingTrack(context, slider, completion) {
   let elapsed = 0;
   let previousClientX = null;
   let previousClientY = null;
+  const logicalClock = BROWSER_LOGICAL_CLOCKS.get(context);
+  if (!logicalClock) {
+    throw slidingBridgeError("SLIDING_TRACK_DISPATCH");
+  }
   for (const sample of completion.track) {
-    if (sample.dt > 0) {
-      await new Promise((resolve) => setTimeout(resolve, sample.dt));
-    }
+    logicalClock.advanceBy(sample.dt);
     elapsed += sample.dt;
     const clientX = completion.handleWidth / 2 + sample.x;
     const clientY = completion.handleWidth / 2 + sample.y;
@@ -3192,6 +3232,7 @@ async function replaySlidingTrack(context, slider, completion) {
       }
       previousClientX = clientX;
       previousClientY = clientY;
+      await Promise.resolve();
       continue;
     }
     try {
@@ -3205,6 +3246,9 @@ async function replaySlidingTrack(context, slider, completion) {
     }
     previousClientX = clientX;
     previousClientY = clientY;
+    // Date/performance 与 event.timeStamp 同步推进逻辑人工节奏；这里只清空
+    // 当前 microtask 队列，不调用 timer 或 macrotask，因此轨迹没有墙钟等待。
+    await Promise.resolve();
   }
 }
 
@@ -3365,7 +3409,7 @@ async function runSlidingCaptcha(
             context.__ALI_SDK_INIT__.phase = "instance";
             if (dragStarted) return;
             dragStarted = true;
-            setTimeout(() => {
+            queueMicrotask(() => {
               Promise.resolve()
                 .then(async () => {
                   context.__ALI_SDK_INIT__.phase = "dom";
@@ -3373,12 +3417,9 @@ async function runSlidingCaptcha(
                   if (!slider) {
                     throw slidingBridgeError("SLIDING_TIMEOUT_DOM");
                   }
-                  // getInstance 在滑动组件的 document 监听器完全挂载前就可能回调。
-                  // 保留一个人手反应窗口，避免后挂的 move 处理器错过 touchstart。
-                  await new Promise((resolveDelay) => setTimeout(
-                    resolveDelay,
-                    Math.min(260, Math.max(120, Math.floor(options.timeoutMs / 20))),
-                  ));
+                  // getInstance 返回当前调用栈后，SDK 的同步 listener 已全部挂载；
+                  // 清空 microtask 即可，不引入真实 timer/macrotask 等待。
+                  await Promise.resolve();
                   context.__ALI_SDK_INIT__.phase = "drag";
                   await replaySlidingTrack(context, slider, completion);
                   context.__ALI_SDK_INIT__.phase = "drag_complete";
@@ -3391,7 +3432,7 @@ async function runSlidingCaptcha(
                       : slidingBridgeError("SLIDING_TRACK_DISPATCH"),
                   );
                 });
-            }, 0);
+            });
           },
         });
       } catch {
@@ -4010,8 +4051,10 @@ export {
   parseTracelessVerifyResponse,
   parseWorkerCompletionPayload,
   replayFeiLinInteractionEvents,
+  replaySlidingTrack,
   refreshFeiLinToken,
   readWorkerCompletionInput,
+  runTracelessCaptcha,
   runSlidingCaptcha,
   safeDeviceBridgeFailureMessage,
   selectFeiLinGetterOwner,

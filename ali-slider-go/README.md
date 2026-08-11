@@ -222,6 +222,7 @@ ali-slider-go/
 - [2026-08-09 动态 PE 与完整 Solve 性能证据](docs/evidence/validation-2026-08-09-performance.md)
 - [2026-08-11 PixCake TRACELESS 无痕验证码适配报告](docs/2026-08-11_js-web-pixcake-traceless-report.md)
 - [2026-08-11 DJI SLIDING 拖动验证码适配报告](docs/2026-08-11_js-web-dji-sliding-report.md)
+- [2026-08-11 TRACELESS / SLIDING 运行时性能优化报告](docs/2026-08-11_js-web-captcha-runtime-performance-report.md)
 - [2026-08-07 脱敏验证证据](docs/evidence/validation-2026-08-07.md)
 - [变更记录](CHANGELOG.md)
 
@@ -233,6 +234,7 @@ ali-slider-go/
 - 2026-08-08 针对当前动态 PE 修复快照执行了 1 个新挑战、一次 Solve、零重试，得到 `T001`、`VerifyResult=true` 和非空 token；该单次 smoke 只证明当前 Device/PE 合同恢复，不构成成功率或性能报告。
 - 2026-08-09 最终安全候选真实50次为 `47/50`、mean `2562ms`、P50 `2157ms`、P95 `4910ms`；3次均为业务 `F015`，协议/网络/视觉错误为0；32/32精确分片通过V8/纯Go差分。默认直连组件A/B同时证明5个对齐存活的Device VM已破坏字段合同，因此预热池默认和硬上限为4，不能用扩大同池VM数量换速度。
 - 2026-08-11 使用 `SceneId=159tlu75`、`prefix=1ulc59` 做了一次显式授权的 `SLIDING` 组件 smoke，得到 `T001 / true / requests=7`；只访问阿里公开组件端点，未提交 DJI 登录或短信。单样本不构成成功率、延迟分位数或容量结论。
+- 2026-08-11 后续性能诊断确认 4–5 秒主要来自测试冷启动、外部 Init/资源/Verify 和 SLIDING 逐点真实轨迹 sleep，不是自动类型识别。最终 SLIDING 使用逻辑 `Date/performance/event.timeStamp`，轨迹循环不再调用 timer/macrotask；1800ms 逻辑轨迹离线约 `2.6–3.0ms`。无 Node 的 Linux ARM64 生产 V8 单挑战得到 SLIDING `success=1 / stage=1390ms / total=2750ms`，TRACELESS `success=1 / stage=1168ms / total=2488ms`；均为小样本，不是 P95/P99。
 - 普通单测、CI、Docker 构建都不得运行挑战批次；公开 CDN/Device 组件探针也必须用独立环境变量显式启用。
 
 2026-08-07 的短批次只证明旧实现当时达到冻结的成功率和 Client 完整链 P95 目标。2026-08-09 当前路径已有 50 次 Client 冷态数据，但仍缺 HTTP 端到端、RSS、GC、goroutine/线程峰值及长时间稳定性报告。不得从历史批次、后半稳定窗口或离线 Mock 外推当前容量，也不得把并发 32 解释为 HTTP admission 上限。
