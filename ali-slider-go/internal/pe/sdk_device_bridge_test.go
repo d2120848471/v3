@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -34,10 +33,10 @@ func TestNodeSDKBridgeTracelessContracts(t *testing.T) {
 		t.Fatal("locate SDK bridge test source failed")
 	}
 	bridgePath := filepath.Join(filepath.Dir(sourceFile), "runtime", "sdk_device_bridge.mjs")
-	bridgeURL := (&url.URL{Scheme: "file", Path: bridgePath}).String()
 	script := fmt.Sprintf(`
     import vm from "node:vm";
-    const bridge = await import(%q);
+    import { pathToFileURL } from "node:url";
+    const bridge = await import(pathToFileURL(%q).href);
     const context = bridge.makeBrowserContext({
       prefix: "1ohgtl",
       region: "cn",
@@ -280,7 +279,7 @@ func TestNodeSDKBridgeTracelessContracts(t *testing.T) {
         || slidingCodedFailure.includes(secret)
       ),
     }));
-  `, bridgeURL, profileJSON, profileJSON, profileJSON)
+  `, bridgePath, profileJSON, profileJSON, profileJSON)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	output, err := exec.CommandContext(ctx, nodePath, "--input-type=module", "--eval", script).CombinedOutput()
@@ -365,9 +364,9 @@ func TestNodeSDKBridgeSlidingInteractionContract(t *testing.T) {
 		t.Fatal("locate SDK bridge test source failed")
 	}
 	bridgePath := filepath.Join(filepath.Dir(sourceFile), "runtime", "sdk_device_bridge.mjs")
-	bridgeURL := (&url.URL{Scheme: "file", Path: bridgePath}).String()
 	script := fmt.Sprintf(`
-    const bridge = await import(%q);
+    import { pathToFileURL } from "node:url";
+    const bridge = await import(pathToFileURL(%q).href);
     const requests = [];
     const context = bridge.makeBrowserContext({
       prefix: "1ulc59",
@@ -499,7 +498,7 @@ func TestNodeSDKBridgeSlidingInteractionContract(t *testing.T) {
       ),
       eventTimeDeltaMs: eventTimeSamples.at(-1) - eventTimeSamples[0],
     }));
-  `, bridgeURL, profileJSON)
+  `, bridgePath, profileJSON)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	output, err := exec.CommandContext(ctx, nodePath, "--input-type=module", "--eval", script).CombinedOutput()

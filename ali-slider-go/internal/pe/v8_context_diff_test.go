@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -97,14 +96,14 @@ func runNodeContextProbe(t *testing.T, nodePath string, profileJSON []byte) json
 		t.Fatal("locate context diff test source failed")
 	}
 	bridgePath := filepath.Join(filepath.Dir(sourceFile), "runtime", "sdk_device_bridge.mjs")
-	bridgeURL := (&url.URL{Scheme: "file", Path: bridgePath}).String()
 	probeJSON, err := json.Marshal(v8ContextProbeSource)
 	if err != nil {
 		t.Fatal(err)
 	}
 	script := fmt.Sprintf(`
     import vm from "node:vm";
-    const bridge = await import(%q);
+    import { pathToFileURL } from "node:url";
+    const bridge = await import(pathToFileURL(%q).href);
     const profile = %s;
     const context = bridge.makeBrowserContext({
       prefix: "fsgtmi",
@@ -115,7 +114,7 @@ func runNodeContextProbe(t *testing.T, nodePath string, profileJSON []byte) json
       mode: "probe-log1",
     }, () => {});
     process.stdout.write(JSON.stringify(vm.runInContext(%s, context)));
-  `, bridgeURL, profileJSON, probeJSON)
+  `, bridgePath, profileJSON, probeJSON)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	output, err := exec.CommandContext(ctx, nodePath, "--input-type=module", "--eval", script).CombinedOutput()
