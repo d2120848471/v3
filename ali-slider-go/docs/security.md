@@ -135,7 +135,7 @@ Init 只能提供相对路径，不能指定完整 URL。下载器：
 Init 返回的动态 PE 不能依赖有限硬编码表，也不能用随机 `arg` 或近似 Go payload 替代当前脚本。生产链会把真实单轮状态交给同进程的两类 V8 Isolate，因此边界如下：
 
 - `StaticPath` 必须匹配版本号、三位分片号和 16 位小写十六进制摘要的固定格式；据此只构造 `g.alicdn.com/captcha-frontend/dynamicJS/...` URL。
-- Go 下载公开 SDK 时只允许 `o.alicdn.com`/`g.alicdn.com`，下载 PE 时只允许 `g.alicdn.com`；请求和每次重定向都要求 HTTPS、默认端口、无 userinfo/query/fragment，单脚本上限 2 MiB，并沿用本轮 transport/代理路由。
+- Go 下载公开 SDK 时只允许 `o.alicdn.com`/`g.alicdn.com`，下载 Puzzle PE 时只允许 `g.alicdn.com`；同会话验证码 SDK 运行桥另允许官方动态挑战资源主机 `x.alicdn.com`。请求和每次重定向都要求 HTTPS、默认端口、无 userinfo，单脚本上限 2 MiB，并沿用本轮 transport/代理路由。
 - 每个Device slot持有独立只读画像；当轮RPC headers、图片、PE与Device Isolate使用租到会话的实际画像。JS不直接持有socket，只能通过同步JSON host回调请求Go访问严格白名单；Isolate从Log1/2/3保持到Complete并产出同session Verify token。
 - 新精确 PE 分片使用禁网 V8 Isolate 对固定假输入采样，并与纯 Go Builder 的 payload、事件和时钟完整差分。仅兼容分片在 TTL 内用本轮真实 `SceneId`、`CertifyId`、DeviceToken、DeviceConfig、图片路径、尺寸、轨迹和逻辑时钟纯算 `data`；不兼容分片在禁网 V8 中按本轮输入构造。Go 随后对两条路径都独立解包并验证 session、schema、坐标、getter 参数、事件计数和时钟边界。
 - 公开SDK每5分钟字节复核；精确PE源码/profile最多30分钟强制重下与V8差分。DeviceToken、`CertifyId`、DeviceConfig、轨迹、`data`不进入分钟级缓存。预热挑战状态默认最多空闲20秒且一次性消费；默认直连池最多保留4个Isolate，满池等待，下一轮必须重建context/session/token。

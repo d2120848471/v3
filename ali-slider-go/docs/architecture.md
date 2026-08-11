@@ -9,12 +9,8 @@
 ```text
 同一 V8/FeiLin Isolate：Device Log1/Log2/Log3
   → InitCaptchaV3
-  → 按精确 StaticPath 下载 SDK/PE，必要时用 V8 重建动态画像
-  → 并发下载背景图与滑块图
-  → 纯 Go 视觉定位
-  → 已完整差分的分片由纯 Go 生成 Data/getter/事件，其余回退 V8
-  → 同一 FeiLin VM 回放事件并执行 Device 最终 Log2
-  → 唯一 VerifyCaptchaV3
+  ├─ TRACELESS：同一 VM 调用官方 SDK 无痕实例，绑定刷新后的 DeviceToken 并唯一 Verify
+  └─ PUZZLE：精确 PE → 双图 → 视觉/轨迹 → 同一 VM Complete → 唯一 Verify
 ```
 
 本地与Mock质量门槛已建立。Linux AMD64公开分片差分证明强制V8与纯Go的解包JSON、arg、全部TrackList、互动事件和延时一致；强制V8约 `530ms`，纯Go约 `0.364ms`。最终安全候选真实50次为 `47/50`、mean `2562ms`、P50 `2157ms`、P95 `4910ms`，32/32分片自校验兼容，分类错误0。默认直连公开组件A/B证明预热池最多安全保留4个Device VM。因此当前P50明显快于原 `4722ms`基线，但并发10下平均仍未达到约1秒，也未完成长时间资源稳定性结论。
@@ -33,6 +29,7 @@ flowchart LR
         setup["固定路由与租用slot实际画像"]
         device["V8 Device Isolate<br/>同一 FeiLin 状态<br/>Log1 → Log2 → Log3"]
         init["InitCaptchaV3"]
+        traceless["TRACELESS<br/>官方 SDK 同 VM Init/Verify<br/>输出滑块同款 Verify 字段"]
         pekey["KeyResolver<br/>公开 SDK/PE + V8 自校验<br/>精确路径 · 软 5 / 硬 30 分钟"]
         assets["双图并发下载<br/>首错取消"]
         vision["vision.Solve"]
@@ -41,15 +38,19 @@ flowchart LR
         verify["VerifyCaptchaV3<br/>不可逆尝试位"]
     end
 
-    client --> setup --> device --> init --> pekey --> assets --> vision --> pe --> complete --> verify
+    client --> setup --> device --> init
+    init -- TRACELESS --> traceless --> result
+    init -- PUZZLE --> pekey --> assets --> vision --> pe --> complete --> verify
     verify --> result["slider.Result"] --> http
 
     transports["TransportPool<br/>直连保留 / route 隔离"] --> device
     transports --> init
+    transports --> traceless
     transports --> pekey
     transports --> assets
     transports --> verify
     v8lib["purego + V8 wrapper<br/>C ABI / ICU 77"] --> device
+    v8lib --> traceless
     v8lib --> pe
     prewarm["DeviceSessionPool<br/>每slot独立画像；最多保留4槽"] -.-> device
     keycache["KeyResolver<br/>SDK 软 5 分钟 / PE 硬 30 分钟<br/>无挑战级状态"] -.-> pekey
@@ -57,6 +58,8 @@ flowchart LR
     failure -.-> vision
     failure -.-> verify
 ```
+
+`TRACELESS` 的 Init 响应不含背景图或滑块图，因此不会进入资产、视觉、轨迹或动态 PE 分支。运行桥在同一 SDK/FeiLin VM 内复用已签发挑战，记录 SDK 刷新的同 session DeviceToken，只允许一次 Init 和一次 Verify；公共结果直接使用阿里 Verify 响应的 `securityToken`、`VerifyCode`、`VerifyResult` 和 `certifyId`，与图片拼图合同一致。
 
 HTTP 层先完成浏览器跨源和输入校验；合法 `POST /api/slider` JSON 与 deprecated `GET /api/slider?...` query 都不经过本地 admission gate，直接调用 Solver，也不因本机在途请求数主动返回 `429` 或 `Retry-After`。GET 与 POST 不合并参数源，form body 不受支持。Handler 和 concrete Client 都会传播超时 context；Solver 必须尊重 context，不使用无界 goroutine 伪造“强制取消”。Client 连接池或预热池的资源预算不等于 HTTP 请求上限。
 

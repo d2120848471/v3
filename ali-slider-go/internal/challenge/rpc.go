@@ -23,6 +23,7 @@ const (
 	defaultReferer      = defaultOrigin + "/"
 	maxRPCResponseBytes = 2 << 20
 	verifyFutureSkew    = 2 * time.Second
+	captchaTraceless    = "TRACELESS"
 )
 
 // CaptchaChallenge 是 Init 成功后的非敏感控制字段；CertifyID 不得进入日志。
@@ -173,13 +174,16 @@ func (client *RPCClient) Init(ctx context.Context, deviceToken string) (CaptchaC
 	if !response.Success || response.Code != "Success" || response.CertifyID == "" {
 		return CaptchaChallenge{}, rpcProtocolError("InitCaptchaV3 returned failure", nil)
 	}
-	imagePath, err := ValidateAssetPath(response.Image, "Image")
-	if err != nil {
-		return CaptchaChallenge{}, rpcProtocolError("Init image path is invalid", err)
-	}
-	puzzlePath, err := ValidateAssetPath(response.PuzzleImage, "PuzzleImage")
-	if err != nil {
-		return CaptchaChallenge{}, rpcProtocolError("Init puzzle path is invalid", err)
+	imagePath, puzzlePath := "", ""
+	if !isTracelessCaptchaType(response.CaptchaType) {
+		imagePath, err = ValidateAssetPath(response.Image, "Image")
+		if err != nil {
+			return CaptchaChallenge{}, rpcProtocolError("Init image path is invalid", err)
+		}
+		puzzlePath, err = ValidateAssetPath(response.PuzzleImage, "PuzzleImage")
+		if err != nil {
+			return CaptchaChallenge{}, rpcProtocolError("Init puzzle path is invalid", err)
+		}
 	}
 	staticPath, err := ValidateAssetPath(response.StaticPath, "StaticPath")
 	if err != nil {
@@ -193,6 +197,10 @@ func (client *RPCClient) Init(ctx context.Context, deviceToken string) (CaptchaC
 		StaticPath: staticPath, CaptchaType: response.CaptchaType,
 		InitStartedMS: started.UnixMilli(), InitFinishedMS: finished.UnixMilli(),
 	}, nil
+}
+
+func isTracelessCaptchaType(value string) bool {
+	return strings.EqualFold(strings.TrimSpace(value), captchaTraceless)
 }
 
 // Verify 发送该 RPCClient 生命周期内唯一一次 Verify。网络错误也消耗尝试位。

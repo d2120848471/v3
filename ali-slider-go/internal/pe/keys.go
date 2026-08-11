@@ -24,20 +24,21 @@ import (
 )
 
 const (
-	defaultNodeBinary  = "node"
-	keySDKURL          = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js"
-	keyPEHost          = "g.alicdn.com"
-	keyProfileCacheTTL = 5 * time.Minute
-	keyProfileHardTTL  = 30 * time.Minute
-	keySDKCacheTTL     = keyProfileCacheTTL
-	keyScriptMaxBytes  = int64(2 << 20)
-	keyBridgeMaxBytes  = 64 << 10
-	keyBridgeTimeout   = 10 * time.Second
-	keyBridgeOrigin    = "http://localhost:38185"
-	keyBridgeReferer   = keyBridgeOrigin + "/"
-	dummyCertifyID     = "0123456789abcdef"
-	maxV8PEIdle        = 32
-	maxV8DeviceActive  = 4
+	defaultNodeBinary   = "node"
+	keySDKURL           = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js"
+	keyPEHost           = "g.alicdn.com"
+	keyCaptchaAssetHost = "x.alicdn.com"
+	keyProfileCacheTTL  = 5 * time.Minute
+	keyProfileHardTTL   = 30 * time.Minute
+	keySDKCacheTTL      = keyProfileCacheTTL
+	keyScriptMaxBytes   = int64(2 << 20)
+	keyBridgeMaxBytes   = 64 << 10
+	keyBridgeTimeout    = 10 * time.Second
+	keyBridgeOrigin     = "http://localhost:38185"
+	keyBridgeReferer    = keyBridgeOrigin + "/"
+	dummyCertifyID      = "0123456789abcdef"
+	maxV8PEIdle         = 32
+	maxV8DeviceActive   = 4
 )
 
 var (

@@ -1,11 +1,24 @@
 package protocol
 
 import (
+	"bytes"
 	"crypto/sha512"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 )
+
+const maxBusinessCaptchaVerifyParamBytes = 16 << 10
+
+// BusinessCaptchaVerifyParam 是 SDK success 回调交给业务端的已签名参数。
+type BusinessCaptchaVerifyParam struct {
+	CertifyID     string `json:"certifyId"`
+	SceneID       string `json:"sceneId"`
+	IsSign        bool   `json:"isSign"`
+	SecurityToken string `json:"securityToken"`
+}
 
 func BuildVerifyCaptchaParam(sceneID, certifyID, deviceToken, data string) (string, error) {
 	if sceneID == "" || certifyID == "" || deviceToken == "" || data == "" {
@@ -33,6 +46,30 @@ func BuildBusinessCaptchaVerifyParam(certifyID, sceneID, securityToken string, i
 		return "", err
 	}
 	return base64.StdEncoding.EncodeToString([]byte(text)), nil
+}
+
+// ParseBusinessCaptchaVerifyParam 严格解析 SDK success 回调，不接受扩展字段或空关键值。
+func ParseBusinessCaptchaVerifyParam(value string) (BusinessCaptchaVerifyParam, error) {
+	if value == "" || len(value) > maxBusinessCaptchaVerifyParamBytes {
+		return BusinessCaptchaVerifyParam{}, fmt.Errorf("business captcha parameter is empty or too large")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(value)
+	if err != nil || len(decoded) == 0 || len(decoded) > maxBusinessCaptchaVerifyParamBytes {
+		return BusinessCaptchaVerifyParam{}, fmt.Errorf("business captcha parameter is not valid base64")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(decoded))
+	decoder.DisallowUnknownFields()
+	var result BusinessCaptchaVerifyParam
+	if err := decoder.Decode(&result); err != nil {
+		return BusinessCaptchaVerifyParam{}, fmt.Errorf("business captcha parameter is not valid JSON")
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return BusinessCaptchaVerifyParam{}, fmt.Errorf("business captcha parameter has trailing content")
+	}
+	if result.CertifyID == "" || result.SceneID == "" || result.SecurityToken == "" {
+		return BusinessCaptchaVerifyParam{}, fmt.Errorf("business captcha parameter fields must not be empty")
+	}
+	return result, nil
 }
 
 func BuildBusinessSignedQuery(bodyText, rawToken, salt string, lgtime int64, lgnonce string) (string, string, error) {

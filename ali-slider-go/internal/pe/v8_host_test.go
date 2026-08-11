@@ -111,12 +111,22 @@ func TestV8HostHTTP(t *testing.T) {
 }
 
 func TestV8HostHTTPRejectsUnsafeRequests(t *testing.T) {
+	for _, rawURL := range []string{
+		"https://g.alicdn.com/path",
+		"https://x.alicdn.com/captcha-frontend/dynamicJS/path.js",
+		"https://prefix.captcha-open.aliyuncs.com/",
+	} {
+		if _, err := allowedV8NetworkURL(rawURL); err != nil {
+			t.Fatalf("allowed URL %q rejected: %v", rawURL, err)
+		}
+	}
 	transport := v8RoundTripFunc(func(*http.Request) (*http.Response, error) {
 		return nil, errors.New("must not run")
 	})
 	for _, request := range []v8HostHTTPRequest{
 		{URL: "http://g.alicdn.com/path", Method: "GET", Redirect: "manual"},
 		{URL: "https://example.com/path", Method: "GET", Redirect: "manual"},
+		{URL: "https://evil.x.alicdn.com/path", Method: "GET", Redirect: "manual"},
 		{URL: "https://evil.aliyuncs.com.example/path", Method: "GET", Redirect: "manual"},
 		{URL: "https://g.alicdn.com:443/path", Method: "GET", Redirect: "manual"},
 		{URL: "https://user@g.alicdn.com/path", Method: "GET", Redirect: "manual"},

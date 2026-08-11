@@ -60,6 +60,15 @@ type deviceBridgeStage struct {
 	Stage                 string                 `json:"stage"`
 	DeviceToken           string                 `json:"deviceToken"`
 	VerifyDeviceToken     string                 `json:"verifyDeviceToken"`
+	CaptchaType           string                 `json:"captchaType"`
+	SceneID               string                 `json:"sceneId"`
+	CertifyID             string                 `json:"certifyId"`
+	CaptchaVerifyParam    string                 `json:"captchaVerifyParam"`
+	TracelessDeviceToken  string                 `json:"tracelessDeviceToken"`
+	VerifyCode            string                 `json:"verifyCode"`
+	VerifyResult          bool                   `json:"verifyResult"`
+	SecurityToken         string                 `json:"securityToken"`
+	VerifyCertifyID       string                 `json:"verifyCertifyId"`
 	DeviceConfig          nativeDeviceConfig     `json:"deviceConfig"`
 	VerifyArgProfile      deviceVerifyArgProfile `json:"verifyArgProfile"`
 	TokenSource           string                 `json:"tokenSource"`
@@ -74,6 +83,40 @@ type deviceCompletion struct {
 	GetterArguments        []string                  `json:"getterArguments"`
 	InteractionEvents      []device.InteractionEvent `json:"interactionEvents"`
 	PostInteractionDelayMS int                       `json:"postInteractionDelayMs"`
+}
+
+type tracelessCompletion struct {
+	Complete    bool   `json:"complete"`
+	Mode        string `json:"mode"`
+	SceneID     string `json:"sceneId"`
+	CertifyID   string `json:"certifyId"`
+	StaticPath  string `json:"staticPath"`
+	CaptchaType string `json:"captchaType"`
+	DeviceToken string `json:"deviceToken"`
+}
+
+// TracelessInput 绑定已经由同一 DeviceToken 初始化的无痕挑战。
+type TracelessInput struct {
+	SceneID     string
+	CertifyID   string
+	StaticPath  string
+	CaptchaType string
+}
+
+// TracelessResult 保留阿里 Verify 响应的现有滑块业务字段。
+type TracelessResult struct {
+	SecurityToken  string
+	VerifyCode     string
+	VerifyResult   bool
+	CertifyID      string
+	RequestActions []string
+}
+
+func (TracelessResult) String() string   { return "pe.TracelessResult{redacted}" }
+func (TracelessResult) GoString() string { return "pe.TracelessResult{redacted}" }
+
+func (result TracelessResult) Succeeded() bool {
+	return result.VerifyCode == "T001" && result.VerifyResult && result.SecurityToken != ""
 }
 
 // DeviceRuntimeSession 保持 Init 与 Verify 之间同一个公开 SDK/FeiLin VM。
@@ -363,7 +406,7 @@ func (relay *connectRelay) handle(client net.Conn) {
 	}
 	defer request.Body.Close()
 	host, port, splitErr := net.SplitHostPort(request.Host)
-	allowed := strings.EqualFold(host, "g.alicdn.com") || strings.HasSuffix(strings.ToLower(host), ".aliyuncs.com")
+	allowed := strings.EqualFold(host, keyPEHost) || strings.EqualFold(host, keyCaptchaAssetHost) || strings.HasSuffix(strings.ToLower(host), ".aliyuncs.com")
 	if request.Method != http.MethodConnect || splitErr != nil || port != "443" || !allowed {
 		_, _ = io.WriteString(client, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
 		return
@@ -731,6 +774,73 @@ func (session *DeviceRuntimeSession) Complete(ctx context.Context, getterArgumen
 	return result, nil
 }
 
+// SolveTraceless 让同一 SDK/FeiLin VM 完成已经初始化的 TRACELESS 挑战。
+func (session *DeviceRuntimeSession) SolveTraceless(ctx context.Context, input TracelessInput) (TracelessResult, error) {
+	if ctx == nil {
+		return TracelessResult{}, errors.New("device runtime context is nil")
+	}
+	if err := validateTracelessInput(input); err != nil {
+		return TracelessResult{}, err
+	}
+	session.mu.Lock()
+	if session.closed || session.completed || session.stdin == nil && session.v8Engine == nil || session.initToken == "" {
+		session.mu.Unlock()
+		return TracelessResult{}, errors.New("device runtime session is unavailable")
+	}
+	payload, err := json.Marshal(tracelessCompletion{
+		Complete: true, Mode: "traceless", SceneID: input.SceneID, CertifyID: input.CertifyID,
+		StaticPath: input.StaticPath, CaptchaType: "TRACELESS", DeviceToken: session.initToken,
+	})
+	if err != nil {
+		session.mu.Unlock()
+		return TracelessResult{}, errors.New("encode traceless runtime completion")
+	}
+	engine := session.v8Engine
+	stdin := session.stdin
+	if engine == nil {
+		session.stdin = nil
+	}
+	session.completed = true
+	session.mu.Unlock()
+	releaseDeviceSlot, err := acquireDeviceExecutionSlot(ctx, session.deviceSlots)
+	if err != nil {
+		return TracelessResult{}, err
+	}
+	defer releaseDeviceSlot()
+	if engine != nil {
+		return session.completeV8Traceless(ctx, engine, payload, input)
+	}
+	if _, err := stdin.Write(payload); err != nil {
+		_ = stdin.Close()
+		return TracelessResult{}, fmt.Errorf("%w: write traceless completion", ErrKeyRuntime)
+	}
+	if err := stdin.Close(); err != nil {
+		return TracelessResult{}, fmt.Errorf("%w: close traceless completion", ErrKeyRuntime)
+	}
+	stage, err := session.readStage(ctx, "traceless")
+	if err != nil {
+		return TracelessResult{}, err
+	}
+	result, err := session.acceptTracelessStage(stage, input)
+	if err != nil {
+		return TracelessResult{}, err
+	}
+	select {
+	case <-ctx.Done():
+		_ = session.command.Process.Kill()
+		return TracelessResult{}, ctx.Err()
+	case <-session.waitDone:
+	}
+	session.mu.Lock()
+	waitErr := session.waitErr
+	stderrEmpty := session.stderr.buffer.Len() == 0
+	session.mu.Unlock()
+	if waitErr != nil || !stderrEmpty {
+		return TracelessResult{}, fmt.Errorf("%w: device bridge exit", ErrKeyRuntime)
+	}
+	return result, nil
+}
+
 // Recycle 在同一个已加载 bridge 的 V8 Isolate 内建立全新浏览器 context 和
 // Device session。它只复用宿主与编译结果，不复用上一轮 session/token/挑战态。
 func (session *DeviceRuntimeSession) Recycle(ctx context.Context) error {
@@ -813,6 +923,96 @@ func validateRuntimeInteractions(events []device.InteractionEvent) error {
 		return errors.New("device interaction span is invalid")
 	}
 	return nil
+}
+
+func validateTracelessInput(input TracelessInput) error {
+	if utf8.RuneCountInString(input.SceneID) < 1 || utf8.RuneCountInString(input.SceneID) > 64 || input.CertifyID == "" || len(input.CertifyID) > 512 || !strings.EqualFold(strings.TrimSpace(input.CaptchaType), "TRACELESS") {
+		return errors.New("traceless runtime input is invalid")
+	}
+	if input.StaticPath == "" || len(input.StaticPath) > 512 || strings.HasPrefix(input.StaticPath, "/") || strings.Contains(input.StaticPath, "://") {
+		return errors.New("traceless static path is invalid")
+	}
+	for _, segment := range strings.Split(input.StaticPath, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return errors.New("traceless static path is invalid")
+		}
+	}
+	return nil
+}
+
+func (session *DeviceRuntimeSession) acceptTracelessStage(stage deviceBridgeStage, input TracelessInput) (TracelessResult, error) {
+	config, err := protocolConfig(stage.DeviceConfig)
+	if err != nil || stage.Stage != "traceless" || !equalProtocolConfig(config, session.config) || stage.VerifyArgProfile != session.verifyProfile {
+		return TracelessResult{}, fmt.Errorf("%w: traceless device runtime changed", ErrUnsupportedPE)
+	}
+	if !isTracelessType(stage.CaptchaType) || stage.SceneID != input.SceneID || stage.CertifyID != input.CertifyID {
+		return TracelessResult{}, fmt.Errorf("%w: traceless challenge identity mismatch", ErrUnsupportedPE)
+	}
+	parsedToken, _, _, _, err := validateRuntimeToken(stage.TracelessDeviceToken, session.config, session.secrets.DeviceTokenSalt())
+	if err != nil || parsedToken.SessionID != session.initParsed.SessionID {
+		return TracelessResult{}, fmt.Errorf("%w: traceless DeviceToken session mismatch", ErrUnsupportedPE)
+	}
+	business, err := protocol.ParseBusinessCaptchaVerifyParam(stage.CaptchaVerifyParam)
+	if err != nil {
+		return TracelessResult{}, fmt.Errorf("%w: traceless success parameter encoding", ErrUnsupportedPE)
+	}
+	if !business.IsSign {
+		return TracelessResult{}, fmt.Errorf("%w: traceless success signature flag", ErrUnsupportedPE)
+	}
+	if business.SceneID != input.SceneID {
+		return TracelessResult{}, fmt.Errorf("%w: traceless success SceneId mismatch", ErrUnsupportedPE)
+	}
+	if business.CertifyID != input.CertifyID {
+		return TracelessResult{}, fmt.Errorf("%w: traceless success CertifyId mismatch", ErrUnsupportedPE)
+	}
+	if stage.VerifyCode != "T001" || !stage.VerifyResult || stage.SecurityToken == "" || stage.SecurityToken != business.SecurityToken || stage.VerifyCertifyID != business.CertifyID {
+		return TracelessResult{}, fmt.Errorf("%w: traceless official Verify result mismatch", ErrUnsupportedPE)
+	}
+	if stage.RequestCount != len(stage.Requests) || len(stage.Requests) < 5 {
+		return TracelessResult{}, fmt.Errorf("%w: traceless request count", ErrUnsupportedPE)
+	}
+	actions := stageActions(stage)
+	if !slices.Equal(actions[:3], []string{"Log1", "Log2", "Log3"}) {
+		return TracelessResult{}, fmt.Errorf("%w: traceless initial request sequence", ErrUnsupportedPE)
+	}
+	initIndex, verifyIndex := -1, -1
+	for index, request := range stage.Requests {
+		switch request.Action {
+		case "InitCaptchaV3":
+			if initIndex >= 0 || !containsAllStrings(request.FieldNames, "SceneId", "DeviceToken") {
+				return TracelessResult{}, fmt.Errorf("%w: traceless Init request", ErrUnsupportedPE)
+			}
+			initIndex = index
+		case "VerifyCaptchaV3":
+			if verifyIndex >= 0 || !containsAllStrings(request.FieldNames, "SceneId", "CertifyId", "CaptchaVerifyParam") {
+				return TracelessResult{}, fmt.Errorf("%w: traceless Verify request", ErrUnsupportedPE)
+			}
+			verifyIndex = index
+		}
+	}
+	if initIndex < 3 || verifyIndex <= initIndex {
+		return TracelessResult{}, fmt.Errorf("%w: traceless request order", ErrUnsupportedPE)
+	}
+	return TracelessResult{
+		SecurityToken:  stage.SecurityToken,
+		VerifyCode:     stage.VerifyCode,
+		VerifyResult:   stage.VerifyResult,
+		CertifyID:      stage.VerifyCertifyID,
+		RequestActions: actions,
+	}, nil
+}
+
+func isTracelessType(value string) bool {
+	return strings.EqualFold(strings.TrimSpace(value), "TRACELESS")
+}
+
+func containsAllStrings(values []string, required ...string) bool {
+	for _, item := range required {
+		if !slices.Contains(values, item) {
+			return false
+		}
+	}
+	return true
 }
 
 func (session *DeviceRuntimeSession) acceptVerifyStage(stage deviceBridgeStage, eventCount int) (device.Result, error) {

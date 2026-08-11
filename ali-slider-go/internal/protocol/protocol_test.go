@@ -224,6 +224,10 @@ func TestParamsMatchPythonOracle(t *testing.T) {
 	if err != nil || business != oracle.BusinessParam {
 		t.Fatalf("business param: %v", err)
 	}
+	parsed, err := ParseBusinessCaptchaVerifyParam(business)
+	if err != nil || parsed.CertifyID != "certify-fixture" || parsed.SceneID != "1ug4aptr" || parsed.SecurityToken != "security-fixture" || !parsed.IsSign {
+		t.Fatalf("parsed business param=%+v err=%v", parsed, err)
+	}
 	verify, err := BuildVerifyCaptchaParam("scene", "certify", "token", "data")
 	if err != nil || verify != `{"sceneId":"scene","certifyId":"certify","deviceToken":"token","data":"data"}` {
 		t.Fatalf("verify param: %q %v", verify, err)
@@ -294,6 +298,16 @@ func TestProtocolValidationBranches(t *testing.T) {
 	}
 	if _, err := BuildBusinessCaptchaVerifyParam("", "s", "t", true); err == nil {
 		t.Fatal("empty business field accepted")
+	}
+	for _, value := range []string{
+		"%%",
+		base64.StdEncoding.EncodeToString([]byte(`{"certifyId":"c","sceneId":"s","isSign":true}`)),
+		base64.StdEncoding.EncodeToString([]byte(`{"certifyId":"c","sceneId":"s","isSign":true,"securityToken":"t","extra":1}`)),
+		base64.StdEncoding.EncodeToString([]byte(`{"certifyId":"c","sceneId":"s","isSign":true,"securityToken":"t"}{}`)),
+	} {
+		if _, err := ParseBusinessCaptchaVerifyParam(value); err == nil {
+			t.Fatalf("invalid business parameter accepted: %q", value)
+		}
 	}
 	if _, _, err := BuildBusinessSignedQuery("", "", "", -1, strings.Repeat("0", 32)); err == nil {
 		t.Fatal("negative lgtime accepted")

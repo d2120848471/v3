@@ -46,12 +46,8 @@ HTTP / library Request
   → route-isolated Transport
   → V8 Device Isolate（预热 Lease 或冷建 Log1/2/3）
   → InitCaptchaV3
-  → KeyResolver（公开 SDK/精确 PE 源码与 V8 自校验，软 5/硬 30 分钟）
-  → 双图并发下载
-  → vision.Solve + 置信度门禁
-  → track.LoadDefault + 已验证纯 Go Builder 或禁网 V8 fallback + Go 独立复核
-  → 同一 Device Isolate Complete + Verify token
-  → VerifyCaptchaV3（最多一次）
+  ├─ TRACELESS → 同一 SDK/FeiLin VM 调用官方无痕流程 → VerifyCaptchaV3（一次）
+  └─ PUZZLE → KeyResolver → 双图 → vision/track/PE → 同一 VM Complete → VerifyCaptchaV3（一次）
   → slider.Result / 脱敏分类错误
 ```
 
@@ -79,7 +75,7 @@ HTTP / library Request
 
 ### 响应
 
-完成态响应保留：`ok`、`securityToken`、`VerifyCode`、`VerifyResult`、`certifyId`、`sceneId`、`proxied`、`elapsedMs`、`timingsMs`、`traceId`。
+完成态响应保留：`ok`、`securityToken`、`VerifyCode`、`VerifyResult`、`certifyId`、`sceneId`、`proxied`、`elapsedMs`、`timingsMs`、`traceId`。TRACELESS 与图片拼图返回相同格式；业务字段 `captcha_verify_param` 由调用方自行组装。
 
 - Verify 业务未通过仍返回 HTTP `200`；调用方不能只判断状态码。
 - 入参错误返回 400，明确浏览器跨源请求返回 403，技术失败返回 500；通过 origin 和输入边界的请求不经过本地并发接纳闸门，直接调用 `Solve`。

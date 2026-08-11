@@ -82,6 +82,8 @@ curl --fail-with-body --get \
 }
 ```
 
+`TRACELESS` 与图片拼图使用同一公共结果格式。服务返回阿里 Verify 的 `securityToken`、`VerifyCode`、`VerifyResult`、`certifyId` 和本轮 `sceneId`；调用方自行组装业务需要的 `captcha_verify_param`，服务不预拼接该字段。
+
 HTTP 输入不合法时返回 `400` 且不进入 Solver；明确的浏览器跨源 GET 或 POST 返回 `403 ApiOriginError`。无浏览器来源头的 curl/程序客户端保持允许。通过跨源和输入边界校验后，每个请求都直接调用一次 Solver。Solver 的参数错误仍返回 `400`，完成态业务结果返回 `200`，协议、网络、视觉、内部错误、超时或 panic 返回脱敏 `500`。`/api/slider` 的这些响应都带 `X-Trace-ID`，并与响应体 `traceId` 一致。
 
 `SceneId/sceneId`、`prefix/Prefix`、`AaduaneId/aaduaneId`、`proxy/Proxy` 是仅有的 8 个精确请求名称。同组同时出现时规范字段优先，同名 query 重复时最后一个值生效，空值回退默认。GET 只读 query，POST 只读 JSON body，两个参数源不合并；不支持 `application/x-www-form-urlencoded` 或 multipart form body。JSON body 和 query 分别最大 65,536 字节；非法 query URL encoding 返回 `400 ApiRequestError`。完整合同见 [docs/api.md](docs/api.md)。
@@ -217,6 +219,7 @@ ali-slider-go/
 - [故障排查](docs/troubleshooting.md)
 - [2026-08-08 无本地 admission 历史快照证据](docs/evidence/validation-2026-08-08-no-local-admission.md)
 - [2026-08-09 动态 PE 与完整 Solve 性能证据](docs/evidence/validation-2026-08-09-performance.md)
+- [2026-08-11 PixCake TRACELESS 无痕验证码适配报告](docs/2026-08-11_js-web-pixcake-traceless-report.md)
 - [2026-08-07 脱敏验证证据](docs/evidence/validation-2026-08-07.md)
 - [变更记录](CHANGELOG.md)
 

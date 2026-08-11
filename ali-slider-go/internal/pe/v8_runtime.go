@@ -553,3 +553,23 @@ func (session *DeviceRuntimeSession) completeV8Device(
 	}
 	return session.acceptVerifyStage(stage, eventCount)
 }
+
+func (session *DeviceRuntimeSession) completeV8Traceless(
+	ctx context.Context,
+	engine *v8runtime.Runtime,
+	payload []byte,
+	input TracelessInput,
+) (TracelessResult, error) {
+	result, err := engine.Call(ctx, "__aliV8DeviceComplete", payload)
+	if err != nil {
+		if ctx.Err() != nil {
+			return TracelessResult{}, ctx.Err()
+		}
+		return TracelessResult{}, fmt.Errorf("%w: V8 Device traceless: %v", ErrKeyRuntime, err)
+	}
+	var stage deviceBridgeStage
+	if err := decodeV8Result(result, &stage); err != nil {
+		return TracelessResult{}, fmt.Errorf("%w: V8 Device traceless output", ErrKeyRuntime)
+	}
+	return session.acceptTracelessStage(stage, input)
+}

@@ -40,6 +40,7 @@ const HOST_COMMAND_MAX_BYTES = WORKER_COMPLETION_MAX_BYTES + 1024;
 const HOST_MAX_VM_COUNT = 8;
 const BRIDGE_EVENT_STATE = Symbol("bridgeEventState");
 const DEVICE_PROFILE_MAX_BYTES = 8 * 1024;
+const DYNAMIC_ASSET_MAX_BYTES = 2 * 1024 * 1024;
 
 
 /**
@@ -145,8 +146,33 @@ function browserRequestHeaders(
 }
 
 
-function safeDeviceBridgeFailureMessage(_error) {
-  return "Node 设备桥执行失败";
+const SAFE_TRACELESS_FAILURE_CODES = new Set([
+  "TRACELESS_TIMEOUT_READY",
+  "TRACELESS_TIMEOUT_CALLING_INIT",
+  "TRACELESS_TIMEOUT_INIT_REJECTED",
+  "TRACELESS_TIMEOUT_INIT_RESPONSE",
+  "TRACELESS_TIMEOUT_INSTANCE",
+  "TRACELESS_TIMEOUT_CLICK",
+  "TRACELESS_TIMEOUT_VERIFY_REQUEST",
+  "TRACELESS_TIMEOUT_VERIFY_RESPONSE",
+  "TRACELESS_INIT_THROW",
+  "TRACELESS_FAIL_CALLBACK",
+  "TRACELESS_CLOSE_CALLBACK",
+]);
+
+
+function tracelessBridgeError(code) {
+  const error = new Error("无痕验证码执行失败");
+  error.safeCode = code;
+  return error;
+}
+
+
+function safeDeviceBridgeFailureMessage(error) {
+  const code = error?.safeCode;
+  return SAFE_TRACELESS_FAILURE_CODES.has(code)
+    ? `Node 设备桥执行失败 [${code}]`
+    : "Node 设备桥执行失败";
 }
 
 
@@ -1102,6 +1128,7 @@ function makeBrowserContext(options, onRequest) {
     const parsed = new URL(String(value));
     const hostAllowed =
       parsed.hostname === "g.alicdn.com" ||
+      parsed.hostname === "x.alicdn.com" ||
       parsed.hostname.endsWith(".aliyuncs.com");
     if (
       parsed.protocol !== "https:"
@@ -1179,7 +1206,11 @@ function makeBrowserContext(options, onRequest) {
               `FeiLin 脚本下载失败：HTTP ${response.status}`,
             );
           }
-          let script = await response.text();
+          const scriptBytes = Buffer.from(await response.arrayBuffer());
+          if (scriptBytes.length > DYNAMIC_ASSET_MAX_BYTES) {
+            throw new Error("动态脚本超过大小上限");
+          }
+          let script = scriptBytes.toString("utf8");
           if (options.mode === "profile-token") {
             const instrumented = instrumentFeiLinProfile(script);
             contextReference.__ALI_FEILIN_SCRIPT_META__ = {
@@ -1204,6 +1235,41 @@ function makeBrowserContext(options, onRequest) {
           child.onerror?.(error);
         });
     }
+    if (
+      options.networkEnabled
+      && child?.tagName === "LINK"
+      && child.href
+    ) {
+      const styleUrl = assertAllowedNetworkUrl(child.href);
+      Promise.resolve()
+        .then(async () => {
+          const response = await fetchAllowedNetworkUrl(styleUrl, {
+            method: "GET",
+            headers: browserRequestHeaders(
+              deviceProfile,
+              {},
+              {
+                destination: "style",
+                includeOrigin: false,
+                mode: "no-cors",
+              },
+            ),
+          });
+          if (!response.ok) {
+            throw new Error(
+              `验证码样式下载失败：HTTP ${response.status}`,
+            );
+          }
+          const styleBytes = await response.arrayBuffer();
+          if (styleBytes.byteLength > DYNAMIC_ASSET_MAX_BYTES) {
+            throw new Error("验证码样式超过大小上限");
+          }
+          child.readyState = "complete";
+          child.onreadystatechange?.();
+          child.onload?.();
+        })
+        .catch((error) => child.onerror?.(error));
+    }
     return appended;
   };
 
@@ -1225,6 +1291,10 @@ function makeBrowserContext(options, onRequest) {
     currentScript: null,
     createElement(tagName) {
       const element = makeElement(tagName);
+      const prototype = contextReference?.HTMLElement?.prototype;
+      if (prototype) {
+        Object.setPrototypeOf(element, prototype);
+      }
       if (String(tagName).toLowerCase() === "iframe") {
         // about:blank iframe 在浏览器中拥有独立的 Window、Document 与内建对象
         // realm；FeiLin 会显式检查这一边界，不能把主 context 原样回填。
@@ -1404,6 +1474,63 @@ function makeBrowserContext(options, onRequest) {
         return;
       }
 
+      const applyResponse = (status, responseText, responseHeaders = []) => {
+        if (this._aborted) return;
+        this.status = status;
+        this.responseText = responseText;
+        this.response = this.responseType === "json"
+          ? JSON.parse(responseText)
+          : responseText;
+        this._responseHeaders = new Map(
+          responseHeaders.map(([name, value]) => [
+            String(name).toLowerCase(),
+            String(value),
+          ]),
+        );
+        this.readyState = 4;
+        this.onreadystatechange?.();
+        this.onload?.();
+      };
+
+      const form = parseForm(request.body);
+      const tracelessInit = contextReference?.__ALI_TRACELESS_INIT__;
+      if (form.Action === "InitCaptchaV3" && tracelessInit) {
+        Promise.resolve()
+          .then(() => {
+            if (
+              tracelessInit.consumed
+              || form.SceneId !== tracelessInit.sceneId
+              || typeof form.DeviceToken !== "string"
+              || form.DeviceToken.length < 1
+              || form.DeviceToken.length > 32 * 1024
+            ) {
+              throw new Error("无痕 Init 会话不一致");
+            }
+            tracelessInit.consumed = true;
+            tracelessInit.observedDeviceToken = form.DeviceToken;
+            tracelessInit.phase = "init_response";
+            applyResponse(200, JSON.stringify({
+              CertifyId: tracelessInit.certifyId,
+              Message: "success",
+              RequestId: "synthetic-traceless-init",
+              Code: "Success",
+              LimitFlow: false,
+              Success: true,
+              StaticPath: tracelessInit.staticPath,
+              CaptchaType: "TRACELESS",
+            }), [["content-type", "application/json"]]);
+          })
+          .catch(() => {
+            tracelessInit.phase = "init_rejected";
+            this.onerror?.(new Error("无痕 Init 会话无效"));
+          });
+        return;
+      }
+
+      if (form.Action === "VerifyCaptchaV3" && tracelessInit) {
+        tracelessInit.phase = "verify_request";
+      }
+
       const requestUrl = assertAllowedNetworkUrl(this.url);
       const timeoutController = new AbortController();
       const timeoutId = this.timeout > 0
@@ -1424,20 +1551,18 @@ function makeBrowserContext(options, onRequest) {
           if (this._aborted) {
             return;
           }
-          this.status = response.status;
-          this.responseText = responseText;
-          this.response = this.responseType === "json"
-            ? JSON.parse(responseText)
-            : responseText;
-          this._responseHeaders = new Map(
-            [...response.headers.entries()].map(([name, value]) => [
-              name.toLowerCase(),
-              value,
-            ]),
+          if (form.Action === "VerifyCaptchaV3" && tracelessInit) {
+            tracelessInit.verifyResult = parseTracelessVerifyResponse(
+              responseText,
+              tracelessInit.certifyId,
+            );
+            tracelessInit.phase = "verify_response";
+          }
+          applyResponse(
+            response.status,
+            responseText,
+            [...response.headers.entries()],
           );
-          this.readyState = 4;
-          this.onreadystatechange?.();
-          this.onload?.();
         })
         .catch((error) => {
           if (timeoutId !== null) {
@@ -1932,6 +2057,7 @@ function makeBrowserContext(options, onRequest) {
     StyleSheet: function StyleSheet() {},
     CSSStyleSheet: function CSSStyleSheet() {},
     Node: function Node() {},
+    NodeList: function NodeList() {},
     Text: function Text() {},
     Comment: function Comment() {},
     DocumentFragment: function DocumentFragment() {},
@@ -2061,6 +2187,13 @@ function makeBrowserContext(options, onRequest) {
     },
   });
   contextReference = vm.createContext(context);
+  Object.setPrototypeOf(
+    contextReference.HTMLElement.prototype,
+    contextReference.Element.prototype,
+  );
+  for (const element of [head, body, documentElement]) {
+    Object.setPrototypeOf(element, contextReference.HTMLElement.prototype);
+  }
   return contextReference;
 }
 
@@ -2070,6 +2203,41 @@ function parseForm(body) {
     return {};
   }
   return Object.fromEntries(new URLSearchParams(body));
+}
+
+
+function parseTracelessVerifyResponse(responseText, expectedCertifyId) {
+  let payload;
+  try {
+    payload = JSON.parse(responseText);
+  } catch {
+    throw new Error("无痕 Verify 响应不是有效 JSON");
+  }
+  const result = payload?.Result;
+  const certifyId = result?.certifyId || expectedCertifyId;
+  if (
+    !result
+    || typeof result !== "object"
+    || Array.isArray(result)
+    || typeof result.VerifyCode !== "string"
+    || result.VerifyCode.length < 1
+    || result.VerifyCode.length > 64
+    || typeof result.VerifyResult !== "boolean"
+    || typeof result.securityToken !== "string"
+    || result.securityToken.length > 16 * 1024
+    || typeof certifyId !== "string"
+    || certifyId.length < 1
+    || certifyId.length > 512
+    || certifyId !== expectedCertifyId
+  ) {
+    throw new Error("无痕 Verify 响应合同无效");
+  }
+  return {
+    verifyCode: result.VerifyCode,
+    verifyResult: result.VerifyResult,
+    securityToken: result.securityToken,
+    certifyId,
+  };
 }
 
 
@@ -2136,6 +2304,44 @@ function callPeFeiLinGetter(getterOwner, getterArguments) {
 
 
 function parseWorkerCompletionPayload(payload) {
+  if (payload?.mode === "traceless") {
+    const staticPath = payload.staticPath;
+    if (
+      payload === null
+      || typeof payload !== "object"
+      || Array.isArray(payload)
+      || payload.complete !== true
+      || Object.keys(payload).length !== 7
+      || typeof payload.sceneId !== "string"
+      || payload.sceneId.length < 1
+      || payload.sceneId.length > 64
+      || typeof payload.certifyId !== "string"
+      || payload.certifyId.length < 1
+      || payload.certifyId.length > 512
+      || typeof payload.captchaType !== "string"
+      || payload.captchaType.toUpperCase() !== "TRACELESS"
+      || typeof payload.deviceToken !== "string"
+      || payload.deviceToken.length < 1
+      || payload.deviceToken.length > 32 * 1024
+      || typeof staticPath !== "string"
+      || staticPath.length < 1
+      || staticPath.length > 512
+      || staticPath.startsWith("/")
+      || staticPath.includes("://")
+      || staticPath.split("/").includes("..")
+    ) {
+      throw new Error("challenge-worker 无痕完成信号无效");
+    }
+    return {
+      complete: true,
+      mode: "traceless",
+      sceneId: payload.sceneId,
+      certifyId: payload.certifyId,
+      captchaType: "TRACELESS",
+      deviceToken: payload.deviceToken,
+      staticPath,
+    };
+  }
   const interactionEvents = payload?.interactionEvents;
   const postInteractionDelayMs = payload?.postInteractionDelayMs;
   if (
@@ -2266,6 +2472,219 @@ async function readWorkerCompletionInput() {
 }
 
 
+async function runTracelessCaptcha(
+  context,
+  runtimeConfig,
+  options,
+  completion,
+) {
+  if (
+    typeof context?.initAliyunCaptcha !== "function"
+    || !runtimeConfig
+    || typeof runtimeConfig !== "object"
+  ) {
+    throw new Error("无痕验证码运行态不可用");
+  }
+
+  const elementId = "ali-traceless-captcha";
+  const buttonId = "ali-traceless-captcha-button";
+  const element = context.document.createElement("div");
+  const button = context.document.createElement("button");
+  element.id = elementId;
+  button.id = buttonId;
+  button.type = "button";
+  button.tabIndex = -1;
+
+  const clickListeners = [];
+  button.addEventListener = (type, listener) => {
+    if (
+      type === "click"
+      && (
+        typeof listener === "function"
+        || typeof listener?.handleEvent === "function"
+      )
+    ) {
+      clickListeners.push(listener);
+    }
+  };
+  button.removeEventListener = (type, listener) => {
+    if (type !== "click") return;
+    const index = clickListeners.indexOf(listener);
+    if (index >= 0) clickListeners.splice(index, 1);
+  };
+  button.click = () => {
+    const event = new context.Event("click", {
+      bubbles: true,
+      cancelable: true,
+    });
+    event.target = button;
+    event.currentTarget = button;
+    if (typeof button.onclick === "function") {
+      button.onclick.call(button, event);
+    }
+    for (const listener of [...clickListeners]) {
+      if (typeof listener === "function") {
+        listener.call(button, event);
+      } else {
+        listener.handleEvent.call(listener, event);
+      }
+    }
+    return !event.defaultPrevented;
+  };
+  button.dispatchEvent = (event) => {
+    if (event?.type !== "click") return true;
+    return button.click();
+  };
+
+  const elements = new Map([
+    [elementId, element],
+    [buttonId, button],
+  ]);
+  const originalGetElementById = context.document.getElementById;
+  const originalQuerySelector = context.document.querySelector;
+  const originalQuerySelectorAll = context.document.querySelectorAll;
+  context.document.getElementById = function getElementById(id) {
+    return elements.get(String(id))
+      ?? originalGetElementById.call(this, id);
+  };
+  context.document.querySelector = function querySelector(selector) {
+    const text = String(selector);
+    return text.startsWith("#")
+      ? elements.get(text.slice(1)) ?? null
+      : originalQuerySelector.call(this, selector);
+  };
+  context.document.querySelectorAll = function querySelectorAll(selector) {
+    const matched = this.querySelector(selector);
+    return matched ? [matched] : originalQuerySelectorAll.call(this, selector);
+  };
+  context.document.body.appendChild(element);
+  context.document.body.appendChild(button);
+
+  const hadDeviceToken = Object.prototype.hasOwnProperty.call(
+    runtimeConfig,
+    "DeviceToken",
+  );
+  const originalDeviceToken = runtimeConfig.DeviceToken;
+  let captchaInstance = null;
+  let timeoutId = null;
+  try {
+    runtimeConfig.DeviceToken = completion.deviceToken;
+    if (runtimeConfig.DeviceToken !== completion.deviceToken) {
+      throw new Error("无痕验证码 DeviceToken 不可写");
+    }
+    context.__ALI_TRACELESS_INIT__ = {
+      sceneId: completion.sceneId,
+      certifyId: completion.certifyId,
+      captchaType: "TRACELESS",
+      staticPath: completion.staticPath,
+      consumed: false,
+      observedDeviceToken: "",
+      verifyResult: null,
+      phase: "ready",
+    };
+    const captchaVerifyParam = await new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        if (timeoutId !== null) clearTimeout(timeoutId);
+        callback(value);
+      };
+      timeoutId = setTimeout(
+        () => {
+          const phase = context.__ALI_TRACELESS_INIT__?.phase;
+          const code = {
+            ready: "TRACELESS_TIMEOUT_READY",
+            calling_init: "TRACELESS_TIMEOUT_CALLING_INIT",
+            init_rejected: "TRACELESS_TIMEOUT_INIT_REJECTED",
+            init_response: "TRACELESS_TIMEOUT_INIT_RESPONSE",
+            instance: "TRACELESS_TIMEOUT_INSTANCE",
+            click: "TRACELESS_TIMEOUT_CLICK",
+            verify_request: "TRACELESS_TIMEOUT_VERIFY_REQUEST",
+            verify_response: "TRACELESS_TIMEOUT_VERIFY_RESPONSE",
+          }[phase] ?? "TRACELESS_TIMEOUT_READY";
+          finish(reject, tracelessBridgeError(code));
+        },
+        options.timeoutMs,
+      );
+      try {
+        context.__ALI_TRACELESS_INIT__.phase = "calling_init";
+        context.initAliyunCaptcha({
+          SceneId: completion.sceneId,
+          mode: "popup",
+          element: `#${elementId}`,
+          button: `#${buttonId}`,
+          language: "cn",
+          timeout: Math.min(options.timeoutMs, 5_000),
+          rem: 1,
+          success(value) {
+            context.__ALI_TRACELESS_INIT__.phase = "success";
+            if (
+              !context.__ALI_TRACELESS_INIT__?.consumed
+              || context.__ALI_TRACELESS_INIT__?.verifyResult === null
+              || typeof value !== "string"
+              || value.length < 1
+              || value.length > 16 * 1024
+            ) {
+              finish(reject, new Error("无痕验证码成功参数无效"));
+              return;
+            }
+            finish(resolve, value);
+          },
+          fail() {
+            finish(reject, tracelessBridgeError("TRACELESS_FAIL_CALLBACK"));
+          },
+          onClose() {
+            finish(reject, tracelessBridgeError("TRACELESS_CLOSE_CALLBACK"));
+          },
+          getInstance(instance) {
+            captchaInstance = instance;
+            context.__ALI_TRACELESS_INIT__.phase = "instance";
+            setTimeout(() => {
+              context.__ALI_TRACELESS_INIT__.phase = "click";
+              button.click();
+            }, 0);
+          },
+        });
+      } catch {
+        finish(reject, tracelessBridgeError("TRACELESS_INIT_THROW"));
+      }
+    });
+    const observedDeviceToken = (
+      context.__ALI_TRACELESS_INIT__?.observedDeviceToken
+    );
+    if (
+      typeof observedDeviceToken !== "string"
+      || observedDeviceToken.length < 1
+      || observedDeviceToken.length > 32 * 1024
+    ) {
+      throw new Error("无痕验证码 DeviceToken 无效");
+    }
+    return {
+      captchaVerifyParam,
+      deviceToken: observedDeviceToken,
+      verifyResult: context.__ALI_TRACELESS_INIT__.verifyResult,
+    };
+  } finally {
+    if (timeoutId !== null) clearTimeout(timeoutId);
+    try {
+      captchaInstance?.destroy?.();
+    } catch {}
+    context.document.getElementById = originalGetElementById;
+    context.document.querySelector = originalQuerySelector;
+    context.document.querySelectorAll = originalQuerySelectorAll;
+    context.document.body.removeChild(element);
+    context.document.body.removeChild(button);
+    delete context.__ALI_TRACELESS_INIT__;
+    if (hadDeviceToken) {
+      runtimeConfig.DeviceToken = originalDeviceToken;
+    } else {
+      delete runtimeConfig.DeviceToken;
+    }
+  }
+}
+
+
 function writeHostOutput(payload) {
   fs.writeFileSync(1, `${JSON.stringify(payload)}\n`);
 }
@@ -2361,14 +2780,14 @@ async function runChallengeHost(options, source) {
         || typeof payload !== "object"
         || Array.isArray(payload)
         || payload.sessionId !== state.sessionId
-        || !["init", "verify", "error"].includes(payload.stage)
+        || !["init", "verify", "traceless", "error"].includes(payload.stage)
       ) {
         reportSlotError(state, worker);
         void worker.terminate();
         return;
       }
       writeHostOutput(payload);
-      if (payload.stage === "verify") {
+      if (payload.stage === "verify" || payload.stage === "traceless") {
         state.completed = true;
         void worker.terminate();
       } else if (payload.stage === "error") {
@@ -2670,6 +3089,34 @@ async function main() {
         requests: summarizeRequests(),
       });
       const completion = await readWorkerCompletionInput();
+      if (completion.mode === "traceless") {
+        const tracelessResult = await runTracelessCaptcha(
+          context,
+          runtimeConfig,
+          options,
+          completion,
+        );
+        writeBridgeOutput({
+          stage: "traceless",
+          captchaType: "TRACELESS",
+          sceneId: completion.sceneId,
+          certifyId: completion.certifyId,
+          captchaVerifyParam: tracelessResult.captchaVerifyParam,
+          tracelessDeviceToken: tracelessResult.deviceToken,
+          verifyCode: tracelessResult.verifyResult.verifyCode,
+          verifyResult: tracelessResult.verifyResult.verifyResult,
+          securityToken: tracelessResult.verifyResult.securityToken,
+          verifyCertifyId: tracelessResult.verifyResult.certifyId,
+          deviceConfig,
+          verifyArgProfile,
+          requestCount: requests.length,
+          requests: summarizeRequests(),
+        });
+        if (multiplexSessionId() !== null) {
+          return;
+        }
+        process.exit(0);
+      }
       getterOwner = selectFeiLinGetterOwner(context);
       if (!getterOwner) {
         throw new Error(
@@ -2784,6 +3231,7 @@ export {
   isSdkRuntimeState,
   makeBrowserContext,
   makeElementFactory,
+  parseTracelessVerifyResponse,
   parseWorkerCompletionPayload,
   replayFeiLinInteractionEvents,
   refreshFeiLinToken,

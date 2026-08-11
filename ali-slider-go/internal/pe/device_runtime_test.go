@@ -125,6 +125,32 @@ func validVerifyDeviceStage(t *testing.T, gatherCost string, eventCount int) dev
 	}
 }
 
+func validTracelessDeviceStage(t *testing.T, sceneID, certifyID string) deviceBridgeStage {
+	t.Helper()
+	config := validRuntimeProtocolConfig()
+	parameter, err := protocol.BuildBusinessCaptchaVerifyParam(certifyID, sceneID, "fixture-security-token", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return deviceBridgeStage{
+		Stage: "traceless", CaptchaType: "TRACELESS", SceneID: sceneID,
+		CertifyID: certifyID, CaptchaVerifyParam: parameter,
+		TracelessDeviceToken: runtimeTokenWithFields(t, config, 111, "53", 2_000_000_000_000, 2_000_000_000_900),
+		VerifyCode:           "T001",
+		VerifyResult:         true,
+		SecurityToken:        "fixture-security-token",
+		VerifyCertifyID:      certifyID,
+		DeviceConfig:         nativeConfigFromProtocol(config),
+		VerifyArgProfile:     deviceVerifyArgProfile{AccessSec: "access-sec", SessionIDSalt: "session-salt"},
+		RequestCount:         5,
+		Requests: []deviceRequestSummary{
+			{Action: "Log1"}, {Action: "Log2"}, {Action: "Log3"},
+			{Action: "InitCaptchaV3", FieldNames: []string{"SceneId", "DeviceToken"}},
+			{Action: "VerifyCaptchaV3", FieldNames: []string{"SceneId", "CertifyId", "CaptchaVerifyParam"}},
+		},
+	}
+}
+
 func newAcceptedRuntimeSession(t *testing.T, gatherCost string) *DeviceRuntimeSession {
 	t.Helper()
 	session := &DeviceRuntimeSession{options: validDeviceRuntimeOptions()}
@@ -209,6 +235,71 @@ func TestDeviceRuntimeRejectsInvalidStages(t *testing.T) {
 				t.Fatalf("error=%v", err)
 			}
 		})
+	}
+}
+
+func TestDeviceRuntimeAcceptsBoundTracelessStage(t *testing.T) {
+	const sceneID, certifyID = "wa3238du", "fixture-traceless-certify"
+	input := TracelessInput{
+		SceneID: sceneID, CertifyID: certifyID,
+		StaticPath: "3.29.0/pe.091.fixture.js", CaptchaType: "traceless",
+	}
+	session := newAcceptedRuntimeSession(t, "53")
+	result, err := session.acceptTracelessStage(validTracelessDeviceStage(t, sceneID, certifyID), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Succeeded() || result.CertifyID != certifyID || result.VerifyCode != "T001" || strings.Join(result.RequestActions, ",") != "Log1,Log2,Log3,InitCaptchaV3,VerifyCaptchaV3" {
+		t.Fatalf("result=%+v", result)
+	}
+	for _, formatted := range []string{result.String(), result.GoString()} {
+		if strings.Contains(formatted, certifyID) || strings.Contains(formatted, result.SecurityToken) {
+			t.Fatalf("traceless result formatting leaked secrets: %s", formatted)
+		}
+	}
+}
+
+func TestDeviceRuntimeRejectsMismatchedTracelessStages(t *testing.T) {
+	const sceneID, certifyID = "wa3238du", "fixture-traceless-certify"
+	input := TracelessInput{
+		SceneID: sceneID, CertifyID: certifyID,
+		StaticPath: "3.29.0/pe.091.fixture.js", CaptchaType: "TRACELESS",
+	}
+	tests := []struct {
+		name   string
+		mutate func(*deviceBridgeStage)
+	}{
+		{"scene", func(stage *deviceBridgeStage) { stage.SceneID = "other" }},
+		{"certify", func(stage *deviceBridgeStage) { stage.CertifyID = "other" }},
+		{"config", func(stage *deviceBridgeStage) { stage.DeviceConfig.IP = "other" }},
+		{"order", func(stage *deviceBridgeStage) {
+			stage.Requests[3], stage.Requests[4] = stage.Requests[4], stage.Requests[3]
+		}},
+		{"fields", func(stage *deviceBridgeStage) { stage.Requests[4].FieldNames = []string{"SceneId"} }},
+		{"parameter", func(stage *deviceBridgeStage) { stage.CaptchaVerifyParam = "invalid" }},
+		{"official token", func(stage *deviceBridgeStage) { stage.SecurityToken = "other" }},
+		{"official certify", func(stage *deviceBridgeStage) { stage.VerifyCertifyID = "other" }},
+		{"official code", func(stage *deviceBridgeStage) { stage.VerifyCode = "F001" }},
+		{"device token", func(stage *deviceBridgeStage) { stage.TracelessDeviceToken = "invalid" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			session := newAcceptedRuntimeSession(t, "53")
+			stage := validTracelessDeviceStage(t, sceneID, certifyID)
+			test.mutate(&stage)
+			if _, err := session.acceptTracelessStage(stage, input); !errors.Is(err, ErrUnsupportedPE) {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+	for _, invalid := range []TracelessInput{
+		{},
+		{SceneID: sceneID, CertifyID: certifyID, StaticPath: "../bad.js", CaptchaType: "TRACELESS"},
+		{SceneID: sceneID, CertifyID: certifyID, StaticPath: "valid.js", CaptchaType: "PUZZLE"},
+	} {
+		if validateTracelessInput(invalid) == nil {
+			t.Fatalf("invalid input accepted: %+v", invalid)
+		}
 	}
 }
 
@@ -378,7 +469,7 @@ func TestConnectRelayTunnelsOnlyAllowedHTTPSHostsAndClosesActiveConnections(t *t
 		t.Fatal(err)
 	}
 	reader := bufio.NewReader(client)
-	_, _ = io.WriteString(client, "CONNECT g.alicdn.com:443 HTTP/1.1\r\nHost: g.alicdn.com:443\r\n\r\n")
+	_, _ = io.WriteString(client, "CONNECT x.alicdn.com:443 HTTP/1.1\r\nHost: x.alicdn.com:443\r\n\r\n")
 	status, err = reader.ReadString('\n')
 	if err != nil || !strings.Contains(status, "200") {
 		t.Fatalf("CONNECT status=%q err=%v", status, err)
@@ -487,6 +578,33 @@ func TestOpenDeviceKeepsOneProcessThroughCompletion(t *testing.T) {
 	}
 	if _, err := session.PESDKSource(); err == nil {
 		t.Fatal("closed session returned SDK source")
+	}
+}
+
+func TestOpenDeviceKeepsOneProcessThroughTracelessCompletion(t *testing.T) {
+	const sceneID, certifyID = "wa3238du", "fixture-traceless-certify"
+	stub := writeDeviceRuntimeStub(t, validInitialDeviceStage(t, "53"), validTracelessDeviceStage(t, sceneID, certifyID))
+	resolver := newNodeKeyResolver(stub)
+	resolver.sdk = cachedSDK{source: []byte("cached-sdk"), fetchedAt: time.Now()}
+	session, err := resolver.OpenDevice(context.Background(), newScriptTransport(), device.Profile{}, validDeviceRuntimeOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	result, err := session.SolveTraceless(context.Background(), TracelessInput{
+		SceneID: sceneID, CertifyID: certifyID,
+		StaticPath: "3.29.0/pe.091.fixture.js", CaptchaType: "TRACELESS",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Succeeded() || result.CertifyID != certifyID {
+		t.Fatalf("result=%+v", result)
+	}
+	if _, err := session.SolveTraceless(context.Background(), TracelessInput{
+		SceneID: sceneID, CertifyID: certifyID, StaticPath: "valid.js", CaptchaType: "TRACELESS",
+	}); err == nil {
+		t.Fatal("completed session accepted a second traceless completion")
 	}
 }
 

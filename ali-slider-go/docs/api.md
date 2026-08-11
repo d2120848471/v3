@@ -153,6 +153,8 @@ GET 是真实有副作用的 Solve，不是健康检查。即使响应头禁止�
 | `timingsMs` | object | 稳定阶段名到非负毫秒数的映射 |
 | `traceId` | string | 服务生成的 12 位小写十六进制追踪 ID |
 
+无痕和图片拼图返回同一组阿里 Verify 字段。调用方可按业务要求自行用 `certifyId`、`sceneId`、成功态 `isSign=true` 和 `securityToken` 组装 `captcha_verify_param`；本 Solver 不预拼接或提交该业务字段，也不主动调用站点短信接口。
+
 `pkg/slider.Client`已接通完整Go编排、进程内V8 Device和精确PE动态自校验，不启动Node子进程。`ok=true`的判定是 `VerifyCode == "T001" && VerifyResult && securityToken != ""`。2026-08-09最终安全候选真实50次为 `47/50`、mean `2562ms`、P50 `2157ms`、P95 `4910ms`；3次均为业务F015，分类错误0。该数据直接调用Client，不经HTTP Handler，且mean约1秒未通过。2026-08-07 `196/200`与 `P95=984ms`仍只属于旧运行时对照。
 
 两次记录都直接验证公共 Client，不是 HTTP 传输基准。历史批次的 `P99=1018ms`，不能声称 P99 或每个响应都小于 1 秒；当前单次 smoke 更不能用来计算分位数。聚合结果不包含令牌、挑战标识、图片或上游正文。

@@ -15,6 +15,7 @@
 - 新建独立 Go module，固定 Go `1.26.5`；生产仅引入 `purego` 动态库加载依赖，Go launcher 保持 `CGO_ENABLED=0`。
 - 增加可并发复用的公共 `slider.Client`：`NewClient`、`Solve`、`Prime`、`PurgeArtifacts` 和幂等 `Close`。
 - 增加完整 Go 编排：V8 Device → InitCaptchaV3 → 双图下载 → Vision → Track/V8 动态 PE → 同一 Device Isolate Complete → 唯一 VerifyCaptchaV3。
+- 增加 `TRACELESS` 无痕分支：同一 SDK/FeiLin VM 完成官方 Init/Verify，并返回与图片拼图一致的 Verify 结果字段。
 - 增加稳定请求、结果和分类错误合同，包含完整阶段 `timingsMs`。
 - 增加 JS/RPC 编码、RPC v1 签名、AES-CBC、DeviceToken、data codec、Verify 参数和自校验。
 - 增加设备画像、浏览器头、指纹、Log1/2/3、首枚/刷新 token、getter/event 和单会话完成态。
@@ -88,6 +89,7 @@
 - 修复进程级固定画像被全部预热会话共享：现在每个live slot生成独立画像，Solver以租到会话的实际画像统一构造RPC headers、图片请求和PE输入。
 - 修复大预热使Device VM同时Open/Complete后出现137/138字段或request sequence错误：默认直连公开组件A/B确认预热池库存边界为4，配置、Client、池和V8动作gate统一执行该边界。
 - 修复满池matching Lease绕过池额外冷建及release广播早于refill登记的竞态；现在等待已有slot recycle，并在广播前占住pending。
+- 修复无图 `TRACELESS` Init 被拼图图片校验拒绝，并避免无痕挑战误入图片、视觉、轨迹和 PE 链路。
 
 ### Security
 
@@ -96,7 +98,7 @@
 - 使用 Go 1.26 标准库 `http.CrossOriginProtection` 拒绝明确浏览器跨源 GET/POST Solve；有副作用的 GET 在检查副本中按 POST 对待，返回脱敏 `403 ApiOriginError` 且不进入 Solver，同源页和无浏览器来源头的 curl/程序客户端保持兼容。
 - HTTP Handler 不内置访问频率或并发准入保护；对外暴露必须由受控网络、反向代理或 API gateway 限制身份、频率、并发和总量。
 - 每个 `CertifyId` 最多尝试一次 Verify；前置失败为零 Verify，网络未知也不重试。
-- 动态公开脚本限制为精确 HTTPS host/默认端口/路径格式和 2 MiB；V8 C ABI/host 回调有输入输出、heap 和超时上限。Device Isolate 只能通过 Go host 访问 `g.alicdn.com`/`*.aliyuncs.com` HTTPS 且逐跳校验重定向；PE Isolate 禁网。挑战输出由 Go 独立复核。
+- 动态公开脚本限制为精确 HTTPS host/默认端口/路径格式和 2 MiB；V8 C ABI/host 回调有输入输出、heap 和超时上限。Device Isolate 只能通过 Go host 访问 `g.alicdn.com`、`x.alicdn.com` 或 `*.aliyuncs.com` HTTPS 且逐跳校验重定向；PE Isolate禁网。挑战输出由 Go 独立复核。
 - 代理 route 和每 host 连接数限制在 `1..32`；直连显式忽略环境 proxy。
 - 设备预热池只复用完整 endpoint/prefix/region/route/profile/timing key 一致的会话。
 - 资产固定 HTTPS CDN，重定向逐跳校验；单图默认最多 8 MiB。
@@ -117,6 +119,7 @@
 - PE builder 的 Python oracle 解包语义对照通过；加入逐挑战 Device/PE runtime 后，`internal/pe` 离线覆盖率为 `73.9%`，真实 `.so` 路径另由 Linux 双架构 V8 集成门禁覆盖。
 - 动态 PE/设备 runtime 的 5 分钟精确缓存、24 路并发 miss 合并、不安全路径、下载上限、wrapper/ABI 失败分类、持久 Isolate、指纹字段、getter/事件/时钟合同和 V8 host 生命周期均有测试；生产 V8 公开 `.058` 分片探针可显式复现。
 - 完整 Solver Mock 链通过：成功路径一次 Verify、低置信零 Verify、Verify 网络错误一次尝试。
+- TRACELESS 离线合同与显式在线单次组件 smoke 通过；在线结果 `T001 / true`，未调用站点短信 API。
 - 完整 Solver 的 32 路并发 Mock 正确性测试通过；该测试不作为吞吐、资源或尾延迟报告。
 - 设备预热池通过有界容量、key 隔离、过期、取消、失败、补货及并发 Lease/Close 的 race 测试。
 - HTTP 四路径、Solve 两种 method、旧 GET query 重复键/默认值/64 KiB/非法 encoding、GET/POST 参数源隔离、内嵌页安全头/nonce/无 Solver 副作用、两种 method 跨源 403 与旧客户端兼容、64 个并发合法请求全部进入 Solver、OpenAPI 不含本地 429 均有离线测试。

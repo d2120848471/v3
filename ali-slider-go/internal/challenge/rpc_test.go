@@ -176,6 +176,36 @@ func TestVerifyCompatibilityUsesNestedResultAndCertifyIDFallback(t *testing.T) {
 	}
 }
 
+func TestRPCInitAcceptsImageLessTracelessOnly(t *testing.T) {
+	newClient := func(captchaType string) *RPCClient {
+		t.Helper()
+		client, err := NewRPCClient(RPCOptions{
+			Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				response := `{"Success":true,"Code":"Success","CertifyId":"fixture-traceless","StaticPath":"3.29.0/pe.091.fixture.js","CaptchaType":"` + captchaType + `"}`
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(response)), Request: request}, nil
+			}),
+			Sources: runtimekit.Sources{
+				Clock: &fixedClock{now: time.UnixMilli(1_700_000_000_000)}, Entropy: &byteEntropy{},
+			}, SceneID: "scene", Prefix: "prefix",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return client
+	}
+
+	challenge, err := newClient("traceless").Init(context.Background(), "init-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if challenge.CaptchaType != "traceless" || challenge.ImagePath != "" || challenge.PuzzleImagePath != "" || challenge.StaticPath == "" {
+		t.Fatalf("challenge=%+v", challenge)
+	}
+	if _, err := newClient("slider").Init(context.Background(), "init-token"); err == nil {
+		t.Fatal("image-less slider challenge was accepted")
+	}
+}
+
 func TestRPCBindsVerifyToSingleInit(t *testing.T) {
 	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(

@@ -83,6 +83,7 @@ type solverTransport struct {
 	verifyMalformed bool
 	deviceMalformed bool
 	staticPath      string
+	captchaType     string
 	beforeVerify    func() error
 	initUserAgent   string
 	verifyUserAgent string
@@ -150,11 +151,19 @@ func (transport *solverTransport) RoundTrip(request *http.Request) (*http.Respon
 		if staticPath == "" {
 			staticPath = "3.29.0/pe.091.00665af58b020d81.js"
 		}
-		return solverJSONResponse(request, map[string]any{
+		captchaType := transport.captchaType
+		if captchaType == "" {
+			captchaType = "slider"
+		}
+		response := map[string]any{
 			"Success": true, "Code": "Success", "CertifyId": identifier,
-			"Image": "fixtures/back.png", "PuzzleImage": "fixtures/shadow.png",
-			"StaticPath": staticPath, "CaptchaType": "slider",
-		})
+			"StaticPath": staticPath, "CaptchaType": captchaType,
+		}
+		if !strings.EqualFold(captchaType, "TRACELESS") {
+			response["Image"] = "fixtures/back.png"
+			response["PuzzleImage"] = "fixtures/shadow.png"
+		}
+		return solverJSONResponse(request, response)
 	case "VerifyCaptchaV3":
 		if transport.beforeVerify != nil {
 			if err := transport.beforeVerify(); err != nil {
@@ -285,6 +294,22 @@ func (*completedDeviceSession) Complete(_ context.Context, _ string, interaction
 }
 func (*completedDeviceSession) Close() {}
 
+type completedTracelessDeviceSession struct {
+	completedDeviceSession
+	calls int
+	input pe.TracelessInput
+}
+
+func (session *completedTracelessDeviceSession) SolveTraceless(_ context.Context, input pe.TracelessInput) (pe.TracelessResult, error) {
+	session.calls++
+	session.input = input
+	return pe.TracelessResult{
+		SecurityToken: "fixture-traceless-security-token",
+		VerifyCode:    "T001", VerifyResult: true, CertifyID: input.CertifyID,
+		RequestActions: []string{"Log1", "Log2", "Log3", "InitCaptchaV3", "VerifyCaptchaV3"},
+	}, nil
+}
+
 type profiledCompletedDeviceSession struct {
 	completedDeviceSession
 	profile device.Profile
@@ -360,6 +385,47 @@ func TestSolverOfflineCompleteSuccess(t *testing.T) {
 	transport.mu.Unlock()
 	if initCount != 1 || verifyCount != 1 || strings.Join(actions, ",") != "Log1,Log2,Log3,Log2" {
 		t.Fatalf("init=%d verify=%d actions=%v", initCount, verifyCount, actions)
+	}
+	if entries, err := os.ReadDir(artifactDirectory); !errors.Is(err, os.ErrNotExist) && (err != nil || len(entries) != 0) {
+		t.Fatalf("success wrote artifacts: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestSolverRoutesImageLessTracelessThroughDeviceSession(t *testing.T) {
+	transport := newSolverTransport(t, "gap")
+	transport.captchaType = "TRACELESS"
+	resolver := &staticPEKeyResolver{profile: pe.RuntimeProfile{
+		ArgumentKey: "0kd8i0mclivjow32", IncludeScreenInfo: true,
+	}}
+	solver, artifactDirectory := newIntegrationSolverWithPEKeys(t, transport, 0.45, 5*time.Second, resolver)
+	deviceSession := &completedTracelessDeviceSession{}
+	solver.options.OpenDevice = func(context.Context, http.RoundTripper, device.Profile, SolveRequest) (DeviceSession, func(), error) {
+		return deviceSession, func() {}, nil
+	}
+	outcome, err := solver.Solve(context.Background(), SolveRequest{SceneID: "wa3238du", Prefix: "1ohgtl"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !outcome.OK || !outcome.VerifyResult || outcome.VerifyCode != "T001" || outcome.SecurityToken == "" || outcome.CertifyID == "" {
+		t.Fatalf("outcome=%+v", outcome)
+	}
+	if deviceSession.calls != 1 || deviceSession.input.SceneID != "wa3238du" || deviceSession.input.CertifyID != outcome.CertifyID || !strings.EqualFold(deviceSession.input.CaptchaType, "TRACELESS") {
+		t.Fatalf("traceless calls=%d input=%+v", deviceSession.calls, deviceSession.input)
+	}
+	transport.mu.Lock()
+	initCount, verifyCount := transport.initCount, transport.verifyCount
+	assetRequests := len(transport.assetUserAgents)
+	transport.mu.Unlock()
+	resolver.mu.Lock()
+	prepareCount, buildCount := len(resolver.paths), len(resolver.buildProfileIDs)
+	resolver.mu.Unlock()
+	if initCount != 1 || verifyCount != 0 || assetRequests != 0 || prepareCount != 0 || buildCount != 0 {
+		t.Fatalf("init=%d rpcVerify=%d assets=%d prepare=%d build=%d", initCount, verifyCount, assetRequests, prepareCount, buildCount)
+	}
+	for _, stage := range []string{"setup", "deviceSession", "init", "traceless", "clientCleanup", "total"} {
+		if _, ok := outcome.TimingsMS[stage]; !ok {
+			t.Errorf("missing timing %q", stage)
+		}
 	}
 	if entries, err := os.ReadDir(artifactDirectory); !errors.Is(err, os.ErrNotExist) && (err != nil || len(entries) != 0) {
 		t.Fatalf("success wrote artifacts: entries=%v err=%v", entries, err)

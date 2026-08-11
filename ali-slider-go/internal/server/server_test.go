@@ -634,6 +634,9 @@ func TestOnlyFrozenRoutesAreExposed(t *testing.T) {
 			t.Errorf("OpenAPI success schema missing %q", field)
 		}
 	}
+	if _, exists := properties["captchaVerifyParam"]; exists {
+		t.Error("OpenAPI still exposes prebuilt captchaVerifyParam")
+	}
 	encoded, err := json.Marshal(document)
 	if err != nil {
 		t.Fatal(err)

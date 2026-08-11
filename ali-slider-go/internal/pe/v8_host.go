@@ -118,7 +118,7 @@ func allowedV8NetworkURL(value string) (*url.URL, error) {
 		return nil, errors.New("V8 HTTP URL is invalid")
 	}
 	hostname := strings.ToLower(parsed.Hostname())
-	hostAllowed := hostname == keyPEHost || strings.HasSuffix(hostname, ".aliyuncs.com")
+	hostAllowed := hostname == keyPEHost || hostname == keyCaptchaAssetHost || strings.HasSuffix(hostname, ".aliyuncs.com")
 	if parsed.Port() != "" || parsed.User != nil || !hostAllowed {
 		return nil, errors.New("V8 HTTP URL is outside the allowlist")
 	}

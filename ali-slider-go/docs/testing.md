@@ -292,6 +292,27 @@ errorsByKind={} wallP50Ms=1579 wallP95Ms=1579 wallP99Ms=1579 wallMaxMs=1579
 
 结果满足严格成功定义：`VerifyCode=T001`、`VerifyResult=true`、token 非空。该样本只证明当前同 VM Device + 原生动态 PE 合同恢复；样本数为 1，不能计算或宣称当前成功率、P95/P99 门槛，且不替代后续正式授权批次。
 
+## 2026-08-11 TRACELESS 无痕组件 smoke
+
+普通离线门禁包含 SDK bridge 的 DOM 原型、`NodeList`、完成消息、`x.alicdn.com` 动态资源白名单和错误脱敏合同：
+
+```bash
+go test -count=1 ./internal/pe -run 'TestNodeSDKBridgeTracelessContracts|TestDeviceRuntimeAcceptsBoundTracelessStage'
+```
+
+显式在线 smoke 只访问阿里公开 Device、Captcha Init/Verify 和动态资源端点；不调用 PixCake 或其他站点的短信 API，也不记录挑战 ID、token 或业务提交参数：
+
+```bash
+env \
+  ALI_SLIDER_NODE_TRACELESS_ONLINE=1 \
+  ALI_SLIDER_ONLINE_SCENE_ID=wa3238du \
+  ALI_SLIDER_ONLINE_PREFIX=1ohgtl \
+  go test -tags=online ./internal/pe \
+  -run 'TestOnlineNodeTracelessRuntime$' -count=1 -v
+```
+
+2026-08-11 的单次结果为 `code=T001 result=true requests=7`。该证据证明当前 PixCake 场景的 TRACELESS 组件合同可完成，不代表短信已发送、完整站点业务已成功，也不能外推成功率或延迟分位数。生产 `slider.Client` 使用同进程 V8 路径；本机缺少可加载的 Darwin V8 wrapper，因此本轮在线 smoke 验证的是同源 JS bridge 的 Node 测试路径，V8 宿主/消息分流只由离线测试覆盖。
+
 ## 2026-08-07 历史授权候选批次结果
 
 历史候选批次已在明确授权下恰好执行一次，参数和结果如下；它先于本次 Device/PE 动态边界修复，不得外推到当前架构：

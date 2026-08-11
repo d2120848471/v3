@@ -118,6 +118,10 @@ type deviceProfileProvider interface {
 	DeviceProfile() device.Profile
 }
 
+type tracelessDeviceSession interface {
+	SolveTraceless(context.Context, pe.TracelessInput) (pe.TracelessResult, error)
+}
+
 // PEKeyResolver 缓存公开 SDK/PE 脚本，并用当前分片逐挑战原生生成
 // data；离线测试可注入无 V8、无网络的实现。
 type PEKeyResolver interface {
@@ -146,7 +150,7 @@ type SolverOptions struct {
 	PEKeys            PEKeyResolver
 }
 
-// Solver 执行 Device → Init → Assets → Vision → PE → Device Complete → Verify。
+// Solver 执行 Device → Init，并按挑战类型分流 TRACELESS 或图片拼图链路。
 type Solver struct {
 	options SolverOptions
 }
@@ -287,6 +291,35 @@ func (solver *Solver) Solve(parent context.Context, request SolveRequest) (outco
 	}
 	if err := checkStageContext(ctx, currentStage); err != nil {
 		return outcome, err
+	}
+	if isTracelessCaptchaType(challengeValue.CaptchaType) {
+		currentStage = "traceless"
+		tracelessSession, ok := session.(tracelessDeviceSession)
+		if !ok {
+			return outcome, fail(FailureProtocol, currentStage, "设备会话不支持无痕验证码", nil)
+		}
+		tracelessStarted := time.Now()
+		tracelessResult, solveErr := tracelessSession.SolveTraceless(ctx, pe.TracelessInput{
+			SceneID: request.SceneID, CertifyID: challengeValue.CertifyID,
+			StaticPath: challengeValue.StaticPath, CaptchaType: challengeValue.CaptchaType,
+		})
+		timings[currentStage] = elapsedMilliseconds(tracelessStarted)
+		if solveErr != nil {
+			return outcome, peRuntimeFailure(ctx, currentStage, "无痕验证码执行失败", solveErr, false)
+		}
+		if !tracelessResult.Succeeded() || tracelessResult.CertifyID != challengeValue.CertifyID {
+			return outcome, fail(FailureProtocol, currentStage, "无痕验证码响应合同不一致", nil)
+		}
+		if err := checkStageContext(ctx, currentStage); err != nil {
+			return outcome, err
+		}
+		releaseSession()
+		outcome.OK = true
+		outcome.SecurityToken = tracelessResult.SecurityToken
+		outcome.VerifyCode = tracelessResult.VerifyCode
+		outcome.VerifyResult = tracelessResult.VerifyResult
+		outcome.CertifyID = tracelessResult.CertifyID
+		return outcome, nil
 	}
 
 	// PE 源码和两张图片只依赖 Init 路径，三者并发下载。
@@ -563,9 +596,9 @@ func validateSolveRequest(request SolveRequest) error {
 }
 
 func newTimingMap() map[string]int {
-	result := make(map[string]int, 13)
+	result := make(map[string]int, 14)
 	for _, name := range []string{
-		"setup", "deviceSession", "init", "resolvePEKey", "downloadAssets", "downloadBackground", "downloadShadow",
+		"setup", "deviceSession", "init", "traceless", "resolvePEKey", "downloadAssets", "downloadBackground", "downloadShadow",
 		"vision", "buildVerifyData", "completeDevice", "verify", "clientCleanup", "total",
 	} {
 		result[name] = 0

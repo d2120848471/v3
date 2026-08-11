@@ -18,7 +18,8 @@ type Request struct {
 func (Request) String() string   { return "slider.Request{redacted}" }
 func (Request) GoString() string { return "slider.Request{redacted}" }
 
-// Result 保持 HTTP 成功响应的业务字段；TimingsMs 的 key 是稳定阶段名。
+// Result 保持 HTTP 成功响应的业务字段；TRACELESS 与 PUZZLE 使用同一字段合同。
+// TimingsMs 的 key 是稳定阶段名。
 type Result struct {
 	OK            bool           `json:"ok"`
 	SecurityToken string         `json:"securityToken"`
