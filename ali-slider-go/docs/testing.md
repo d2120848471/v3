@@ -19,7 +19,7 @@
 | L0 单元 | 编码、加密、配置、设备、动态 PE/runtime、脚本缓存、视觉、轨迹和边界分支 | 各包 `*_test.go` | 禁止真实外网；V8 host 网络用替身，Node 仅在可选历史 oracle/上下文差异测试中出现 | 通过 |
 | L1 跨语言 oracle | 锁定 Python 与 Go 的协议和困难视觉语义 | `protocol/testdata`、`vision/testdata`、PE oracle | 静态 fixture | 通过 |
 | L2 组件集成 | 验证设备 RPC schema、Captcha RPC、代理、下载、预热池及清理 | `internal/device`、`internal/challenge`、`internal/artifact` | Fake `RoundTripper` | 通过 |
-| L3 完整离线链 | 验证 Device → Init → PE profile → Assets → Vision → native PE contract → Device Complete → Verify | `solver_test.go` | 单一 Mock transport / fake PE runtime | 通过 |
+| L3 完整离线链 | 验证 Device → Init → 类型自动分流；Puzzle 进入 PE/Assets/Vision/Complete/Verify，TRACELESS/SLIDING 进入 SDK completion/Verify | `solver_test.go`、`device_runtime_test.go`、`sdk_device_bridge_test.go` | 单一 Mock transport / fake PE runtime / Node bridge fixture | 通过 |
 | L4 服务合同 | HTTP 四路径、POST JSON + deprecated GET query、内嵌页/CSP、别名/空值/参数源、状态码、OpenAPI、64 并发直通、无本地主动 429、日志脱敏、启动配置 | `server_test.go`、`cmd/server/main_test.go` | Mock Solver/占用端口 | 通过 |
 | L5 工程门禁 | fmt、vet、test、race、coverage、staticcheck、govulncheck、V8 native/ABI 测试与便携包 | `Makefile`、Docker BuildKit、CI | Linux AMD64/ARM64 实际 V8 `.so`；Windows AMD64 原生 DLL；工具/依赖获取可联网 | 本地候选已验证；发布 commit 由 CI 重跑 |
 | L6 授权在线 | 生产 V8 Device、精确 PE 差分探针；受控挑战 acceptance | `v8_runtime_online_test.go`、`online_acceptance_test.go`、其他 `online` build tag 测试 | 双重显式开关/授权；普通 CI 永不执行 | 当前V8/纯Go差分为0；最终50次 `47/50`、mean `2562ms`；4-slot/10-job组件通过 |
@@ -312,6 +312,28 @@ env \
 ```
 
 2026-08-11 的单次结果为 `code=T001 result=true requests=7`。该证据证明当前 PixCake 场景的 TRACELESS 组件合同可完成，不代表短信已发送、完整站点业务已成功，也不能外推成功率或延迟分位数。生产 `slider.Client` 使用同进程 V8 路径；本机缺少可加载的 Darwin V8 wrapper，因此本轮在线 smoke 验证的是同源 JS bridge 的 Node 测试路径，V8 宿主/消息分流只由离线测试覆盖。
+
+## 2026-08-11 SLIDING 拖动组件 smoke
+
+普通离线门禁覆盖 Init 类型自动分流、无双图合同、`418×48`/`370px` 轨迹、CSSStyleDeclaration 空值、元素事件与冒泡、`insertAdjacentHTML`、官方 success Base64、唯一 Init/Verify 及敏感错误脱敏：
+
+```bash
+node --check internal/pe/runtime/sdk_device_bridge.mjs
+go test -count=1 ./internal/pe ./internal/challenge
+```
+
+显式在线 smoke 只访问阿里公开 Device、Captcha Init/Verify、动态资源和采集端点；不访问 DJI 登录或短信接口，也不记录挑战 ID、token 或 success 参数：
+
+```bash
+env \
+  ALI_SLIDER_NODE_SLIDING_ONLINE=1 \
+  ALI_SLIDER_ONLINE_SCENE_ID=159tlu75 \
+  ALI_SLIDER_ONLINE_PREFIX=1ulc59 \
+  go test -timeout 35s -tags=online ./internal/pe \
+  -run 'TestOnlineNodeSlidingRuntime$' -count=1 -v
+```
+
+2026-08-11 的最终干净脱敏快照输出为 `SLIDING completed: code=T001 result=true requests=7`，用例约 `5.58s`。`requests=7` 是 bridge 记录数，包含 Device、被本地绑定的 SDK Init、动态资源和真实 Verify，不等于 7 次网络 Verify；运行时严格确认 `InitCaptchaV3` 与 `VerifyCaptchaV3` 记录各出现一次且顺序正确，SDK Init 不产生第二次真实网络 Init。该最终快照的单次结果只证明当前 `SceneId=159tlu75`、`prefix=1ulc59` 的组件合同可以完成；开发期 first-divergence 探针也不构成成功率、性能或容量报告。生产 `slider.Client` 使用同进程 V8；本机没有可加载的 Darwin V8 wrapper，因此在线部分验证 Node bridge，V8 completion 分流和 Go stage 由离线测试覆盖。
 
 ## 2026-08-07 历史授权候选批次结果
 

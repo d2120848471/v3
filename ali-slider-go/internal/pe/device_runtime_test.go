@@ -19,6 +19,7 @@ import (
 	"github.com/d2120848471/v3/ali-slider-go/internal/device"
 	"github.com/d2120848471/v3/ali-slider-go/internal/protocol"
 	"github.com/d2120848471/v3/ali-slider-go/internal/runtimekit"
+	"github.com/d2120848471/v3/ali-slider-go/internal/track"
 )
 
 type runtimeTestEntropy struct {
@@ -143,6 +144,49 @@ func validTracelessDeviceStage(t *testing.T, sceneID, certifyID string) deviceBr
 		DeviceConfig:         nativeConfigFromProtocol(config),
 		VerifyArgProfile:     deviceVerifyArgProfile{AccessSec: "access-sec", SessionIDSalt: "session-salt"},
 		RequestCount:         5,
+		Requests: []deviceRequestSummary{
+			{Action: "Log1"}, {Action: "Log2"}, {Action: "Log3"},
+			{Action: "InitCaptchaV3", FieldNames: []string{"SceneId", "DeviceToken"}},
+			{Action: "VerifyCaptchaV3", FieldNames: []string{"SceneId", "CertifyId", "CaptchaVerifyParam"}},
+		},
+	}
+}
+
+func validSlidingTrack() []track.Event {
+	return []track.Event{
+		{Type: "touchstart", X: 0, Y: 1, DT: 0, Force: 0.6, RadiusX: 12, RadiusY: 11},
+		{Type: "touchmove", X: 180, Y: 2, DT: 180, Force: 0.62, RadiusX: 13, RadiusY: 12},
+		{Type: "touchmove", X: 370, Y: 1, DT: 220, Force: 0.58, RadiusX: 12, RadiusY: 12},
+		{Type: "touchend", X: 370, Y: 1, DT: 60, Force: 0.55, RadiusX: 12, RadiusY: 11},
+	}
+}
+
+func validSlidingInput(sceneID, certifyID string) SlidingInput {
+	return SlidingInput{
+		SceneID: sceneID, CertifyID: certifyID,
+		StaticPath: "3.22.0/sg.092.fixture.js", CaptchaType: "SLIDING",
+		Track: validSlidingTrack(), SlideWidth: 418, HandleWidth: 48,
+	}
+}
+
+func validSlidingDeviceStage(t *testing.T, sceneID, certifyID string) deviceBridgeStage {
+	t.Helper()
+	config := validRuntimeProtocolConfig()
+	parameter, err := protocol.BuildBusinessCaptchaVerifyParam(certifyID, sceneID, "fixture-upload-security-token", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return deviceBridgeStage{
+		Stage: "sliding", CaptchaType: "SLIDING", SceneID: sceneID,
+		CertifyID: certifyID, CaptchaVerifyParam: parameter,
+		SlidingDeviceToken: runtimeTokenWithFields(t, config, 111, "53", 2_000_000_000_000, 2_000_000_000_900),
+		VerifyCode:         "T001",
+		VerifyResult:       true,
+		SecurityToken:      "fixture-upload-security-token",
+		VerifyCertifyID:    certifyID,
+		DeviceConfig:       nativeConfigFromProtocol(config),
+		VerifyArgProfile:   deviceVerifyArgProfile{AccessSec: "access-sec", SessionIDSalt: "session-salt"},
+		RequestCount:       5,
 		Requests: []deviceRequestSummary{
 			{Action: "Log1"}, {Action: "Log2"}, {Action: "Log3"},
 			{Action: "InitCaptchaV3", FieldNames: []string{"SceneId", "DeviceToken"}},
@@ -298,6 +342,64 @@ func TestDeviceRuntimeRejectsMismatchedTracelessStages(t *testing.T) {
 		{SceneID: sceneID, CertifyID: certifyID, StaticPath: "valid.js", CaptchaType: "PUZZLE"},
 	} {
 		if validateTracelessInput(invalid) == nil {
+			t.Fatalf("invalid input accepted: %+v", invalid)
+		}
+	}
+}
+
+func TestDeviceRuntimeAcceptsBoundSlidingStage(t *testing.T) {
+	const sceneID, certifyID = "159tlu75", "fixture-sliding-certify"
+	input := validSlidingInput(sceneID, certifyID)
+	session := newAcceptedRuntimeSession(t, "53")
+	result, err := session.acceptSlidingStage(validSlidingDeviceStage(t, sceneID, certifyID), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Succeeded() || result.CertifyID != certifyID || result.VerifyCode != "T001" || result.SecurityToken != "fixture-upload-security-token" || strings.Join(result.RequestActions, ",") != "Log1,Log2,Log3,InitCaptchaV3,VerifyCaptchaV3" {
+		t.Fatalf("result=%+v", result)
+	}
+	for _, formatted := range []string{result.String(), result.GoString()} {
+		if strings.Contains(formatted, certifyID) || strings.Contains(formatted, result.SecurityToken) {
+			t.Fatalf("sliding result formatting leaked secrets: %s", formatted)
+		}
+	}
+}
+
+func TestDeviceRuntimeRejectsMismatchedSlidingStages(t *testing.T) {
+	const sceneID, certifyID = "159tlu75", "fixture-sliding-certify"
+	input := validSlidingInput(sceneID, certifyID)
+	tests := []struct {
+		name   string
+		mutate func(*deviceBridgeStage)
+	}{
+		{"scene", func(stage *deviceBridgeStage) { stage.SceneID = "other" }},
+		{"certify", func(stage *deviceBridgeStage) { stage.CertifyID = "other" }},
+		{"config", func(stage *deviceBridgeStage) { stage.DeviceConfig.IP = "other" }},
+		{"parameter", func(stage *deviceBridgeStage) { stage.CaptchaVerifyParam = "invalid" }},
+		{"verify result", func(stage *deviceBridgeStage) { stage.SecurityToken = "other" }},
+		{"device token", func(stage *deviceBridgeStage) { stage.SlidingDeviceToken = "invalid" }},
+		{"duplicate verify", func(stage *deviceBridgeStage) {
+			stage.Requests = append(stage.Requests, deviceRequestSummary{Action: "VerifyCaptchaV3"})
+			stage.RequestCount++
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			session := newAcceptedRuntimeSession(t, "53")
+			stage := validSlidingDeviceStage(t, sceneID, certifyID)
+			test.mutate(&stage)
+			if _, err := session.acceptSlidingStage(stage, input); !errors.Is(err, ErrUnsupportedPE) {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+	for _, invalid := range []SlidingInput{
+		{},
+		{SceneID: sceneID, CertifyID: certifyID, StaticPath: "../bad.js", CaptchaType: "SLIDING", Track: validSlidingTrack(), SlideWidth: 418, HandleWidth: 48},
+		{SceneID: sceneID, CertifyID: certifyID, StaticPath: "valid.js", CaptchaType: "TRACELESS", Track: validSlidingTrack(), SlideWidth: 418, HandleWidth: 48},
+		{SceneID: sceneID, CertifyID: certifyID, StaticPath: "valid.js", CaptchaType: "SLIDING", Track: validSlidingTrack(), SlideWidth: 48, HandleWidth: 48},
+	} {
+		if validateSlidingInput(invalid) == nil {
 			t.Fatalf("invalid input accepted: %+v", invalid)
 		}
 	}
@@ -605,6 +707,29 @@ func TestOpenDeviceKeepsOneProcessThroughTracelessCompletion(t *testing.T) {
 		SceneID: sceneID, CertifyID: certifyID, StaticPath: "valid.js", CaptchaType: "TRACELESS",
 	}); err == nil {
 		t.Fatal("completed session accepted a second traceless completion")
+	}
+}
+
+func TestOpenDeviceKeepsOneProcessThroughSlidingCompletion(t *testing.T) {
+	const sceneID, certifyID = "159tlu75", "fixture-sliding-certify"
+	stub := writeDeviceRuntimeStub(t, validInitialDeviceStage(t, "53"), validSlidingDeviceStage(t, sceneID, certifyID))
+	resolver := newNodeKeyResolver(stub)
+	resolver.sdk = cachedSDK{source: []byte("cached-sdk"), fetchedAt: time.Now()}
+	session, err := resolver.OpenDevice(context.Background(), newScriptTransport(), device.Profile{}, validDeviceRuntimeOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	input := validSlidingInput(sceneID, certifyID)
+	result, err := session.SolveSliding(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Succeeded() || result.CertifyID != certifyID || result.SecurityToken != "fixture-upload-security-token" {
+		t.Fatalf("result=%+v", result)
+	}
+	if _, err := session.SolveSliding(context.Background(), input); err == nil {
+		t.Fatal("completed session accepted a second sliding completion")
 	}
 }
 

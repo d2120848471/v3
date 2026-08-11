@@ -26,6 +26,8 @@ const (
 	defaultRegion       = "cn"
 	sliderRenderedWidth = 300
 	sliderHandleWidth   = 40
+	slidingTrackWidth   = 418
+	slidingHandleWidth  = 48
 )
 
 // FailureKind 是编排层稳定、可脱敏映射的失败类别。
@@ -120,6 +122,10 @@ type deviceProfileProvider interface {
 
 type tracelessDeviceSession interface {
 	SolveTraceless(context.Context, pe.TracelessInput) (pe.TracelessResult, error)
+}
+
+type slidingDeviceSession interface {
+	SolveSliding(context.Context, pe.SlidingInput) (pe.SlidingResult, error)
 }
 
 // PEKeyResolver 缓存公开 SDK/PE 脚本，并用当前分片逐挑战原生生成
@@ -291,6 +297,41 @@ func (solver *Solver) Solve(parent context.Context, request SolveRequest) (outco
 	}
 	if err := checkStageContext(ctx, currentStage); err != nil {
 		return outcome, err
+	}
+	if isSlidingCaptchaType(challengeValue.CaptchaType) {
+		currentStage = "sliding"
+		slidingSession, ok := session.(slidingDeviceSession)
+		if !ok {
+			return outcome, fail(FailureProtocol, currentStage, "设备会话不支持拖动验证码", nil)
+		}
+		slidingStarted := time.Now()
+		trackValue, trackErr := track.LoadDefault(float64(slidingTrackWidth-slidingHandleWidth), solver.options.Sources.Entropy)
+		if trackErr != nil {
+			timings[currentStage] = elapsedMilliseconds(slidingStarted)
+			return outcome, peRuntimeFailure(ctx, currentStage, "拖动验证码轨迹生成失败", trackErr, false)
+		}
+		slidingResult, solveErr := slidingSession.SolveSliding(ctx, pe.SlidingInput{
+			SceneID: request.SceneID, CertifyID: challengeValue.CertifyID,
+			StaticPath: challengeValue.StaticPath, CaptchaType: challengeValue.CaptchaType,
+			Track: trackValue, SlideWidth: slidingTrackWidth, HandleWidth: slidingHandleWidth,
+		})
+		timings[currentStage] = elapsedMilliseconds(slidingStarted)
+		if solveErr != nil {
+			return outcome, peRuntimeFailure(ctx, currentStage, "拖动验证码执行失败", solveErr, false)
+		}
+		if !slidingResult.Succeeded() || slidingResult.CertifyID != challengeValue.CertifyID {
+			return outcome, fail(FailureProtocol, currentStage, "拖动验证码响应合同不一致", nil)
+		}
+		if err := checkStageContext(ctx, currentStage); err != nil {
+			return outcome, err
+		}
+		releaseSession()
+		outcome.OK = true
+		outcome.SecurityToken = slidingResult.SecurityToken
+		outcome.VerifyCode = slidingResult.VerifyCode
+		outcome.VerifyResult = slidingResult.VerifyResult
+		outcome.CertifyID = slidingResult.CertifyID
+		return outcome, nil
 	}
 	if isTracelessCaptchaType(challengeValue.CaptchaType) {
 		currentStage = "traceless"
@@ -596,9 +637,9 @@ func validateSolveRequest(request SolveRequest) error {
 }
 
 func newTimingMap() map[string]int {
-	result := make(map[string]int, 14)
+	result := make(map[string]int, 15)
 	for _, name := range []string{
-		"setup", "deviceSession", "init", "traceless", "resolvePEKey", "downloadAssets", "downloadBackground", "downloadShadow",
+		"setup", "deviceSession", "init", "sliding", "traceless", "resolvePEKey", "downloadAssets", "downloadBackground", "downloadShadow",
 		"vision", "buildVerifyData", "completeDevice", "verify", "clientCleanup", "total",
 	} {
 		result[name] = 0

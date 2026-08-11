@@ -159,7 +159,7 @@ func (transport *solverTransport) RoundTrip(request *http.Request) (*http.Respon
 			"Success": true, "Code": "Success", "CertifyId": identifier,
 			"StaticPath": staticPath, "CaptchaType": captchaType,
 		}
-		if !strings.EqualFold(captchaType, "TRACELESS") {
+		if !isSDKCaptchaType(captchaType) {
 			response["Image"] = "fixtures/back.png"
 			response["PuzzleImage"] = "fixtures/shadow.png"
 		}
@@ -300,6 +300,22 @@ type completedTracelessDeviceSession struct {
 	input pe.TracelessInput
 }
 
+type completedSlidingDeviceSession struct {
+	completedDeviceSession
+	calls int
+	input pe.SlidingInput
+}
+
+func (session *completedSlidingDeviceSession) SolveSliding(_ context.Context, input pe.SlidingInput) (pe.SlidingResult, error) {
+	session.calls++
+	session.input = input
+	return pe.SlidingResult{
+		SecurityToken: "fixture-upload-security-token",
+		VerifyCode:    "T001", VerifyResult: true, CertifyID: input.CertifyID,
+		RequestActions: []string{"Log1", "Log2", "Log3", "InitCaptchaV3", "VerifyCaptchaV3"},
+	}, nil
+}
+
 func (session *completedTracelessDeviceSession) SolveTraceless(_ context.Context, input pe.TracelessInput) (pe.TracelessResult, error) {
 	session.calls++
 	session.input = input
@@ -423,6 +439,48 @@ func TestSolverRoutesImageLessTracelessThroughDeviceSession(t *testing.T) {
 		t.Fatalf("init=%d rpcVerify=%d assets=%d prepare=%d build=%d", initCount, verifyCount, assetRequests, prepareCount, buildCount)
 	}
 	for _, stage := range []string{"setup", "deviceSession", "init", "traceless", "clientCleanup", "total"} {
+		if _, ok := outcome.TimingsMS[stage]; !ok {
+			t.Errorf("missing timing %q", stage)
+		}
+	}
+	if entries, err := os.ReadDir(artifactDirectory); !errors.Is(err, os.ErrNotExist) && (err != nil || len(entries) != 0) {
+		t.Fatalf("success wrote artifacts: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestSolverRoutesImageLessSlidingThroughDeviceSession(t *testing.T) {
+	transport := newSolverTransport(t, "gap")
+	transport.captchaType = "SLIDING"
+	resolver := &staticPEKeyResolver{profile: pe.RuntimeProfile{
+		ArgumentKey: "0kd8i0mclivjow32", IncludeScreenInfo: true,
+	}}
+	solver, artifactDirectory := newIntegrationSolverWithPEKeys(t, transport, 0.45, 5*time.Second, resolver)
+	deviceSession := &completedSlidingDeviceSession{}
+	solver.options.OpenDevice = func(context.Context, http.RoundTripper, device.Profile, SolveRequest) (DeviceSession, func(), error) {
+		return deviceSession, func() {}, nil
+	}
+	outcome, err := solver.Solve(context.Background(), SolveRequest{SceneID: "159tlu75", Prefix: "1ulc59"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !outcome.OK || !outcome.VerifyResult || outcome.VerifyCode != "T001" || outcome.SecurityToken != "fixture-upload-security-token" || outcome.CertifyID == "" {
+		t.Fatalf("outcome=%+v", outcome)
+	}
+	input := deviceSession.input
+	if deviceSession.calls != 1 || input.SceneID != "159tlu75" || input.CertifyID != outcome.CertifyID || !strings.EqualFold(input.CaptchaType, "SLIDING") || input.SlideWidth != 418 || input.HandleWidth != 48 || len(input.Track) < 3 || input.Track[len(input.Track)-1].X != 370 {
+		t.Fatalf("sliding calls=%d input=%+v", deviceSession.calls, input)
+	}
+	transport.mu.Lock()
+	initCount, verifyCount := transport.initCount, transport.verifyCount
+	assetRequests := len(transport.assetUserAgents)
+	transport.mu.Unlock()
+	resolver.mu.Lock()
+	prepareCount, buildCount := len(resolver.paths), len(resolver.buildProfileIDs)
+	resolver.mu.Unlock()
+	if initCount != 1 || verifyCount != 0 || assetRequests != 0 || prepareCount != 0 || buildCount != 0 {
+		t.Fatalf("init=%d rpcVerify=%d assets=%d prepare=%d build=%d", initCount, verifyCount, assetRequests, prepareCount, buildCount)
+	}
+	for _, stage := range []string{"setup", "deviceSession", "init", "sliding", "clientCleanup", "total"} {
 		if _, ok := outcome.TimingsMS[stage]; !ok {
 			t.Errorf("missing timing %q", stage)
 		}

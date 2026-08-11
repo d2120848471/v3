@@ -210,7 +210,9 @@ globalThis.__aliV8DeviceComplete = async (input) => {
   resolveCompletion(input);
   const expectedStage = input?.mode === "traceless"
     ? "traceless"
-    : "verify";
+    : input?.mode === "sliding"
+      ? "sliding"
+      : "verify";
   const stage = await v8WaitForStage(expectedStage);
   const outcome = await v8DeviceMain;
   v8DeviceMain = null;

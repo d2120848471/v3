@@ -573,3 +573,23 @@ func (session *DeviceRuntimeSession) completeV8Traceless(
 	}
 	return session.acceptTracelessStage(stage, input)
 }
+
+func (session *DeviceRuntimeSession) completeV8Sliding(
+	ctx context.Context,
+	engine *v8runtime.Runtime,
+	payload []byte,
+	input SlidingInput,
+) (SlidingResult, error) {
+	result, err := engine.Call(ctx, "__aliV8DeviceComplete", payload)
+	if err != nil {
+		if ctx.Err() != nil {
+			return SlidingResult{}, ctx.Err()
+		}
+		return SlidingResult{}, fmt.Errorf("%w: V8 Device sliding: %v", ErrKeyRuntime, err)
+	}
+	var stage deviceBridgeStage
+	if err := decodeV8Result(result, &stage); err != nil {
+		return SlidingResult{}, fmt.Errorf("%w: V8 Device sliding output", ErrKeyRuntime)
+	}
+	return session.acceptSlidingStage(stage, input)
+}

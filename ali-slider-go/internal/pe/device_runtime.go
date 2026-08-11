@@ -26,6 +26,7 @@ import (
 	"github.com/d2120848471/v3/ali-slider-go/internal/device"
 	"github.com/d2120848471/v3/ali-slider-go/internal/protocol"
 	"github.com/d2120848471/v3/ali-slider-go/internal/runtimekit"
+	"github.com/d2120848471/v3/ali-slider-go/internal/track"
 	"github.com/d2120848471/v3/ali-slider-go/internal/v8runtime"
 )
 
@@ -65,6 +66,7 @@ type deviceBridgeStage struct {
 	CertifyID             string                 `json:"certifyId"`
 	CaptchaVerifyParam    string                 `json:"captchaVerifyParam"`
 	TracelessDeviceToken  string                 `json:"tracelessDeviceToken"`
+	SlidingDeviceToken    string                 `json:"slidingDeviceToken"`
 	VerifyCode            string                 `json:"verifyCode"`
 	VerifyResult          bool                   `json:"verifyResult"`
 	SecurityToken         string                 `json:"securityToken"`
@@ -95,6 +97,19 @@ type tracelessCompletion struct {
 	DeviceToken string `json:"deviceToken"`
 }
 
+type slidingCompletion struct {
+	Complete    bool          `json:"complete"`
+	Mode        string        `json:"mode"`
+	SceneID     string        `json:"sceneId"`
+	CertifyID   string        `json:"certifyId"`
+	StaticPath  string        `json:"staticPath"`
+	CaptchaType string        `json:"captchaType"`
+	DeviceToken string        `json:"deviceToken"`
+	Track       []track.Event `json:"track"`
+	SlideWidth  int           `json:"slideWidth"`
+	HandleWidth int           `json:"handleWidth"`
+}
+
 // TracelessInput 绑定已经由同一 DeviceToken 初始化的无痕挑战。
 type TracelessInput struct {
 	SceneID     string
@@ -116,6 +131,33 @@ func (TracelessResult) String() string   { return "pe.TracelessResult{redacted}"
 func (TracelessResult) GoString() string { return "pe.TracelessResult{redacted}" }
 
 func (result TracelessResult) Succeeded() bool {
+	return result.VerifyCode == "T001" && result.VerifyResult && result.SecurityToken != ""
+}
+
+// SlidingInput 绑定同一 DeviceToken 初始化的无图拖动挑战及官方组件轨迹。
+type SlidingInput struct {
+	SceneID     string
+	CertifyID   string
+	StaticPath  string
+	CaptchaType string
+	Track       []track.Event
+	SlideWidth  int
+	HandleWidth int
+}
+
+// SlidingResult 把 SDK success 归一到既有公共完成态字段。
+type SlidingResult struct {
+	SecurityToken  string
+	VerifyCode     string
+	VerifyResult   bool
+	CertifyID      string
+	RequestActions []string
+}
+
+func (SlidingResult) String() string   { return "pe.SlidingResult{redacted}" }
+func (SlidingResult) GoString() string { return "pe.SlidingResult{redacted}" }
+
+func (result SlidingResult) Succeeded() bool {
 	return result.VerifyCode == "T001" && result.VerifyResult && result.SecurityToken != ""
 }
 
@@ -841,6 +883,74 @@ func (session *DeviceRuntimeSession) SolveTraceless(ctx context.Context, input T
 	return result, nil
 }
 
+// SolveSliding 在同一 SDK/FeiLin VM 中渲染官方 SLIDING 并回放拖动轨迹。
+func (session *DeviceRuntimeSession) SolveSliding(ctx context.Context, input SlidingInput) (SlidingResult, error) {
+	if ctx == nil {
+		return SlidingResult{}, errors.New("device runtime context is nil")
+	}
+	if err := validateSlidingInput(input); err != nil {
+		return SlidingResult{}, err
+	}
+	session.mu.Lock()
+	if session.closed || session.completed || session.stdin == nil && session.v8Engine == nil || session.initToken == "" {
+		session.mu.Unlock()
+		return SlidingResult{}, errors.New("device runtime session is unavailable")
+	}
+	payload, err := json.Marshal(slidingCompletion{
+		Complete: true, Mode: "sliding", SceneID: input.SceneID, CertifyID: input.CertifyID,
+		StaticPath: input.StaticPath, CaptchaType: "SLIDING", DeviceToken: session.initToken,
+		Track: slices.Clone(input.Track), SlideWidth: input.SlideWidth, HandleWidth: input.HandleWidth,
+	})
+	if err != nil {
+		session.mu.Unlock()
+		return SlidingResult{}, errors.New("encode sliding runtime completion")
+	}
+	engine := session.v8Engine
+	stdin := session.stdin
+	if engine == nil {
+		session.stdin = nil
+	}
+	session.completed = true
+	session.mu.Unlock()
+	releaseDeviceSlot, err := acquireDeviceExecutionSlot(ctx, session.deviceSlots)
+	if err != nil {
+		return SlidingResult{}, err
+	}
+	defer releaseDeviceSlot()
+	if engine != nil {
+		return session.completeV8Sliding(ctx, engine, payload, input)
+	}
+	if _, err := stdin.Write(payload); err != nil {
+		_ = stdin.Close()
+		return SlidingResult{}, fmt.Errorf("%w: write sliding completion", ErrKeyRuntime)
+	}
+	if err := stdin.Close(); err != nil {
+		return SlidingResult{}, fmt.Errorf("%w: close sliding completion", ErrKeyRuntime)
+	}
+	stage, err := session.readStage(ctx, "sliding")
+	if err != nil {
+		return SlidingResult{}, err
+	}
+	result, err := session.acceptSlidingStage(stage, input)
+	if err != nil {
+		return SlidingResult{}, err
+	}
+	select {
+	case <-ctx.Done():
+		_ = session.command.Process.Kill()
+		return SlidingResult{}, ctx.Err()
+	case <-session.waitDone:
+	}
+	session.mu.Lock()
+	waitErr := session.waitErr
+	stderrEmpty := session.stderr.buffer.Len() == 0
+	session.mu.Unlock()
+	if waitErr != nil || !stderrEmpty {
+		return SlidingResult{}, fmt.Errorf("%w: device bridge exit", ErrKeyRuntime)
+	}
+	return result, nil
+}
+
 // Recycle 在同一个已加载 bridge 的 V8 Isolate 内建立全新浏览器 context 和
 // Device session。它只复用宿主与编译结果，不复用上一轮 session/token/挑战态。
 func (session *DeviceRuntimeSession) Recycle(ctx context.Context) error {
@@ -940,6 +1050,53 @@ func validateTracelessInput(input TracelessInput) error {
 	return nil
 }
 
+func validateSlidingInput(input SlidingInput) error {
+	if utf8.RuneCountInString(input.SceneID) < 1 || utf8.RuneCountInString(input.SceneID) > 64 || input.CertifyID == "" || len(input.CertifyID) > 512 || !isSlidingType(input.CaptchaType) {
+		return errors.New("sliding runtime input is invalid")
+	}
+	if input.StaticPath == "" || len(input.StaticPath) > 512 || strings.HasPrefix(input.StaticPath, "/") || strings.Contains(input.StaticPath, "://") {
+		return errors.New("sliding static path is invalid")
+	}
+	for _, segment := range strings.Split(input.StaticPath, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return errors.New("sliding static path is invalid")
+		}
+	}
+	if input.SlideWidth < 320 || input.SlideWidth > 1024 || input.HandleWidth < 30 || input.HandleWidth >= input.SlideWidth {
+		return errors.New("sliding dimensions are invalid")
+	}
+	return validateSlidingTrack(input.Track, input.SlideWidth-input.HandleWidth)
+}
+
+func validateSlidingTrack(events []track.Event, target int) error {
+	if len(events) < 3 || len(events) > 512 || target < 1 {
+		return errors.New("sliding track is invalid")
+	}
+	total := 0
+	for index, event := range events {
+		if event.DT < 0 || event.DT > 5_000 || event.X < -64 || event.X > target+64 || event.Y < -256 || event.Y > 256 || math.IsNaN(event.Force) || math.IsInf(event.Force, 0) || event.Force < 0 || event.Force > 1 || math.IsNaN(event.RadiusX) || math.IsInf(event.RadiusX, 0) || event.RadiusX <= 0 || event.RadiusX > 128 || math.IsNaN(event.RadiusY) || math.IsInf(event.RadiusY, 0) || event.RadiusY <= 0 || event.RadiusY > 128 {
+			return errors.New("sliding track is invalid")
+		}
+		if index == 0 && (event.Type != "touchstart" || event.DT != 0 || event.X != 0) {
+			return errors.New("sliding track is invalid")
+		}
+		if index > 0 && index < len(events)-1 && event.Type != "touchmove" {
+			return errors.New("sliding track is invalid")
+		}
+		if index == len(events)-1 && (event.Type != "touchend" || event.X != target) {
+			return errors.New("sliding track is invalid")
+		}
+		total += event.DT
+		if total > 15_000 {
+			return errors.New("sliding track is invalid")
+		}
+	}
+	if events[len(events)-2].X != target {
+		return errors.New("sliding track is invalid")
+	}
+	return nil
+}
+
 func (session *DeviceRuntimeSession) acceptTracelessStage(stage deviceBridgeStage, input TracelessInput) (TracelessResult, error) {
 	config, err := protocolConfig(stage.DeviceConfig)
 	if err != nil || stage.Stage != "traceless" || !equalProtocolConfig(config, session.config) || stage.VerifyArgProfile != session.verifyProfile {
@@ -1002,8 +1159,66 @@ func (session *DeviceRuntimeSession) acceptTracelessStage(stage deviceBridgeStag
 	}, nil
 }
 
+func (session *DeviceRuntimeSession) acceptSlidingStage(stage deviceBridgeStage, input SlidingInput) (SlidingResult, error) {
+	config, err := protocolConfig(stage.DeviceConfig)
+	if err != nil || stage.Stage != "sliding" || !equalProtocolConfig(config, session.config) || stage.VerifyArgProfile != session.verifyProfile {
+		return SlidingResult{}, fmt.Errorf("%w: sliding device runtime changed", ErrUnsupportedPE)
+	}
+	if !isSlidingType(stage.CaptchaType) || stage.SceneID != input.SceneID || stage.CertifyID != input.CertifyID {
+		return SlidingResult{}, fmt.Errorf("%w: sliding challenge identity mismatch", ErrUnsupportedPE)
+	}
+	parsedToken, _, _, _, err := validateRuntimeToken(stage.SlidingDeviceToken, session.config, session.secrets.DeviceTokenSalt())
+	if err != nil || parsedToken.SessionID != session.initParsed.SessionID {
+		return SlidingResult{}, fmt.Errorf("%w: sliding DeviceToken session mismatch", ErrUnsupportedPE)
+	}
+	if len(stage.CaptchaVerifyParam) <= 140 || len(stage.CaptchaVerifyParam) > 16*1024 {
+		return SlidingResult{}, fmt.Errorf("%w: sliding success parameter length", ErrUnsupportedPE)
+	}
+	business, err := protocol.ParseBusinessCaptchaVerifyParam(stage.CaptchaVerifyParam)
+	if err != nil || !business.IsSign || business.SceneID != input.SceneID || business.CertifyID != input.CertifyID || business.SecurityToken == "" {
+		return SlidingResult{}, fmt.Errorf("%w: sliding success parameter mismatch", ErrUnsupportedPE)
+	}
+	if stage.VerifyCode != "T001" || !stage.VerifyResult || stage.SecurityToken == "" || stage.SecurityToken != business.SecurityToken || stage.VerifyCertifyID != business.CertifyID {
+		return SlidingResult{}, fmt.Errorf("%w: sliding official Verify result mismatch", ErrUnsupportedPE)
+	}
+	if stage.RequestCount != len(stage.Requests) || len(stage.Requests) < 5 {
+		return SlidingResult{}, fmt.Errorf("%w: sliding request count", ErrUnsupportedPE)
+	}
+	actions := stageActions(stage)
+	if !slices.Equal(actions[:3], []string{"Log1", "Log2", "Log3"}) {
+		return SlidingResult{}, fmt.Errorf("%w: sliding initial request sequence", ErrUnsupportedPE)
+	}
+	initIndex, verifyIndex := -1, -1
+	for index, request := range stage.Requests {
+		switch request.Action {
+		case "InitCaptchaV3":
+			if initIndex >= 0 || !containsAllStrings(request.FieldNames, "SceneId", "DeviceToken") {
+				return SlidingResult{}, fmt.Errorf("%w: sliding Init request", ErrUnsupportedPE)
+			}
+			initIndex = index
+		case "VerifyCaptchaV3":
+			if verifyIndex >= 0 || !containsAllStrings(request.FieldNames, "SceneId", "CertifyId", "CaptchaVerifyParam") {
+				return SlidingResult{}, fmt.Errorf("%w: sliding Verify request", ErrUnsupportedPE)
+			}
+			verifyIndex = index
+		}
+	}
+	if initIndex < 3 || verifyIndex <= initIndex {
+		return SlidingResult{}, fmt.Errorf("%w: sliding request order", ErrUnsupportedPE)
+	}
+	return SlidingResult{
+		SecurityToken: stage.SecurityToken,
+		VerifyCode:    stage.VerifyCode, VerifyResult: stage.VerifyResult, CertifyID: stage.VerifyCertifyID,
+		RequestActions: actions,
+	}, nil
+}
+
 func isTracelessType(value string) bool {
 	return strings.EqualFold(strings.TrimSpace(value), "TRACELESS")
+}
+
+func isSlidingType(value string) bool {
+	return strings.EqualFold(strings.TrimSpace(value), "SLIDING")
 }
 
 func containsAllStrings(values []string, required ...string) bool {

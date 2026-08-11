@@ -176,12 +176,12 @@ func TestVerifyCompatibilityUsesNestedResultAndCertifyIDFallback(t *testing.T) {
 	}
 }
 
-func TestRPCInitAcceptsImageLessTracelessOnly(t *testing.T) {
+func TestRPCInitAcceptsImageLessSDKTypes(t *testing.T) {
 	newClient := func(captchaType string) *RPCClient {
 		t.Helper()
 		client, err := NewRPCClient(RPCOptions{
 			Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-				response := `{"Success":true,"Code":"Success","CertifyId":"fixture-traceless","StaticPath":"3.29.0/pe.091.fixture.js","CaptchaType":"` + captchaType + `"}`
+				response := `{"Success":true,"Code":"Success","CertifyId":"fixture-sdk","StaticPath":"3.29.0/pe.091.fixture.js","CaptchaType":"` + captchaType + `"}`
 				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(response)), Request: request}, nil
 			}),
 			Sources: runtimekit.Sources{
@@ -194,12 +194,16 @@ func TestRPCInitAcceptsImageLessTracelessOnly(t *testing.T) {
 		return client
 	}
 
-	challenge, err := newClient("traceless").Init(context.Background(), "init-token")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if challenge.CaptchaType != "traceless" || challenge.ImagePath != "" || challenge.PuzzleImagePath != "" || challenge.StaticPath == "" {
-		t.Fatalf("challenge=%+v", challenge)
+	for _, captchaType := range []string{"traceless", "SLIDING"} {
+		t.Run(captchaType, func(t *testing.T) {
+			challenge, err := newClient(captchaType).Init(context.Background(), "init-token")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if challenge.CaptchaType != captchaType || challenge.ImagePath != "" || challenge.PuzzleImagePath != "" || challenge.StaticPath == "" {
+				t.Fatalf("challenge=%+v", challenge)
+			}
+		})
 	}
 	if _, err := newClient("slider").Init(context.Background(), "init-token"); err == nil {
 		t.Fatal("image-less slider challenge was accepted")

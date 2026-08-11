@@ -146,7 +146,7 @@ function browserRequestHeaders(
 }
 
 
-const SAFE_TRACELESS_FAILURE_CODES = new Set([
+const SAFE_SDK_FAILURE_CODES = new Set([
   "TRACELESS_TIMEOUT_READY",
   "TRACELESS_TIMEOUT_CALLING_INIT",
   "TRACELESS_TIMEOUT_INIT_REJECTED",
@@ -158,6 +158,24 @@ const SAFE_TRACELESS_FAILURE_CODES = new Set([
   "TRACELESS_INIT_THROW",
   "TRACELESS_FAIL_CALLBACK",
   "TRACELESS_CLOSE_CALLBACK",
+  "SLIDING_TIMEOUT_READY",
+  "SLIDING_TIMEOUT_CALLING_INIT",
+  "SLIDING_TIMEOUT_INIT_REJECTED",
+  "SLIDING_TIMEOUT_INIT_RESPONSE",
+  "SLIDING_TIMEOUT_INSTANCE",
+  "SLIDING_TIMEOUT_DOM",
+  "SLIDING_TIMEOUT_DRAG",
+  "SLIDING_TIMEOUT_DRAG_COMPLETE",
+  "SLIDING_TIMEOUT_VERIFY_REQUEST",
+  "SLIDING_TIMEOUT_VERIFY_RESPONSE",
+  "SLIDING_INIT_THROW",
+  "SLIDING_FAIL_CALLBACK",
+  "SLIDING_ERROR_CALLBACK",
+  "SLIDING_EVENT_CONSTRUCT",
+  "SLIDING_TOUCHSTART_DISPATCH",
+  "SLIDING_TOUCHMOVE_DISPATCH",
+  "SLIDING_TOUCHEND_DISPATCH",
+  "SLIDING_TRACK_DISPATCH",
 ]);
 
 
@@ -168,9 +186,16 @@ function tracelessBridgeError(code) {
 }
 
 
+function slidingBridgeError(code) {
+  const error = new Error("拖动验证码执行失败");
+  error.safeCode = code;
+  return error;
+}
+
+
 function safeDeviceBridgeFailureMessage(error) {
   const code = error?.safeCode;
-  return SAFE_TRACELESS_FAILURE_CODES.has(code)
+  return SAFE_SDK_FAILURE_CODES.has(code)
     ? `Node 设备桥执行失败 [${code}]`
     : "Node 设备桥执行失败";
 }
@@ -652,16 +677,39 @@ function makeElementFactory(profile) {
   return function makeElement(tagName = "div") {
     const attributes = new Map();
     const children = [];
-    const style = {
+    const elementListeners = new Map();
+    const styleTarget = {
       setProperty(name, value) {
         this[String(name)] = String(value);
       },
       getPropertyValue(name) {
         return this[String(name)] ?? "";
       },
+      removeProperty(name) {
+        const normalized = String(name);
+        const previous = this[normalized] ?? "";
+        delete this[normalized];
+        return previous;
+      },
     };
+    const style = new Proxy(styleTarget, {
+      get(target, property, receiver) {
+        if (Reflect.has(target, property)) {
+          return Reflect.get(target, property, receiver);
+        }
+        return typeof property === "string" ? "" : undefined;
+      },
+      set(target, property, value, receiver) {
+        return Reflect.set(
+          target,
+          property,
+          typeof property === "string" ? String(value) : value,
+          receiver,
+        );
+      },
+    });
     const normalizedTag = String(tagName).toUpperCase();
-    return {
+    const element = {
       nodeType: 1,
       tagName: normalizedTag,
       nodeName: normalizedTag,
@@ -673,6 +721,12 @@ function makeElementFactory(profile) {
       innerHTML: "",
       textContent: "",
       parentNode: null,
+      offsetLeft: 0,
+      offsetTop: 0,
+      clientLeft: 0,
+      clientTop: 0,
+      scrollLeft: 0,
+      scrollTop: 0,
       get outerHTML() {
         if (normalizedTag === "HTML") {
           return "<html><head></head><body></body></html>";
@@ -685,6 +739,9 @@ function makeElementFactory(profile) {
       },
       get lastChild() {
         return children.at(-1) ?? null;
+      },
+      get parentElement() {
+        return this.parentNode?.nodeType === 1 ? this.parentNode : null;
       },
       appendChild(child) {
         if (child && typeof child === "object") {
@@ -705,6 +762,31 @@ function makeElementFactory(profile) {
         }
         return child;
       },
+      insertAdjacentHTML(position, html) {
+        const normalizedPosition = String(position).toLowerCase();
+        const markup = String(html);
+        const match = markup.match(/<([a-z][\w-]*)\b[^>]*>/i);
+        const inserted = makeElement(match?.[1] ?? "span");
+        const id = markup.match(/\bid=["']([^"']+)["']/i)?.[1];
+        const className = markup.match(/\bclass=["']([^"']*)["']/i)?.[1];
+        if (id) inserted.id = id;
+        if (className !== undefined) inserted.className = className;
+        inserted.innerHTML = markup;
+        inserted.textContent = markup.replace(/<[^>]*>/g, "");
+        if (normalizedPosition === "beforebegin") {
+          this.parentNode?.insertBefore(inserted, this);
+        } else if (normalizedPosition === "afterbegin") {
+          this.insertBefore(inserted, this.firstChild);
+        } else if (normalizedPosition === "beforeend") {
+          this.appendChild(inserted);
+        } else if (normalizedPosition === "afterend") {
+          const siblings = this.parentNode?.children ?? [];
+          const index = siblings.indexOf(this);
+          this.parentNode?.insertBefore(inserted, siblings[index + 1] ?? null);
+        } else {
+          throw new TypeError("insertAdjacentHTML position 无效");
+        }
+      },
       removeChild(child) {
         const index = children.indexOf(child);
         if (index >= 0) {
@@ -712,10 +794,93 @@ function makeElementFactory(profile) {
         }
         return child;
       },
-      addEventListener() {},
-      removeEventListener() {},
-      dispatchEvent() {
-        return true;
+      addEventListener(type, listener, listenerOptions) {
+        const normalizedType = String(type ?? "");
+        const valid = (
+          typeof listener === "function"
+          || typeof listener?.handleEvent === "function"
+        );
+        if (!normalizedType || !valid) return;
+        if (!elementListeners.has(normalizedType)) {
+          elementListeners.set(normalizedType, []);
+        }
+        const bucket = elementListeners.get(normalizedType);
+        const capture = listenerOptions === true || Boolean(listenerOptions?.capture);
+        if (bucket.some((entry) => entry.listener === listener && entry.capture === capture)) {
+          return;
+        }
+        bucket.push({
+          listener,
+          capture,
+          once: Boolean(listenerOptions?.once),
+        });
+      },
+      removeEventListener(type, listener, listenerOptions) {
+        const bucket = elementListeners.get(String(type));
+        if (!bucket) return;
+        const capture = listenerOptions === true || Boolean(listenerOptions?.capture);
+        const index = bucket.findIndex((entry) => (
+          entry.listener === listener && entry.capture === capture
+        ));
+        if (index >= 0) bucket.splice(index, 1);
+      },
+      dispatchEvent(event) {
+        if (!event || typeof event !== "object" || !event.type) {
+          throw new TypeError("dispatchEvent 需要带 type 的 event object");
+        }
+        let state = event[BRIDGE_EVENT_STATE];
+        if (!state) {
+          state = {
+            defaultPrevented: Boolean(event.defaultPrevented),
+            propagationStopped: false,
+            immediateStopped: false,
+          };
+          Object.defineProperty(event, BRIDGE_EVENT_STATE, {
+            configurable: true,
+            value: state,
+          });
+          Object.defineProperties(event, {
+            defaultPrevented: {
+              configurable: true,
+              get() { return state.defaultPrevented; },
+            },
+            preventDefault: {
+              configurable: true,
+              value() { state.defaultPrevented = true; },
+            },
+            stopPropagation: {
+              configurable: true,
+              value() { state.propagationStopped = true; },
+            },
+            stopImmediatePropagation: {
+              configurable: true,
+              value() {
+                state.propagationStopped = true;
+                state.immediateStopped = true;
+              },
+            },
+          });
+        }
+        if (!("target" in event)) event.target = this;
+        event.currentTarget = this;
+        const propertyHandler = this[`on${String(event.type)}`];
+        if (typeof propertyHandler === "function") {
+          propertyHandler.call(this, event);
+        }
+        const bucket = elementListeners.get(String(event.type)) ?? [];
+        for (const entry of [...bucket]) {
+          if (state.immediateStopped) break;
+          if (entry.once) {
+            const index = bucket.indexOf(entry);
+            if (index >= 0) bucket.splice(index, 1);
+          }
+          if (typeof entry.listener === "function") {
+            entry.listener.call(this, event);
+          } else {
+            entry.listener.handleEvent.call(entry.listener, event);
+          }
+        }
+        return !event.defaultPrevented;
       },
       setAttribute(name, value) {
         attributes.set(String(name), String(value));
@@ -935,6 +1100,32 @@ function makeElementFactory(profile) {
       clientWidth: 100,
       clientHeight: 20,
     };
+    element.classList = {
+      add(...names) {
+        const values = new Set(String(element.className).split(/\s+/).filter(Boolean));
+        names.forEach((name) => values.add(String(name)));
+        element.className = [...values].join(" ");
+      },
+      remove(...names) {
+        const removed = new Set(names.map(String));
+        element.className = String(element.className)
+          .split(/\s+/)
+          .filter((name) => name && !removed.has(name))
+          .join(" ");
+      },
+      contains(name) {
+        return String(element.className).split(/\s+/).includes(String(name));
+      },
+      toggle(name, force) {
+        const normalized = String(name);
+        const present = this.contains(normalized);
+        const shouldAdd = force === undefined ? !present : Boolean(force);
+        if (shouldAdd) this.add(normalized);
+        else this.remove(normalized);
+        return shouldAdd;
+      },
+    };
+    return element;
   };
 }
 
@@ -1083,10 +1274,15 @@ function makeBrowserContext(options, onRequest) {
   }
   head.addEventListener = recordEventRegistration("head");
   head.removeEventListener = removeEventRegistration("head");
+  head.dispatchEvent = (event) => dispatchRegisteredEvent("head", head, event);
   body.addEventListener = recordEventRegistration("body");
   body.removeEventListener = removeEventRegistration("body");
+  body.dispatchEvent = (event) => dispatchRegisteredEvent("body", body, event);
   documentElement.addEventListener = recordEventRegistration("html");
   documentElement.removeEventListener = removeEventRegistration("html");
+  documentElement.dispatchEvent = (event) => (
+    dispatchRegisteredEvent("html", documentElement, event)
+  );
 
   function browserSetTimeout(callback, delay = 0, ...args) {
     const id = timerSequence++;
@@ -1493,42 +1689,59 @@ function makeBrowserContext(options, onRequest) {
       };
 
       const form = parseForm(request.body);
-      const tracelessInit = contextReference?.__ALI_TRACELESS_INIT__;
-      if (form.Action === "InitCaptchaV3" && tracelessInit) {
+      const sdkInit = contextReference?.__ALI_SDK_INIT__;
+      if (form.Action === "InitCaptchaV3" && sdkInit) {
         Promise.resolve()
           .then(() => {
             if (
-              tracelessInit.consumed
-              || form.SceneId !== tracelessInit.sceneId
+              sdkInit.consumed
+              || form.SceneId !== sdkInit.sceneId
               || typeof form.DeviceToken !== "string"
               || form.DeviceToken.length < 1
               || form.DeviceToken.length > 32 * 1024
             ) {
-              throw new Error("无痕 Init 会话不一致");
+              throw new Error("SDK Init 会话不一致");
             }
-            tracelessInit.consumed = true;
-            tracelessInit.observedDeviceToken = form.DeviceToken;
-            tracelessInit.phase = "init_response";
+            sdkInit.consumed = true;
+            sdkInit.observedDeviceToken = form.DeviceToken;
+            sdkInit.phase = "init_response";
             applyResponse(200, JSON.stringify({
-              CertifyId: tracelessInit.certifyId,
+              CertifyId: sdkInit.certifyId,
               Message: "success",
-              RequestId: "synthetic-traceless-init",
+              RequestId: "synthetic-sdk-init",
               Code: "Success",
               LimitFlow: false,
               Success: true,
-              StaticPath: tracelessInit.staticPath,
-              CaptchaType: "TRACELESS",
+              ...(sdkInit.securityToken
+                ? { SecurityToken: sdkInit.securityToken }
+                : {}),
+              StaticPath: sdkInit.staticPath,
+              CaptchaType: sdkInit.captchaType,
             }), [["content-type", "application/json"]]);
           })
           .catch(() => {
-            tracelessInit.phase = "init_rejected";
-            this.onerror?.(new Error("无痕 Init 会话无效"));
+            sdkInit.phase = "init_rejected";
+            this.onerror?.(new Error("SDK Init 会话无效"));
           });
         return;
       }
 
-      if (form.Action === "VerifyCaptchaV3" && tracelessInit) {
-        tracelessInit.phase = "verify_request";
+      if (form.Action === "VerifyCaptchaV3" && sdkInit) {
+        if (
+          sdkInit.verifyRequested
+          || !sdkInit.consumed
+          || form.SceneId !== sdkInit.sceneId
+          || form.CertifyId !== sdkInit.certifyId
+        ) {
+          sdkInit.phase = "verify_rejected";
+          Promise.resolve().then(() => {
+            this.onerror?.(new Error("SDK Verify 请求无效"));
+          });
+          return;
+        }
+        // Verify 一旦准备发送即永久消耗本轮机会；网络结果未知也不补发。
+        sdkInit.verifyRequested = true;
+        sdkInit.phase = "verify_request";
       }
 
       const requestUrl = assertAllowedNetworkUrl(this.url);
@@ -1551,12 +1764,12 @@ function makeBrowserContext(options, onRequest) {
           if (this._aborted) {
             return;
           }
-          if (form.Action === "VerifyCaptchaV3" && tracelessInit) {
-            tracelessInit.verifyResult = parseTracelessVerifyResponse(
+          if (form.Action === "VerifyCaptchaV3" && sdkInit) {
+            sdkInit.verifyResult = parseTracelessVerifyResponse(
               responseText,
-              tracelessInit.certifyId,
+              sdkInit.certifyId,
             );
-            tracelessInit.phase = "verify_response";
+            sdkInit.phase = "verify_response";
           }
           applyResponse(
             response.status,
@@ -2040,6 +2253,7 @@ function makeBrowserContext(options, onRequest) {
     AnimationEvent: BasicEvent,
     TransitionEvent: BasicEvent,
     TouchEvent: BasicEvent,
+    MouseEvent: BasicEvent,
     Touch: function Touch() {},
     Window: function Window() {},
     Document: function Document() {},
@@ -2304,6 +2518,95 @@ function callPeFeiLinGetter(getterOwner, getterArguments) {
 
 
 function parseWorkerCompletionPayload(payload) {
+  if (payload?.mode === "sliding") {
+    const staticPath = payload.staticPath;
+    const track = payload.track;
+    const slideWidth = payload.slideWidth;
+    const handleWidth = payload.handleWidth;
+    const target = slideWidth - handleWidth;
+    const validTrack = (
+      Array.isArray(track)
+      && track.length >= 3
+      && track.length <= 512
+      && track.every((event, index) => (
+        event !== null
+        && typeof event === "object"
+        && !Array.isArray(event)
+        && Object.keys(event).length === 7
+        && ["touchstart", "touchmove", "touchend"].includes(event.type)
+        && Number.isInteger(event.x)
+        && event.x >= -64
+        && event.x <= target + 64
+        && Number.isInteger(event.y)
+        && event.y >= -256
+        && event.y <= 256
+        && Number.isInteger(event.dt)
+        && event.dt >= 0
+        && event.dt <= 5_000
+        && Number.isFinite(event.force)
+        && event.force >= 0
+        && event.force <= 1
+        && Number.isFinite(event.radiusX)
+        && event.radiusX > 0
+        && event.radiusX <= 128
+        && Number.isFinite(event.radiusY)
+        && event.radiusY > 0
+        && event.radiusY <= 128
+        && (index !== 0 || (event.type === "touchstart" && event.x === 0 && event.dt === 0))
+        && (index === 0 || index === track.length - 1 || event.type === "touchmove")
+        && (index !== track.length - 1 || (event.type === "touchend" && event.x === target))
+      ))
+      && track.at(-2)?.x === target
+      && track.reduce((total, event) => total + event.dt, 0) <= 15_000
+    );
+    if (
+      payload === null
+      || typeof payload !== "object"
+      || Array.isArray(payload)
+      || payload.complete !== true
+      || Object.keys(payload).length !== 10
+      || typeof payload.sceneId !== "string"
+      || payload.sceneId.length < 1
+      || payload.sceneId.length > 64
+      || typeof payload.certifyId !== "string"
+      || payload.certifyId.length < 1
+      || payload.certifyId.length > 512
+      || typeof payload.captchaType !== "string"
+      || payload.captchaType.toUpperCase() !== "SLIDING"
+      || typeof payload.deviceToken !== "string"
+      || payload.deviceToken.length < 1
+      || payload.deviceToken.length > 32 * 1024
+      || typeof staticPath !== "string"
+      || staticPath.length < 1
+      || staticPath.length > 512
+      || staticPath.startsWith("/")
+      || staticPath.includes("://")
+      || staticPath.split("/").some((segment) => (
+        segment === "" || segment === "." || segment === ".."
+      ))
+      || !Number.isInteger(slideWidth)
+      || slideWidth < 320
+      || slideWidth > 1024
+      || !Number.isInteger(handleWidth)
+      || handleWidth < 30
+      || handleWidth >= slideWidth
+      || !validTrack
+    ) {
+      throw new Error("challenge-worker 拖动完成信号无效");
+    }
+    return {
+      complete: true,
+      mode: "sliding",
+      sceneId: payload.sceneId,
+      certifyId: payload.certifyId,
+      captchaType: "SLIDING",
+      deviceToken: payload.deviceToken,
+      staticPath,
+      track: track.map((event) => ({ ...event })),
+      slideWidth,
+      handleWidth,
+    };
+  }
   if (payload?.mode === "traceless") {
     const staticPath = payload.staticPath;
     if (
@@ -2572,12 +2875,14 @@ async function runTracelessCaptcha(
     if (runtimeConfig.DeviceToken !== completion.deviceToken) {
       throw new Error("无痕验证码 DeviceToken 不可写");
     }
-    context.__ALI_TRACELESS_INIT__ = {
+    context.__ALI_SDK_INIT__ = {
       sceneId: completion.sceneId,
       certifyId: completion.certifyId,
       captchaType: "TRACELESS",
+      securityToken: "",
       staticPath: completion.staticPath,
       consumed: false,
+      verifyRequested: false,
       observedDeviceToken: "",
       verifyResult: null,
       phase: "ready",
@@ -2592,7 +2897,7 @@ async function runTracelessCaptcha(
       };
       timeoutId = setTimeout(
         () => {
-          const phase = context.__ALI_TRACELESS_INIT__?.phase;
+          const phase = context.__ALI_SDK_INIT__?.phase;
           const code = {
             ready: "TRACELESS_TIMEOUT_READY",
             calling_init: "TRACELESS_TIMEOUT_CALLING_INIT",
@@ -2608,7 +2913,7 @@ async function runTracelessCaptcha(
         options.timeoutMs,
       );
       try {
-        context.__ALI_TRACELESS_INIT__.phase = "calling_init";
+        context.__ALI_SDK_INIT__.phase = "calling_init";
         context.initAliyunCaptcha({
           SceneId: completion.sceneId,
           mode: "popup",
@@ -2618,10 +2923,10 @@ async function runTracelessCaptcha(
           timeout: Math.min(options.timeoutMs, 5_000),
           rem: 1,
           success(value) {
-            context.__ALI_TRACELESS_INIT__.phase = "success";
+            context.__ALI_SDK_INIT__.phase = "success";
             if (
-              !context.__ALI_TRACELESS_INIT__?.consumed
-              || context.__ALI_TRACELESS_INIT__?.verifyResult === null
+              !context.__ALI_SDK_INIT__?.consumed
+              || context.__ALI_SDK_INIT__?.verifyResult === null
               || typeof value !== "string"
               || value.length < 1
               || value.length > 16 * 1024
@@ -2639,9 +2944,9 @@ async function runTracelessCaptcha(
           },
           getInstance(instance) {
             captchaInstance = instance;
-            context.__ALI_TRACELESS_INIT__.phase = "instance";
+            context.__ALI_SDK_INIT__.phase = "instance";
             setTimeout(() => {
-              context.__ALI_TRACELESS_INIT__.phase = "click";
+              context.__ALI_SDK_INIT__.phase = "click";
               button.click();
             }, 0);
           },
@@ -2651,7 +2956,7 @@ async function runTracelessCaptcha(
       }
     });
     const observedDeviceToken = (
-      context.__ALI_TRACELESS_INIT__?.observedDeviceToken
+      context.__ALI_SDK_INIT__?.observedDeviceToken
     );
     if (
       typeof observedDeviceToken !== "string"
@@ -2663,7 +2968,7 @@ async function runTracelessCaptcha(
     return {
       captchaVerifyParam,
       deviceToken: observedDeviceToken,
-      verifyResult: context.__ALI_TRACELESS_INIT__.verifyResult,
+      verifyResult: context.__ALI_SDK_INIT__.verifyResult,
     };
   } finally {
     if (timeoutId !== null) clearTimeout(timeoutId);
@@ -2675,7 +2980,450 @@ async function runTracelessCaptcha(
     context.document.querySelectorAll = originalQuerySelectorAll;
     context.document.body.removeChild(element);
     context.document.body.removeChild(button);
-    delete context.__ALI_TRACELESS_INIT__;
+    delete context.__ALI_SDK_INIT__;
+    if (hadDeviceToken) {
+      runtimeConfig.DeviceToken = originalDeviceToken;
+    } else {
+      delete runtimeConfig.DeviceToken;
+    }
+  }
+}
+
+
+function setSlidingElementBox(element, width, height, defaultLeft = 0) {
+  element.offsetWidth = width;
+  element.clientWidth = width;
+  element.offsetHeight = height;
+  element.clientHeight = height;
+  Object.defineProperties(element, {
+    offsetLeft: {
+      configurable: true,
+      get() {
+        const styledLeft = Number.parseFloat(element.style.left);
+        return Number.isFinite(styledLeft) ? styledLeft : defaultLeft;
+      },
+    },
+    offsetTop: {
+      configurable: true,
+      get() { return 0; },
+    },
+  });
+  element.getBoundingClientRect = () => {
+    const styledLeft = Number.parseFloat(element.style.left);
+    const left = Number.isFinite(styledLeft) ? styledLeft : defaultLeft;
+    return {
+      x: left,
+      y: 0,
+      top: 0,
+      left,
+      right: left + width,
+      bottom: height,
+      width,
+      height,
+    };
+  };
+}
+
+
+function buildSlidingElementTree(context, host, slideWidth, handleWidth) {
+  const elements = new Map([[host.id, host]]);
+  const make = (tagName, id, className = "") => {
+    const element = context.document.createElement(tagName);
+    element.id = id;
+    element.className = className;
+    elements.set(id, element);
+    return element;
+  };
+  const embed = make("div", "aliyunCaptcha-window-embed", "aliyunCaptcha-show");
+  const wrapper = make("div", "aliyunCaptcha-sliding-wrapper", "aliyun-captcha");
+  const body = make("div", "aliyunCaptcha-sliding-body", "sliding");
+  const left = make("div", "aliyunCaptcha-sliding-left", "aliyunCaptcha-sliding-slided");
+  const slider = make("div", "aliyunCaptcha-sliding-slider", "aliyunCaptcha-sliding-slider");
+  const textBox = make("div", "aliyunCaptcha-sliding-text-box", "aliyunCaptcha-sliding-text-box");
+  const text = make("span", "aliyunCaptcha-sliding-text", "aliyunCaptcha-sliding-text");
+  const errorCode = make("div", "aliyunCaptcha-sliding-errorCode");
+  const failTip = make("span", "aliyunCaptcha-sliding-failTip");
+
+  slider.textContent = "\ue624";
+  text.textContent = "请按住滑块，拖动到最右边";
+  textBox.appendChild(text);
+  body.appendChild(left);
+  body.appendChild(slider);
+  body.appendChild(textBox);
+  wrapper.appendChild(body);
+  wrapper.appendChild(errorCode);
+  wrapper.appendChild(failTip);
+  embed.appendChild(wrapper);
+  host.appendChild(embed);
+
+  for (const element of [host, embed, wrapper, body, left, textBox]) {
+    setSlidingElementBox(element, slideWidth, handleWidth);
+  }
+  setSlidingElementBox(slider, handleWidth, handleWidth);
+  setSlidingElementBox(text, slideWidth - 2 * handleWidth, handleWidth);
+  setSlidingElementBox(errorCode, 0, 0);
+  setSlidingElementBox(failTip, 0, 0);
+
+  const query = (selector) => {
+    const normalized = String(selector);
+    return normalized.startsWith("#")
+      ? elements.get(normalized.slice(1)) ?? null
+      : null;
+  };
+  const queryAll = (selector) => {
+    if (String(selector) === "*") return [...elements.values()];
+    const matched = query(selector);
+    return matched ? [matched] : [];
+  };
+  for (const element of elements.values()) {
+    element.querySelector = query;
+    element.querySelectorAll = queryAll;
+  }
+  return { elements, slider, query, queryAll };
+}
+
+
+function makeTouchList(values) {
+  const list = [...values];
+  Object.defineProperty(list, "item", {
+    configurable: true,
+    value(index) {
+      return list[index] ?? null;
+    },
+  });
+  return list;
+}
+
+
+function dispatchSlidingEvent(context, slider, event) {
+  let eventTarget = slider;
+  while (eventTarget && eventTarget !== context.document.body) {
+    eventTarget.dispatchEvent(event);
+    if (event[BRIDGE_EVENT_STATE].propagationStopped) return;
+    eventTarget = eventTarget.parentNode;
+  }
+  if (eventTarget === context.document.body) {
+    context.document.body.dispatchEvent(event);
+  }
+  if (!event[BRIDGE_EVENT_STATE].propagationStopped) {
+    context.document.dispatchEvent(event);
+  }
+  if (!event[BRIDGE_EVENT_STATE].propagationStopped) {
+    context.dispatchEvent(event);
+  }
+}
+
+
+async function replaySlidingTrack(context, slider, completion) {
+  let elapsed = 0;
+  let previousClientX = null;
+  let previousClientY = null;
+  for (const sample of completion.track) {
+    if (sample.dt > 0) {
+      await new Promise((resolve) => setTimeout(resolve, sample.dt));
+    }
+    elapsed += sample.dt;
+    const clientX = completion.handleWidth / 2 + sample.x;
+    const clientY = completion.handleWidth / 2 + sample.y;
+    const movementX = previousClientX === null ? 0 : clientX - previousClientX;
+    const movementY = previousClientY === null ? 0 : clientY - previousClientY;
+    const touch = {
+      identifier: 1,
+      target: slider,
+      clientX,
+      clientY,
+      pageX: clientX,
+      pageY: clientY,
+      screenX: clientX,
+      screenY: clientY,
+      radiusX: sample.radiusX,
+      radiusY: sample.radiusY,
+      rotationAngle: 0,
+      force: sample.force,
+    };
+    const ended = sample.type === "touchend";
+    const wireType = {
+      touchstart: "mousedown",
+      touchmove: "mousemove",
+      touchend: "mouseup",
+    }[sample.type];
+    const active = makeTouchList(ended ? [] : [touch]);
+    const changed = makeTouchList([touch]);
+    let event;
+    try {
+      event = new context.MouseEvent(wireType, {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        isTrusted: true,
+        timeStamp: elapsed,
+        target: slider,
+        touches: active,
+        targetTouches: active,
+        changedTouches: changed,
+        clientX,
+        clientY,
+        pageX: clientX,
+        pageY: clientY,
+        screenX: clientX,
+        screenY: clientY,
+        x: clientX,
+        y: clientY,
+        offsetX: clientX,
+        offsetY: clientY,
+        layerX: clientX,
+        layerY: clientY,
+        movementX,
+        movementY,
+        button: 0,
+        buttons: ended ? 0 : 1,
+        which: 1,
+        detail: 1,
+        view: context,
+      });
+    } catch {
+      throw slidingBridgeError("SLIDING_EVENT_CONSTRUCT");
+    }
+    if (sample.type === "touchstart") {
+      try {
+        dispatchSlidingEvent(context, slider, event);
+      } catch {
+        throw slidingBridgeError("SLIDING_TOUCHSTART_DISPATCH");
+      }
+      previousClientX = clientX;
+      previousClientY = clientY;
+      continue;
+    }
+    try {
+      dispatchSlidingEvent(context, slider, event);
+    } catch {
+      throw slidingBridgeError(
+        sample.type === "touchend"
+          ? "SLIDING_TOUCHEND_DISPATCH"
+          : "SLIDING_TOUCHMOVE_DISPATCH",
+      );
+    }
+    previousClientX = clientX;
+    previousClientY = clientY;
+  }
+}
+
+
+async function runSlidingCaptcha(
+  context,
+  runtimeConfig,
+  options,
+  completion,
+) {
+  if (
+    typeof context?.initAliyunCaptcha !== "function"
+    || !runtimeConfig
+    || typeof runtimeConfig !== "object"
+  ) {
+    throw new Error("拖动验证码运行态不可用");
+  }
+
+  const elementId = "ali-sliding-captcha";
+  const element = context.document.createElement("div");
+  element.id = elementId;
+  setSlidingElementBox(element, completion.slideWidth, completion.handleWidth);
+  let slidingDOM = null;
+  element.insertAdjacentHTML = (_position, html) => {
+    if (
+      slidingDOM === null
+      && String(html).includes("aliyunCaptcha-sliding-wrapper")
+    ) {
+      slidingDOM = buildSlidingElementTree(
+        context,
+        element,
+        completion.slideWidth,
+        completion.handleWidth,
+      );
+    }
+  };
+
+  const originalGetElementById = context.document.getElementById;
+  const originalQuerySelector = context.document.querySelector;
+  const originalQuerySelectorAll = context.document.querySelectorAll;
+  context.document.getElementById = function getElementById(id) {
+    if (String(id) === elementId) return element;
+    return slidingDOM?.elements.get(String(id))
+      ?? originalGetElementById.call(this, id);
+  };
+  context.document.querySelector = function querySelector(selector) {
+    const normalized = String(selector);
+    if (normalized === `#${elementId}`) return element;
+    return slidingDOM?.query(normalized)
+      ?? originalQuerySelector.call(this, selector);
+  };
+  context.document.querySelectorAll = function querySelectorAll(selector) {
+    const normalized = String(selector);
+    if (normalized === `#${elementId}`) return [element];
+    const matched = slidingDOM?.queryAll(normalized) ?? [];
+    return matched.length > 0
+      ? matched
+      : originalQuerySelectorAll.call(this, selector);
+  };
+  element.querySelector = (selector) => slidingDOM?.query(selector) ?? null;
+  element.querySelectorAll = (selector) => slidingDOM?.queryAll(selector) ?? [];
+  context.document.body.appendChild(element);
+
+  const hadDeviceToken = Object.prototype.hasOwnProperty.call(
+    runtimeConfig,
+    "DeviceToken",
+  );
+  const originalDeviceToken = runtimeConfig.DeviceToken;
+  let captchaInstance = null;
+  let timeoutId = null;
+  let dragStarted = false;
+  try {
+    runtimeConfig.DeviceToken = completion.deviceToken;
+    if (runtimeConfig.DeviceToken !== completion.deviceToken) {
+      throw new Error("拖动验证码 DeviceToken 不可写");
+    }
+    context.__ALI_SDK_INIT__ = {
+      sceneId: completion.sceneId,
+      certifyId: completion.certifyId,
+      captchaType: "SLIDING",
+      securityToken: "",
+      staticPath: completion.staticPath,
+      consumed: false,
+      verifyRequested: false,
+      observedDeviceToken: "",
+      verifyResult: null,
+      phase: "ready",
+    };
+    const captchaVerifyParam = await new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        if (timeoutId !== null) clearTimeout(timeoutId);
+        callback(value);
+      };
+      timeoutId = setTimeout(
+        () => {
+          const phase = context.__ALI_SDK_INIT__?.phase;
+          const code = {
+            ready: "SLIDING_TIMEOUT_READY",
+            calling_init: "SLIDING_TIMEOUT_CALLING_INIT",
+            init_rejected: "SLIDING_TIMEOUT_INIT_REJECTED",
+            init_response: "SLIDING_TIMEOUT_INIT_RESPONSE",
+            instance: "SLIDING_TIMEOUT_INSTANCE",
+            dom: "SLIDING_TIMEOUT_DOM",
+            drag: "SLIDING_TIMEOUT_DRAG",
+            drag_complete: "SLIDING_TIMEOUT_DRAG_COMPLETE",
+            verify_request: "SLIDING_TIMEOUT_VERIFY_REQUEST",
+            verify_response: "SLIDING_TIMEOUT_VERIFY_RESPONSE",
+          }[phase] ?? "SLIDING_TIMEOUT_READY";
+          finish(reject, slidingBridgeError(code));
+        },
+        options.timeoutMs,
+      );
+      try {
+        context.__ALI_SDK_INIT__.phase = "calling_init";
+        context.initAliyunCaptcha({
+          prefix: options.prefix,
+          SceneId: completion.sceneId,
+          mode: "embed",
+          element: `#${elementId}`,
+          language: "cn",
+          timeout: Math.min(options.timeoutMs, 5_000),
+          rem: 1,
+          slideStyle: {
+            width: completion.slideWidth,
+            height: completion.handleWidth,
+          },
+          showErrorTip: false,
+          delayBeforeSuccess: false,
+          success(value) {
+            context.__ALI_SDK_INIT__.phase = "success";
+            if (
+              !context.__ALI_SDK_INIT__?.consumed
+              || context.__ALI_SDK_INIT__?.captchaType !== "SLIDING"
+              || context.__ALI_SDK_INIT__?.verifyResult === null
+              || typeof value !== "string"
+              || value.length <= 140
+              || value.length > 16 * 1024
+            ) {
+              finish(reject, new Error("拖动验证码成功参数无效"));
+              return;
+            }
+            finish(resolve, value);
+          },
+          fail() {
+            finish(reject, slidingBridgeError("SLIDING_FAIL_CALLBACK"));
+          },
+          onError() {
+            finish(reject, slidingBridgeError("SLIDING_ERROR_CALLBACK"));
+          },
+          onClose() {
+            finish(reject, slidingBridgeError("SLIDING_FAIL_CALLBACK"));
+          },
+          getInstance(instance) {
+            captchaInstance = instance;
+            context.__ALI_SDK_INIT__.phase = "instance";
+            if (dragStarted) return;
+            dragStarted = true;
+            setTimeout(() => {
+              Promise.resolve()
+                .then(async () => {
+                  context.__ALI_SDK_INIT__.phase = "dom";
+                  const slider = slidingDOM?.slider;
+                  if (!slider) {
+                    throw slidingBridgeError("SLIDING_TIMEOUT_DOM");
+                  }
+                  // getInstance 在滑动组件的 document 监听器完全挂载前就可能回调。
+                  // 保留一个人手反应窗口，避免后挂的 move 处理器错过 touchstart。
+                  await new Promise((resolveDelay) => setTimeout(
+                    resolveDelay,
+                    Math.min(260, Math.max(120, Math.floor(options.timeoutMs / 20))),
+                  ));
+                  context.__ALI_SDK_INIT__.phase = "drag";
+                  await replaySlidingTrack(context, slider, completion);
+                  context.__ALI_SDK_INIT__.phase = "drag_complete";
+                })
+                .catch((error) => {
+                  finish(
+                    reject,
+                    error?.safeCode
+                      ? error
+                      : slidingBridgeError("SLIDING_TRACK_DISPATCH"),
+                  );
+                });
+            }, 0);
+          },
+        });
+      } catch {
+        finish(reject, slidingBridgeError("SLIDING_INIT_THROW"));
+      }
+    });
+    const observedDeviceToken = context.__ALI_SDK_INIT__?.observedDeviceToken;
+    if (
+      typeof observedDeviceToken !== "string"
+      || observedDeviceToken.length < 1
+      || observedDeviceToken.length > 32 * 1024
+    ) {
+      throw new Error("拖动验证码 DeviceToken 无效");
+    }
+    return {
+      captchaVerifyParam,
+      deviceToken: observedDeviceToken,
+      verifyResult: context.__ALI_SDK_INIT__?.verifyResult,
+    };
+  } finally {
+    if (timeoutId !== null) clearTimeout(timeoutId);
+    try {
+      captchaInstance?.destroyCaptcha?.();
+    } catch {}
+    try {
+      captchaInstance?.destroy?.();
+    } catch {}
+    context.document.getElementById = originalGetElementById;
+    context.document.querySelector = originalQuerySelector;
+    context.document.querySelectorAll = originalQuerySelectorAll;
+    context.document.body.removeChild(element);
+    delete context.__ALI_SDK_INIT__;
     if (hadDeviceToken) {
       runtimeConfig.DeviceToken = originalDeviceToken;
     } else {
@@ -3089,6 +3837,34 @@ async function main() {
         requests: summarizeRequests(),
       });
       const completion = await readWorkerCompletionInput();
+      if (completion.mode === "sliding") {
+        const slidingResult = await runSlidingCaptcha(
+          context,
+          runtimeConfig,
+          options,
+          completion,
+        );
+        writeBridgeOutput({
+          stage: "sliding",
+          captchaType: "SLIDING",
+          sceneId: completion.sceneId,
+          certifyId: completion.certifyId,
+          captchaVerifyParam: slidingResult.captchaVerifyParam,
+          slidingDeviceToken: slidingResult.deviceToken,
+          verifyCode: slidingResult.verifyResult?.verifyCode,
+          verifyResult: slidingResult.verifyResult?.verifyResult,
+          securityToken: slidingResult.verifyResult?.securityToken,
+          verifyCertifyId: slidingResult.verifyResult?.certifyId,
+          deviceConfig,
+          verifyArgProfile,
+          requestCount: requests.length,
+          requests: summarizeRequests(),
+        });
+        if (multiplexSessionId() !== null) {
+          return;
+        }
+        process.exit(0);
+      }
       if (completion.mode === "traceless") {
         const tracelessResult = await runTracelessCaptcha(
           context,
@@ -3236,6 +4012,7 @@ export {
   replayFeiLinInteractionEvents,
   refreshFeiLinToken,
   readWorkerCompletionInput,
+  runSlidingCaptcha,
   safeDeviceBridgeFailureMessage,
   selectFeiLinGetterOwner,
 };

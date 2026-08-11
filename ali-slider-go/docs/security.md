@@ -137,6 +137,7 @@ Init 返回的动态 PE 不能依赖有限硬编码表，也不能用随机 `arg
 - `StaticPath` 必须匹配版本号、三位分片号和 16 位小写十六进制摘要的固定格式；据此只构造 `g.alicdn.com/captcha-frontend/dynamicJS/...` URL。
 - Go 下载公开 SDK 时只允许 `o.alicdn.com`/`g.alicdn.com`，下载 Puzzle PE 时只允许 `g.alicdn.com`；同会话验证码 SDK 运行桥另允许官方动态挑战资源主机 `x.alicdn.com`。请求和每次重定向都要求 HTTPS、默认端口、无 userinfo，单脚本上限 2 MiB，并沿用本轮 transport/代理路由。
 - 每个Device slot持有独立只读画像；当轮RPC headers、图片、PE与Device Isolate使用租到会话的实际画像。JS不直接持有socket，只能通过同步JSON host回调请求Go访问严格白名单；Isolate从Log1/2/3保持到Complete并产出同session Verify token。
+- `TRACELESS`/`SLIDING` 的 SDK 内部 Init 被 bridge 绑定到 Go 已签发的挑战，不产生第二次真实 Init；SDK 发出的 Verify 必须恰好一次。`SLIDING` 的 success Base64 与 Verify 响应会在 Go 层交叉校验 `SceneId`、`CertifyId`、`securityToken`、结果码和布尔结果，任何错配都按协议错误停止。
 - 新精确 PE 分片使用禁网 V8 Isolate 对固定假输入采样，并与纯 Go Builder 的 payload、事件和时钟完整差分。仅兼容分片在 TTL 内用本轮真实 `SceneId`、`CertifyId`、DeviceToken、DeviceConfig、图片路径、尺寸、轨迹和逻辑时钟纯算 `data`；不兼容分片在禁网 V8 中按本轮输入构造。Go 随后对两条路径都独立解包并验证 session、schema、坐标、getter 参数、事件计数和时钟边界。
 - 公开SDK每5分钟字节复核；精确PE源码/profile最多30分钟强制重下与V8差分。DeviceToken、`CertifyId`、DeviceConfig、轨迹、`data`不进入分钟级缓存。预热挑战状态默认最多空闲20秒且一次性消费；默认直连池最多保留4个Isolate，满池等待，下一轮必须重建context/session/token。
 - 不创建临时桥文件或子进程，也不向 JS 注入代理环境变量。HTTP(S)/SOCKS 凭据只保留在 Go transport 内存中；V8 host 只收发有大小上限的 JSON、响应与密码学随机字节。wrapper 对源码/输入/结果设上限，单 Isolate heap 上限 512 MiB，child script 默认 1 秒且最长 10 秒，Go context 取消会请求 V8 终止执行。
@@ -148,11 +149,11 @@ V8 Isolate 不是操作系统级沙箱；wrapper 和 V8 与 Go 同进程，nativ
 
 完整链的不变量：
 
-1. 每轮 Solver 只创建一个 RPCClient。
-2. RPCClient 只允许一次 Init，并记录成功签发的 `CertifyId`。
-3. Verify 仅接受该 RPCClient 签发的 ID。
-4. Verify 尝试位在任何网络发送之前消耗；请求清空 `GetBody`，阻止 `net/http` 在已发送 body 后透明重放；网络未知也不回滚。
-5. 轨迹、PE schema、getter、Device Complete、置信度或 context 门禁失败时，Verify 调用数为零。
+1. 每轮 Solver 只创建一个 RPCClient，并只发送一次真实 Init；SDK 类型内部的 Init 调用使用已绑定响应，不发送第二次网络请求。
+2. RPCClient 记录成功签发的 `CertifyId`；Puzzle Verify 和 SDK stage 都只接受同一 ID。
+3. Puzzle Verify 尝试位在任何网络发送之前消耗；请求清空 `GetBody`，阻止 `net/http` 在已发送 body 后透明重放；网络未知也不回滚。
+4. TRACELESS/SLIDING 只接受 SDK 发出的一个 `VerifyCaptchaV3`；重复、缺失、乱序、身份或结果错配均拒绝，且不再补发。
+5. 轨迹、PE schema、getter、Device Complete、置信度或前置 context 门禁失败时不进入 Verify；SDK success 在 Verify 后校验失败时拒绝结果和业务提交，且不补发 Verify。
 6. 业务拒绝是一次已完成 Verify，绝不重试。
 
 当前保证的作用域是单轮生产状态机。上游正常每次 Init 返回新 ID；进程不维护无界的全局历史 ID 数据库。
@@ -195,7 +196,8 @@ V8 Isolate 不是操作系统级沙箱；wrapper 和 V8 与 Go 同进程，nativ
 | `internal/challenge/pool.go` · `canonicalProxyRoute` / `TransportPool.Get` | 路由归一、摘要 key、直连保留和 LRU 限制凭据泄漏与永久耗尽。 | proxy → canonical → SHA-256 key → bounded transport |
 | `internal/challenge/assets.go` · `DownloadAssets` | 固定 CDN、逐跳校验、字节上限和首错取消降低 SSRF/内存/尾延迟风险。 | relative path → allowlisted HTTPS → bounded bytes |
 | `internal/pe/v8_host.go`；`internal/v8runtime/runtime.go`；`native/v8runtime/src/lib.rs` | Device 只能通过 Go host 访问 HTTPS allowlist，PE host 禁网；ABI 输入/输出、heap、child script 时间和 context 取消均有边界。 | untrusted public JS → isolated V8 context → bounded host call → independently checked Go output |
-| `internal/challenge/rpc.go` · `RPCClient.Init/Verify` | Init 只一次，Verify 绑定该 ID 并在网络前消耗唯一尝试位。 | issued ID → irreversible Verify attempt |
+| `internal/challenge/rpc.go` · `RPCClient.Init/Verify` | 真实 Init 只一次；Puzzle Verify 绑定该 ID 并在网络前消耗唯一尝试位。 | issued ID → irreversible Puzzle Verify attempt |
+| `internal/pe/device_runtime.go` · `acceptTracelessStage` / `acceptSlidingStage`；`internal/pe/runtime/sdk_device_bridge.mjs` · `runTracelessCaptcha` / `runSlidingCaptcha` | SDK 类型复用已签发挑战，只接受一次内部 Verify；SLIDING success 与 Verify 响应在 Go 层交叉校验且结果格式化脱敏。 | bound challenge → SDK interaction → one Verify → independent Go validation |
 | `.github/workflows/ali-slider-go-ci.yml` | 官方 action 全 SHA 固定；项目测试与 Windows smoke 不访问真实目标，工具与 vuln DB 供应链网络被明确区分。 | pinned actions/tools → offline project checks → verified binary/ZIP |
 | `internal/device/rpc.go:119`、`:130`；`internal/device/session_test.go:130`、`:146`、`:150`、`:165` | Device `ResultObject` 保留原始 JSON，只在 Log1 解码配置，避免对 Log2/3 施加错误对象 schema。 | bounded response → action-specific decode → regression proof |
 | `pkg/slider/online_acceptance_test.go:37`、`:49`、`:98`、`:128`、`:147`、`:165`、`:168`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 2026-08-07 的历史 Client harness 每个 job 只调用一次 Solve，只输出分类计数和聚合延迟；`196/200` 且 network `0`。它不经过 HTTP Handler；最终源码通过 `GetBody == nil` 离线回归证明 one-shot，但未在线重跑。 | dated authorization → no-application-retry Client jobs → sanitized aggregate → bounded historical finding |

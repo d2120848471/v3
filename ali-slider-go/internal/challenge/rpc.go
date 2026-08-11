@@ -24,6 +24,7 @@ const (
 	maxRPCResponseBytes = 2 << 20
 	verifyFutureSkew    = 2 * time.Second
 	captchaTraceless    = "TRACELESS"
+	captchaSliding      = "SLIDING"
 )
 
 // CaptchaChallenge 是 Init 成功后的非敏感控制字段；CertifyID 不得进入日志。
@@ -175,7 +176,7 @@ func (client *RPCClient) Init(ctx context.Context, deviceToken string) (CaptchaC
 		return CaptchaChallenge{}, rpcProtocolError("InitCaptchaV3 returned failure", nil)
 	}
 	imagePath, puzzlePath := "", ""
-	if !isTracelessCaptchaType(response.CaptchaType) {
+	if !isSDKCaptchaType(response.CaptchaType) {
 		imagePath, err = ValidateAssetPath(response.Image, "Image")
 		if err != nil {
 			return CaptchaChallenge{}, rpcProtocolError("Init image path is invalid", err)
@@ -201,6 +202,14 @@ func (client *RPCClient) Init(ctx context.Context, deviceToken string) (CaptchaC
 
 func isTracelessCaptchaType(value string) bool {
 	return strings.EqualFold(strings.TrimSpace(value), captchaTraceless)
+}
+
+func isSlidingCaptchaType(value string) bool {
+	return strings.EqualFold(strings.TrimSpace(value), captchaSliding)
+}
+
+func isSDKCaptchaType(value string) bool {
+	return isTracelessCaptchaType(value) || isSlidingCaptchaType(value)
 }
 
 // Verify 发送该 RPCClient 生命周期内唯一一次 Verify。网络错误也消耗尝试位。

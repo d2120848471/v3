@@ -10,6 +10,7 @@
 同一 V8/FeiLin Isolate：Device Log1/Log2/Log3
   → InitCaptchaV3
   ├─ TRACELESS：同一 VM 调用官方 SDK 无痕实例，绑定刷新后的 DeviceToken 并唯一 Verify
+  ├─ SLIDING：同一 VM 渲染官方无图拖动组件，回放轨迹并由 SDK 唯一 Verify
   └─ PUZZLE：精确 PE → 双图 → 视觉/轨迹 → 同一 VM Complete → 唯一 Verify
 ```
 
@@ -30,6 +31,7 @@ flowchart LR
         device["V8 Device Isolate<br/>同一 FeiLin 状态<br/>Log1 → Log2 → Log3"]
         init["InitCaptchaV3"]
         traceless["TRACELESS<br/>官方 SDK 同 VM Init/Verify<br/>输出滑块同款 Verify 字段"]
+        sliding["SLIDING<br/>官方无图拖动组件<br/>鼠标事件回放 + SDK Verify"]
         pekey["KeyResolver<br/>公开 SDK/PE + V8 自校验<br/>精确路径 · 软 5 / 硬 30 分钟"]
         assets["双图并发下载<br/>首错取消"]
         vision["vision.Solve"]
@@ -40,17 +42,20 @@ flowchart LR
 
     client --> setup --> device --> init
     init -- TRACELESS --> traceless --> result
+    init -- SLIDING --> sliding --> result
     init -- PUZZLE --> pekey --> assets --> vision --> pe --> complete --> verify
     verify --> result["slider.Result"] --> http
 
     transports["TransportPool<br/>直连保留 / route 隔离"] --> device
     transports --> init
     transports --> traceless
+    transports --> sliding
     transports --> pekey
     transports --> assets
     transports --> verify
     v8lib["purego + V8 wrapper<br/>C ABI / ICU 77"] --> device
     v8lib --> traceless
+    v8lib --> sliding
     v8lib --> pe
     prewarm["DeviceSessionPool<br/>每slot独立画像；最多保留4槽"] -.-> device
     keycache["KeyResolver<br/>SDK 软 5 分钟 / PE 硬 30 分钟<br/>无挑战级状态"] -.-> pekey
@@ -59,7 +64,7 @@ flowchart LR
     failure -.-> verify
 ```
 
-`TRACELESS` 的 Init 响应不含背景图或滑块图，因此不会进入资产、视觉、轨迹或动态 PE 分支。运行桥在同一 SDK/FeiLin VM 内复用已签发挑战，记录 SDK 刷新的同 session DeviceToken，只允许一次 Init 和一次 Verify；公共结果直接使用阿里 Verify 响应的 `securityToken`、`VerifyCode`、`VerifyResult` 和 `certifyId`，与图片拼图合同一致。
+`TRACELESS` 与 `SLIDING` 的 Init 响应都不含背景图或滑块图，因此不会进入资产、视觉或 Puzzle PE 分支。运行桥在同一 SDK/FeiLin VM 内复用已签发挑战：SDK 发起的 Init 被本地绑定响应拦截，不产生第二次真实 Init；随后只允许一次真实 Verify。`SLIDING` 使用独立 `418×48` 组件合同、`48px` 手柄和 `370px` 目标轨迹，并把内部 touch 轨迹映射成页面实测的 `mousedown/mousemove/mouseup`。Go 同时复核 SDK success Base64 与 Verify 响应的场景、挑战 ID、token 和 `T001`；公共结果与图片拼图合同一致。
 
 HTTP 层先完成浏览器跨源和输入校验；合法 `POST /api/slider` JSON 与 deprecated `GET /api/slider?...` query 都不经过本地 admission gate，直接调用 Solver，也不因本机在途请求数主动返回 `429` 或 `Retry-After`。GET 与 POST 不合并参数源，form body 不受支持。Handler 和 concrete Client 都会传播超时 context；Solver 必须尊重 context，不使用无界 goroutine 伪造“强制取消”。Client 连接池或预热池的资源预算不等于 HTTP 请求上限。
 
@@ -94,6 +99,8 @@ stateDiagram-v2
     [*] --> RequestValidated
     RequestValidated --> DeviceReady
     DeviceReady --> ChallengeInitialized
+    ChallengeInitialized --> SDKCaptcha: TRACELESS or SLIDING
+    SDKCaptcha --> VerifyAttempted: official SDK
     ChallengeInitialized --> PEKeyResolved
     PEKeyResolved --> AssetsReady
     AssetsReady --> VisionAccepted
@@ -105,6 +112,7 @@ stateDiagram-v2
     RequestValidated --> FailedBeforeVerify
     DeviceReady --> FailedBeforeVerify
     ChallengeInitialized --> FailedBeforeVerify
+    SDKCaptcha --> FailedBeforeVerify
     PEKeyResolved --> FailedBeforeVerify
     AssetsReady --> FailedBeforeVerify
     VisionAccepted --> FailedBeforeVerify
@@ -114,10 +122,10 @@ stateDiagram-v2
 
 不变量：
 
-1. 每个 Solve 创建独立 RPCClient，RPCClient 只允许一次 Init。
-2. RPCClient 记录 Init 签发的 `CertifyId`；Verify 必须使用同一 ID。
-3. `verifyAttempted` 在构造/HTTP 发送之前从 false 不可逆地变为 true。DNS、TLS、超时或结果未知均不回滚。
-4. 动态 PE 源码/画像无法解析、低置信、图像错误、PE/getter/时钟不一致及 Device Complete 失败都在 Verify 前终止。
+1. 每个 Solve 创建独立 RPCClient，RPCClient 只允许一次真实 Init；SDK 类型内部的 Init 调用由 bridge 用已签发响应拦截，不再访问网络。
+2. Puzzle 的 RPCClient 和 SDK 类型的 Go stage 都记录 Init 签发的 `CertifyId`；Verify 必须使用同一 ID。
+3. Puzzle 在 Go `RPCClient` 内消耗唯一 Verify 位；TRACELESS/SLIDING 只接受 SDK 发出的唯一一次 Verify，并由 Go 校验请求数量、顺序和结果。网络结果未知均不重试。
+4. 动态 PE 源码/画像无法解析、低置信、图像错误、PE/getter/时钟不一致或 Device Complete 失败会在 Verify 前终止；SDK success 在 Verify 后校验失败时只拒绝结果和业务提交，不会补发 Verify。
 5. Verify 业务拒绝是完成态：返回 `200 + ok=false`，不转成交通错误，不重试。
 
 ## 5. 并发与资源所有权
@@ -167,9 +175,10 @@ HTTP 进程入口的 `maxHeaderBytes` 是 `server.MaxRequestBytes + 32 KiB`：64
 | Evidence | Finding | Path |
 |---|---|---|
 | `pkg/slider/client.go` · `Client.Solve/Prime/Close` | library 拥有完整 Solver、预热与并发安全关闭生命周期。 | caller → Client → challenge.Solver → Result |
-| `internal/challenge/solver.go` · `Solver.Solve` / `completeAndVerify` | 前置协议阶段通过后只有一个 Verify 调用点。 | Device → Init → Assets → Vision → PE → Complete → Verify |
+| `internal/challenge/solver.go` · `Solver.Solve` / `completeAndVerify` | Puzzle 只有 Go `completeAndVerify` 一个 Verify 调用点；TRACELESS/SLIDING 则各自进入一次性 SDK completion，并由 Go stage 验收唯一 Verify。 | Device → Init → type route → Puzzle Complete/Verify or SDK interaction/Verify → Result |
 | `internal/pe/keys.go`、`v8_runtime.go`、`runtime.go`、`device_runtime.go`；`native/v8runtime/src/lib.rs`；对应离线/显式在线测试 | SDK/同分片 miss 合并、异分片并发；软 5/硬 30 分钟边界；精确分片 V8 与纯 Go 完整差分；Device 外层 Isolate 回收但每轮 context/session/token 重建；V8/code cache 有界。 | StaticPath → V8 oracle → verified pure-Go or V8 fallback → one-round data/token |
-| `internal/challenge/rpc.go` · `RPCClient.Init/Verify` | Init 与唯一 Verify 有实例级状态与 CertifyId 绑定。 | Init consumes attempt → issued ID → Verify consumes attempt |
+| `internal/challenge/rpc.go` · `RPCClient.Init/Verify` | 所有类型的真实 Init 只有一次；Puzzle 的唯一 Verify 由 RPCClient 的实例状态和 CertifyId 绑定。 | Init consumes attempt → issued ID → Puzzle Verify consumes attempt |
+| `internal/challenge/solver.go` · `isSlidingCaptchaType` / `slidingDeviceSession`；`internal/pe/device_runtime.go` · `SolveSliding` / `acceptSlidingStage`；`internal/pe/runtime/sdk_device_bridge.mjs` · `runSlidingCaptcha` | Init 的 `CaptchaType=SLIDING` 自动进入无图 SDK 分支；拖动完成后只接受一次 SDK Verify，并把官方 success 与 Verify 响应交叉校验。 | Init type → SLIDING route → bound SDK Init → mouse replay → one Verify → common Result |
 | `internal/server/server.go` · `MaxRequestBytes` / `checkSolveOrigin` / `decodeQueryRequest` / `requestFromPayload` / `handleSolve` / `callSolver`；`cmd/server/main.go` · `maxHeaderBytes`；`cmd/server/main_test.go` · `TestHeaderBudgetAcceptsMaximumLegacyQuery` | HTTP 入口保留足够 request-line/header 预算，再对 POST 和 deprecated GET 拒绝明确浏览器跨源请求，分别校验 JSON body 与 query；合法请求不经过本地 admission，在请求派生的 deadline context 中调用 Solver。 | request → HTTP budget → origin + source-specific gate → timeout context → Solve → mapped response |
 | `internal/server/testpage.go` · `writeTestPage`；`internal/server/web/test.html` | 第一方页面编译进二进制，以随机 nonce CSP 约束为同源手工调用且不持久化结果。 | GET `/` → embedded page → explicit POST `/api/slider` |
 | `internal/config/config.go` · `MaxConcurrency` / `MaxDevicePrewarmCapacity`；`pkg/slider/client.go` · `NewClient` | `MaxConcurrency`是每route/host连接与PE预算；默认Device预热池库存另有硬上限4；两者都不是HTTP admission阈值。 | config → ClientOptions → transport/PE/device budgets；valid request → Solver |

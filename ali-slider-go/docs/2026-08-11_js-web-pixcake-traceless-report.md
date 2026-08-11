@@ -11,6 +11,8 @@
 | 结论 | 原实现不支持真正无图 `TRACELESS`；修复后显式在线组件 smoke 返回 `T001 / true` |
 | 业务短信 | 未发送；业务接口未调用 |
 
+> 后续说明：本报告记录 TRACELESS 适配当时的代码快照。当前代码又增加了无图 `SLIDING` 支持，因此“仅 TRACELESS 允许空双图”等表述只描述该历史快照；当前边界见 [DJI SLIDING 适配报告](./2026-08-11_js-web-dji-sliding-report.md)。
+
 ## 1. Executive Summary
 
 PixCake 的手机验证码流程使用阿里验证码 2.0。第一方业务脚本配置为 `SceneId=wa3238du`、`prefix=1ohgtl`、`mode=popup`，服务端返回错误码 45 后才启动隐藏验证码；SDK 成功参数会作为 `captcha_verify_param` 重试短信接口。
@@ -230,7 +232,7 @@ git diff --check
 
 专项离线合同包括：
 
-- `TestRPCInitAcceptsImageLessTracelessOnly`
+- `TestRPCInitAcceptsImageLessSDKTypes`
 - `TestSolverRoutesImageLessTracelessThroughDeviceSession`
 - `TestNodeSDKBridgeTracelessContracts`
 - `TestDeviceRuntimeAcceptsBoundTracelessStage`
