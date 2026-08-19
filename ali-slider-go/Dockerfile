@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM --platform=$BUILDPLATFORM golang:1.26.5-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.6-bookworm AS build
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -29,7 +29,7 @@ FROM v8-build AS native-test
 
 RUN cargo test --release --locked
 
-FROM --platform=$TARGETPLATFORM golang:1.26.5-bookworm AS v8-test
+FROM --platform=$TARGETPLATFORM golang:1.26.6-bookworm AS v8-test
 
 WORKDIR /src
 COPY go.mod go.sum ./

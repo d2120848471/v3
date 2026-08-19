@@ -136,7 +136,7 @@ Unix 构建强制 Artifact 目录/文件为 `0700/0600`。Windows 的 Go `FileMo
 
 1. 依赖 Linux quality 与 Darwin race 成功；
 2. 在 `windows-2025` 原生运行 `go vet` 和全量 `go test`；
-3. 使用 Go module 固定的 Go `1.26.5`、`CGO_ENABLED=0` 和 `GOARCH=amd64` 构建，并安装 Rust `1.88.0`；
+3. 使用 Go module 固定的 Go `1.26.6`、`CGO_ENABLED=0` 和 `GOARCH=amd64` 构建，并安装 Rust `1.88.0`；
 4. 运行 Rust wrapper 单测，以静态 MSVC CRT 构建 DLL，再用真实 DLL 运行 Go→V8 测试；
 5. 把 `ali_slider_v8_runtime.dll` 和 `THIRD-PARTY-NOTICES.txt` 纳入包，生成构建信息、UTF-8 BOM 中文说明、包内 SHA-256 和明确文件白名单；
 6. 解压到含中文及空格的临时路径；
@@ -157,7 +157,7 @@ macOS/Linux 交叉构建可以证明 EXE/DLL 可生成并检查 PE 导出/依赖
 
 | Evidence | Finding | Path |
 |---|---|---|
-| `go.mod:3`；`Makefile` · `build-windows` | Windows EXE 固定 Go 1.26.5、AMD64、CGO 关闭和 stripped 构建。 | source → pinned Go → PE executable |
+| `go.mod:3`；`Makefile` · `build-windows` | Windows EXE 固定 Go 1.26.6、AMD64、CGO 关闭和 stripped 构建。 | source → pinned Go → PE executable |
 | `internal/track/track.go:21` | 生产运行所需默认轨迹已嵌入 EXE，不需要外置 fixture。 | embedded asset → single executable |
 | `internal/server/testpage.go`、`internal/server/web/test.html` | API 测试页、样式和脚本编译进同一 EXE，只能同源手工 POST，不生成敏感 query，不增加 ZIP 文件或运行时依赖。 | embedded page → browser GET `/` → explicit same-origin POST |
 | `internal/server/server.go` · `decodeQueryRequest` / `checkSolveOrigin`；`internal/server/server_test.go` · `TestLegacyGETQueryCompatibility` / `TestSolveParameterSourcesStaySeparated` / `TestBrowserOriginBoundaryPreservesLegacyClients` | 旧 GET query 仅做协议兼容，与 POST 分离参数源且共用跨源/Solver 边界。 | legacy URL → query validation → same Solve side effects |

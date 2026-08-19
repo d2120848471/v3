@@ -85,7 +85,7 @@ CPU:      Apple M3 Max
 内存:     51,539,607,552 bytes（48 GiB）
 ```
 
-module、CI 和 Docker 构建均固定 Go `1.26.5`，wrapper 构建固定 Rust `1.88.0`/V8 `149.4.0`。Linux AMD64/ARM64 只验证了功能构建/native ABI，不能与 Mac 性能基线混为同一结论。
+module、CI 和 Docker 构建均固定 Go `1.26.6`，wrapper 构建固定 Rust `1.88.0`/V8 `149.4.0`。Linux AMD64/ARM64 只验证了功能构建/native ABI，不能与 Mac 性能基线混为同一结论。
 
 每份性能报告还必须记录 commit、工作树状态、Go toolchain、OS/arch、`GOMAXPROCS`、电源模式、温度/降频、后台负载、直连/代理、`MaxConcurrency`、同时存活的Device会话峰值及 benchmark 参数。
 
@@ -137,7 +137,7 @@ ALI_SLIDER_PERF=1 GOMAXPROCS=16 \
 
 扩展稳定性画像可按以下流程：
 
-1. 固定 commit、Go `1.26.5`、机器、电源模式和 `GOMAXPROCS=16`。
+1. 固定 commit、Go `1.26.6`、机器、电源模式和 `GOMAXPROCS=16`。
 2. 在计时外读取 fixture、完成只读初始化并充分预热 Go runtime。
 3. 逐次记录 `vision`、`buildVerifyData` 和完整纯计算链墙钟，不只保存聚合平均值。
 4. 数据集同时包含普通图、困难 fallback、无缺口负例和授权脱敏失败样本；不得只挑最快样本。
@@ -233,7 +233,7 @@ ALI_SLIDER_PERF=1 GOMAXPROCS=16 \
 
 | 字段 | 要求 |
 |---|---|
-| 版本 | commit、dirty 状态、Go `1.26.5`、Rust `1.88.0`、V8 `149.4.0` |
+| 版本 | commit、dirty 状态、Go `1.26.6`、Rust `1.88.0`、V8 `149.4.0` |
 | 环境 | OS、arch、CPU、内存、`GOMAXPROCS`、电源模式 |
 | 数据集 | fixture/授权样本数量及普通、困难、负例分布 |
 | 模式 | 逐请求冷建、直连/代理、并发度、`MaxConcurrency`与Device live峰值 |
@@ -257,4 +257,4 @@ ALI_SLIDER_PERF=1 GOMAXPROCS=16 \
 | `internal/challenge/performance_test.go:21`、`:65`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 32 路 Mock 正确性通过；200 样本纯计算 `P99=57.05075ms`，达到硬门槛；6,400 次离线 Solve 压力通过。 | concurrent mock / explicit local sampler / repeated stress → verified compute and capacity gates |
 | `internal/pe/keys.go` · `Prepare` / `runtimeProfileCacheFresh` / `ProfileCacheStats`；`internal/pe/v8_runtime.go` · `runtimeProfileMatchesPureGo`；`pkg/slider/online_acceptance_test.go` | 精确分片只有经当前V8完整差分后才走纯Go；软5/硬30分钟且统计不暴露路径/key。历史预热池50次mean `2562ms`，未达1s；当前逐请求冷建路径待复测。 | StaticPath → source/profile singleflight → V8 oracle → verified pure-Go or V8 fallback → one Verify |
 | `pkg/slider/online_acceptance_test.go:37`、`:49`、`:98`、`:128`、`:147`、`:165`、`:168`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 200/32/应用层零重试候选批次成功率 `98%`、Client 完整求解链 P95 `984ms`，两项门槛通过；不经过 HTTP Handler，最终 one-shot 加固后未再在线重跑。 | authorized jobs → one Solve each → aggregate percentiles → bounded acceptance |
-| `go.mod:3`；`Dockerfile:3` | 正式构建工具链固定 Go `1.26.5`。 | source → pinned build → comparable baseline |
+| `go.mod:3`；`Dockerfile:3` | 正式构建工具链固定 Go `1.26.6`。 | source → pinned build → comparable baseline |

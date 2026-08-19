@@ -14,6 +14,7 @@
 - 删除内部 `DeviceSessionPool`、Lease 注入和 `Recycle` 入口；`clientCleanup` 现在包含真实 Device/V8 关闭与槽位释放耗时。
 - 公开 SDK、精确 PE 源码及 profile 缓存继续保留；DeviceToken、`CertifyId`、轨迹和 `data` 仍不跨轮复用。
 - `DevicePrewarmCapacity`、`DeviceSessionReserve`、`--device-prewarm`、`--device-reserve` 及对应环境变量仅为旧配置兼容保留，现在只接受 `0`，非零值会在配置或 Client 创建阶段报错。
+- Go module 与 Docker 构建层同步升级到 Go `1.26.6`，修复 Go `1.26.5` 标准库漏洞导致的 `govulncheck` 门禁失败。
 
 下方其他条目保留 `1.0.0` 开发过程的里程碑；其中提到的预热、Lease、Recycle 和补货已被上述当前变更取代，不再是待发布版的运行行为。
 

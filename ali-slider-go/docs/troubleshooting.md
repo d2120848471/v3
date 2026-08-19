@@ -190,7 +190,7 @@ go test -count=1 -race \
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| module 要求 Go 1.26.5 | 本机旧工具链且无法自动获取 | 安装 Go 1.26.5；CI 使用 `GOTOOLCHAIN=local` 和精确版本 |
+| module 要求 Go 1.26.6 | 本机旧工具链且无法自动获取 | 安装 Go 1.26.6；CI 使用 `GOTOOLCHAIN=local` 和精确版本 |
 | `staticcheck` 不在 PATH | 本机未安装组织工具 | 使用 CI 固定 `v0.7.0` 或按组织流程安装；项目验证记录已通过 |
 | `govulncheck` 不在 PATH/查询失败 | 工具或漏洞库网络不可用 | 使用 CI 固定 `v1.1.4`；区分扫描基础设施失败与发现漏洞 |
 | PR 没有 Go CI | 变更路径未命中或工作流未触发 | 检查 `.github/workflows/ali-slider-go-ci.yml` paths；可 workflow_dispatch |

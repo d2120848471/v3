@@ -26,7 +26,7 @@
 
 ## Go 版本与快速验证
 
-模块、CI 和 Docker 构建层统一固定 Go `1.26.5`；V8 wrapper 构建层固定 Rust `1.88.0`、`v8=149.4.0`、ICU data `0.77.0`。以下命令从 `ali-slider-go` 目录执行：
+模块、CI 和 Docker 构建层统一固定 Go `1.26.6`；V8 wrapper 构建层固定 Rust `1.88.0`、`v8=149.4.0`、ICU data `0.77.0`。以下命令从 `ali-slider-go` 目录执行：
 
 ```bash
 export CGO_ENABLED=0
@@ -250,7 +250,7 @@ PR 执行完整 Windows 验证但不上传。`main` push 和 `workflow_dispatch`
 
 ## Docker 功能冒烟
 
-Docker 镜像使用 Go `1.26.5` 构建层、Rust `1.88.0` V8 构建层、Debian bookworm-slim 运行层和非 root UID/GID `65532`。HTTP 服务在 ready 前加载 `.so`、校验 C ABI 并初始化 V8/ICU；启动过程本身不会访问外部 Device/PE。以下仍显式传 `0`，用于验证旧脚本的兼容参数：
+Docker 镜像使用 Go `1.26.6` 构建层、Rust `1.88.0` V8 构建层、Debian bookworm-slim 运行层和非 root UID/GID `65532`。HTTP 服务在 ready 前加载 `.so`、校验 C ABI 并初始化 V8/ICU；启动过程本身不会访问外部 Device/PE。以下仍显式传 `0`，用于验证旧脚本的兼容参数：
 
 ```bash
 docker build --platform linux/amd64 -t ali-slider-go:test .
@@ -272,7 +272,7 @@ docker stop ali-slider-go-smoke
 
 根仓库工作流 `.github/workflows/ali-slider-go-ci.yml` 已实现，固定：
 
-- Go `1.26.5`，`GOTOOLCHAIN=local`；
+- Go `1.26.6`，`GOTOOLCHAIN=local`；
 - `staticcheck@v0.7.0`、`govulncheck@v1.1.4`；
 - Go/Rust 锁定依赖下载与 `go mod verify` / `cargo --locked`；
 - gofmt、vet、staticcheck、unit、integration、race；
@@ -377,7 +377,7 @@ env \
 
 | Evidence | Finding | Path |
 |---|---|---|
-| `go.mod:3`；`Dockerfile:3`；`.github/workflows/ali-slider-go-ci.yml` · `quality` / `race` / `windows-package` | module、Docker 构建层和 CI 统一固定 Go `1.26.5`。 | source → pinned toolchain → reproducible gates |
+| `go.mod:3`；`Dockerfile:3`；`.github/workflows/ali-slider-go-ci.yml` · `quality` / `race` / `windows-package` | module、Docker 构建层和 CI 统一固定 Go `1.26.6`。 | source → pinned toolchain → reproducible gates |
 | `.github/workflows/ali-slider-go-ci.yml` · `quality` / `race` / `linux-runtime` / `windows-package` | Linux AMD64/ARM64 用真实 `.so`，Windows 用真实 DLL；只有平台 native/ABI/test/smoke 通过才上传产物。 | PR/push → cross-platform Go/Rust/V8 gates → verified artifacts |
 | `internal/protocol/protocol_test.go:47`、`:125`、`:211` | 协议关键输出由静态 Python oracle 锁定。 | Python fixture → Go primitives → equality |
 | `internal/vision/solver_test.go:17` | edge-decoy 正负 fixture 已通过跨语言静态对照。 | PNG fixture → Go vision → accept/reject assertion |

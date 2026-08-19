@@ -140,7 +140,7 @@ file dist/linux-amd64/libali_slider_v8_runtime.so
 
 ### 容器
 
-`Dockerfile` 使用 Go `1.26.5` 构建层、Rust `1.88.0` V8 构建层和 Debian bookworm-slim 运行层，服务以非 root UID/GID `65532` 运行。启动时在 ready 前加载 `.so`、校验 C ABI 并初始化 V8/ICU。容器默认仍监听回环；需要端口映射时显式设置容器内 `0.0.0.0`，并优先只发布到宿主回环。
+`Dockerfile` 使用 Go `1.26.6` 构建层、Rust `1.88.0` V8 构建层和 Debian bookworm-slim 运行层，服务以非 root UID/GID `65532` 运行。启动时在 ready 前加载 `.so`、校验 C ABI 并初始化 V8/ICU。容器默认仍监听回环；需要端口映射时显式设置容器内 `0.0.0.0`，并优先只发布到宿主回环。
 
 ### 服务生命周期
 
@@ -212,7 +212,7 @@ file dist/linux-amd64/libali_slider_v8_runtime.so
 | `internal/pe/keys.go` · `NewKeyResolverWithCapacity`；`internal/pe/device_runtime.go` · `OpenDevice` / `Close` | 每个合法请求立即冷建独立Device/V8，本地没有live并发槽，完成或失败后关闭。 | cold Open → Complete → Close |
 | `cmd/server/main.go` · `run` | 启动器已接线配置、runtime自检、启动/定时清理和优雅关闭；不调用Prime或Device RPC。 | config → local runtime check → HTTP → lifecycle cleanup |
 | `internal/server/server.go` · `checkSolveOrigin` / `decodeRequest` / `decodeQueryRequest` / `requestFromPayload` / `handleSolve`；`internal/server/server_test.go` · `TestLegacyGETQueryCompatibility` / `TestLegacyGETQueryValidationNeverCallsSolver` / `TestSolveParameterSourcesStaySeparated` / `TestBrowserOriginBoundaryPreservesLegacyClients` / `TestConcurrentRequestsAlwaysEnterSolver` | 旧 GET query 的字段、重复键、默认值、64 KiB、非法 encoding 和跨源边界均有回归；通过校验的 GET/POST 直接调用 Solver，没有本地 429。 | method → origin + JSON/query gate → timeout context → Solve exactly once |
-| `go.mod`；`native/v8runtime/Cargo.toml`；`Makefile` · `build-linux-amd64` / `build-linux-arm64`；`Dockerfile` | Go `1.26.5` launcher、Rust 1.88/V8 149.4 wrapper 与 Debian/glibc 组成完整容器部署候选。 | Go + Rust source → native/ABI tests → launcher + wrapper → image |
+| `go.mod`；`native/v8runtime/Cargo.toml`；`Makefile` · `build-linux-amd64` / `build-linux-arm64`；`Dockerfile` | Go `1.26.6` launcher、Rust 1.88/V8 149.4 wrapper 与 Debian/glibc 组成完整容器部署候选。 | Go + Rust source → native/ABI tests → launcher + wrapper → image |
 | `.github/workflows/ali-slider-go-ci.yml` · `quality` / `race` / `linux-runtime` / `windows-package` | Linux AMD64/ARM64 用真实 `.so`，Windows 用真实 DLL，组成跨平台发布门禁。 | change → split-platform Go/Rust/V8 evidence → release gate |
 | `internal/vision/solver_test.go:17`；`internal/pe/v8_*_test.go`；`internal/v8runtime/runtime_test.go` | Python/Node oracle 只作静态迁移对照；生产主链在受控 V8 Isolate 执行当前脚本并由 Go 复核。 | fixture + exact StaticPath + challenge input → embedded V8 → Go assertions |
 | `internal/pe/v8_runtime_online_test.go` · `TestOnlineV8DeviceRuntimeColdRounds` / `TestOnlineV8DeviceRuntimeConcurrentColdFlows` | 探针已改为独立冷建round/job，并检查session/token隔离与精确PE的V8/纯Go差分；改写后只通过online-tag编译，尚未重新在线执行。 | public SDK/PE + Device RPC → independent cold round → V8 oracle → verified builder |

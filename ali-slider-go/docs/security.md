@@ -161,7 +161,7 @@ V8 Isolate 不是操作系统级沙箱；wrapper 和 V8 与 Go 同进程，nativ
 ## 9. 供应链与运行时
 
 - 生产 module 使用 `github.com/ebitengine/purego v0.10.2` 加载 wrapper；`go.sum` 和 `Cargo.lock` 均纳入版本控制。
-- `go.mod`、CI 和 Docker 使用 Go 1.26.5；wrapper 使用 Rust 1.88.0、`v8=149.4.0`、`deno_core_icudata=0.77.0`，并嵌入 ICU 77 common data。
+- `go.mod`、CI 和 Docker 使用 Go 1.26.6；wrapper 使用 Rust 1.88.0、`v8=149.4.0`、`deno_core_icudata=0.77.0`，并嵌入 ICU 77 common data。
 - Linux AMD64/ARM64 产物是 `CGO_ENABLED=0` Go launcher + 同架构 `.so` + 第三方 notices；launcher 通过 `libdl.so.2` 加载 wrapper，最终 Debian 镜像提供 glibc，不是静态单 ELF。
 - Windows AMD64 便携版包含 `CGO_ENABLED=0` 的 Go console PE、静态 MSVC CRT wrapper DLL 和 `THIRD-PARTY-NOTICES.txt`；测试页仍内嵌于 Go EXE。Windows 原生 CI 负责 Rust/Go→DLL 测试、文件白名单、哈希、解压启动和本地 HTTP smoke。
 - 官方 GitHub actions 使用完整 commit SHA 固定；普通 CI 权限保持 `contents: read`。Windows ZIP 包含 commit/build/Go/Rust/V8 版本信息和所有包内文件的 SHA-256。

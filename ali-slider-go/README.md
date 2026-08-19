@@ -32,7 +32,7 @@
 
 ### 源码运行
 
-源码构建要求 Go `1.26.5` 和 Rust `1.88.0`；Docker 镜像或 Windows 便携包已包含 V8 wrapper，运行机不需安装 Go、Rust 或 Node。Linux 源码启动示例：
+源码构建要求 Go `1.26.6` 和 Rust `1.88.0`；Docker 镜像或 Windows 便携包已包含 V8 wrapper，运行机不需安装 Go、Rust 或 Node。Linux 源码启动示例：
 
 ```bash
 cd ali-slider-go
@@ -158,7 +158,7 @@ docker run --rm \
   ali-slider-go:local
 ```
 
-镜像使用非 root UID/GID `65532`、Debian bookworm-slim 运行层、Go 1.26.5 构建层、Rust 1.88.0 V8 构建层和 `CGO_ENABLED=0` 的 Go launcher。最终形态是 Go launcher + 同架构 V8 `.so` + glibc，不是 `scratch`/单静态 ELF，也不含 Node；复现方式见 [docs/testing.md](docs/testing.md)。
+镜像使用非 root UID/GID `65532`、Debian bookworm-slim 运行层、Go 1.26.6 构建层、Rust 1.88.0 V8 构建层和 `CGO_ENABLED=0` 的 Go launcher。最终形态是 Go launcher + 同架构 V8 `.so` + glibc，不是 `scratch`/单静态 ELF，也不含 Node；复现方式见 [docs/testing.md](docs/testing.md)。
 
 ## 质量门禁
 
