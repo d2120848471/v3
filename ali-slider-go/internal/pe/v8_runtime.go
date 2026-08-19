@@ -181,8 +181,8 @@ func (resolver *KeyResolver) newV8Engine(
 	}
 	var assetCache *v8AssetCache
 	if networkEnabled {
-		// Cache 生命周期绑定当前 Device engine；Recycle 会复用，同一份静态
-		// 字节不会跨代理、画像或独立 Isolate 混用。
+		// Cache 生命周期绑定当前 Device engine，静态字节不会跨代理、
+		// 画像或独立 Isolate 混用。
 		assetCache = newV8AssetCache()
 	}
 	engine, err := library.NewWithHost(newV8HostHandler(transport, entropy, networkEnabled, assetCache))
@@ -530,7 +530,7 @@ func (resolver *KeyResolver) openV8Device(
 		return nil, fmt.Errorf("%w: V8 Device init output", ErrKeyRuntime)
 	}
 	session := &DeviceRuntimeSession{
-		v8Engine: engine, v8Open: bytes.Clone(payload), profile: profile.Clone(), deviceSlots: resolver.deviceSlots,
+		v8Engine: engine, profile: profile.Clone(),
 		options: options, sdkSource: bytes.Clone(sdkSource),
 	}
 	if err := session.acceptInitialStage(stage); err != nil {

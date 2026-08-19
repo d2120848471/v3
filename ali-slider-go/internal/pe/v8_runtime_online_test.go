@@ -50,9 +50,10 @@ func (transport *v8OnlineTransport) snapshot() []string {
 	return append([]string(nil), transport.calls...)
 }
 
-// TestOnlineV8DeviceRuntime 请求公开 SDK/Log/FeiLin/PE，跑完
-// Device Init → 动态 PE data → 同一 Device VM Complete；不创建验证码，也不调用业务 Init/Verify。
-func TestOnlineV8DeviceRuntime(t *testing.T) {
+// TestOnlineV8DeviceRuntimeColdRounds 请求公开 SDK/Log/FeiLin/PE，跑完两轮
+// 独立 Open → Device Init → 动态 PE data → Complete → Close。它不创建
+// 验证码，也不调用业务 Init/Verify。
+func TestOnlineV8DeviceRuntimeColdRounds(t *testing.T) {
 	if os.Getenv("ALI_SLIDER_V8_DEVICE_ONLINE") != "1" {
 		t.Skip("set ALI_SLIDER_V8_DEVICE_ONLINE=1 to run the V8 device probe")
 	}
@@ -83,33 +84,44 @@ func TestOnlineV8DeviceRuntime(t *testing.T) {
 		GatherCostMin: 180, GatherCostMax: 260, FirstTouchAgeMin: 650, FirstTouchAgeMax: 850,
 		Sources: sources,
 	}
-	// 模拟 DeviceSessionPool.Prime：Open 使用短生命周期 context，库存会话
-	// 必须在该 context 结束后仍能由后续 Solve context 完成。
-	openContext, cancelOpen := context.WithTimeout(ctx, 15*time.Second)
-	session, err := resolver.OpenDevice(openContext, transport, profile, deviceOptions)
-	cancelOpen()
-	if err != nil {
-		t.Logf("V8 Device network calls: %v", transport.snapshot())
-		t.Fatalf("OpenDevice() error = %v", err)
-	}
-	defer session.Close()
-
 	runtimeProfile, err := resolver.Resolve(ctx, transport, profile, testDynamicPath)
 	if err != nil {
 		t.Fatalf("Resolve() error = %v", err)
 	}
-	firstSessionID, firstToken := runOnlineV8DeviceRound(t, ctx, resolver, transport, profile, sources, session, "dummy-certify-id-1")
-
-	recycleStarted := time.Now()
-	if err := session.Recycle(ctx); err != nil {
-		t.Fatalf("Recycle() error = %v", err)
-	}
-	t.Logf("V8 Device recycle initialized a fresh round in %s", time.Since(recycleStarted))
-	secondSessionID, secondToken := runOnlineV8DeviceRound(t, ctx, resolver, transport, profile, sources, session, "dummy-certify-id-2")
+	firstSessionID, firstToken := runOnlineV8ColdDeviceRound(
+		t, ctx, resolver, transport, profile, sources, deviceOptions, "dummy-certify-id-1",
+	)
+	secondSessionID, secondToken := runOnlineV8ColdDeviceRound(
+		t, ctx, resolver, transport, profile, sources, deviceOptions, "dummy-certify-id-2",
+	)
 	if firstSessionID == secondSessionID || firstToken == secondToken {
-		t.Fatal("V8 Device recycle reused previous session/token state")
+		t.Fatal("independent V8 Device rounds reused previous session/token state")
 	}
-	t.Logf("V8 Device/PE two rounds completed: key=%s", runtimeProfile.ArgumentKey)
+	t.Logf("V8 Device/PE two cold rounds completed: key=%s", runtimeProfile.ArgumentKey)
+}
+
+func runOnlineV8ColdDeviceRound(
+	t *testing.T,
+	ctx context.Context,
+	resolver *KeyResolver,
+	transport http.RoundTripper,
+	profile device.Profile,
+	sources runtimekit.Sources,
+	options DeviceRuntimeOptions,
+	certifyID string,
+) (string, string) {
+	t.Helper()
+	openStarted := time.Now()
+	session, err := resolver.OpenDevice(ctx, transport, profile, options)
+	if err != nil {
+		if loggedTransport, ok := transport.(*v8OnlineTransport); ok {
+			t.Logf("V8 Device network calls: %v", loggedTransport.snapshot())
+		}
+		t.Fatalf("OpenDevice() error = %v", err)
+	}
+	t.Logf("V8 Device cold open completed in %s", time.Since(openStarted))
+	defer session.Close()
+	return runOnlineV8DeviceRound(t, ctx, resolver, transport, profile, sources, session, certifyID)
 }
 
 func runOnlineV8DeviceRound(
@@ -227,10 +239,10 @@ func executeOnlineV8DeviceRound(
 	}, nil
 }
 
-// TestOnlineV8DeviceRuntimeConcurrentPrime 验证最多 4 个独立画像的库存
-// Isolate 通过 Complete→Recycle 服务 10 个并发 job。它不创建 Captcha
-// Init/Verify，只访问公开 SDK/Device/PE 组件。
-func TestOnlineV8DeviceRuntimeConcurrentPrime(t *testing.T) {
+// TestOnlineV8DeviceRuntimeConcurrentColdFlows 验证最多 10 个 job 都并发执行独立的
+// Open/Complete/Close，期间不经过本地 Device 执行或生命周期门限。
+// 它不创建 Captcha Init/Verify，只访问公开 SDK/Device/PE 组件。
+func TestOnlineV8DeviceRuntimeConcurrentColdFlows(t *testing.T) {
 	if os.Getenv("ALI_SLIDER_V8_DEVICE_CONCURRENT_ONLINE") != "1" {
 		t.Skip("set ALI_SLIDER_V8_DEVICE_CONCURRENT_ONLINE=1 to run the concurrent V8 device probe")
 	}
@@ -246,10 +258,9 @@ func TestOnlineV8DeviceRuntimeConcurrentPrime(t *testing.T) {
 		}
 		attempts = parsed
 	}
-	liveCapacity := min(attempts, maxV8DeviceActive)
 	sources := runtimekit.NewSystemSources()
-	profiles := make([]device.Profile, liveCapacity)
-	profileIDs := make(map[string]struct{}, liveCapacity)
+	profiles := make([]device.Profile, attempts)
+	profileIDs := make(map[string]struct{}, attempts)
 	for index := range profiles {
 		profile, err := device.GenerateProfile(sources.Entropy)
 		if err != nil {
@@ -277,70 +288,32 @@ func TestOnlineV8DeviceRuntimeConcurrentPrime(t *testing.T) {
 		GatherCostMin: 180, GatherCostMax: 260, FirstTouchAgeMin: 650, FirstTouchAgeMax: 850,
 		Sources: sources,
 	}
-	sessions := make([]*DeviceRuntimeSession, liveCapacity)
-	openResults := make(chan error, liveCapacity)
-	var workers sync.WaitGroup
-	for index := range liveCapacity {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			openContext, cancelOpen := context.WithTimeout(ctx, 15*time.Second)
-			session, openErr := resolver.OpenDevice(openContext, baseTransport, profiles[index], deviceOptions)
-			cancelOpen()
-			if openErr == nil {
-				sessions[index] = session
-			}
-			openResults <- openErr
-		}()
-	}
-	workers.Wait()
-	close(openResults)
-	for openErr := range openResults {
-		if openErr != nil {
-			for _, session := range sessions {
-				if session != nil {
-					session.Close()
-				}
-			}
-			t.Fatalf("concurrent OpenDevice() error = %v", openErr)
-		}
-	}
-	defer func() {
-		for _, session := range sessions {
-			session.Close()
-		}
-	}()
 	if _, err := resolver.Resolve(ctx, baseTransport, profiles[0], testDynamicPath); err != nil {
-		t.Fatalf("Resolve() after concurrent OpenDevice error = %v", err)
+		t.Fatalf("Resolve() before concurrent OpenDevice error = %v", err)
 	}
 
-	jobs := make(chan int)
 	roundResults := make(chan error, attempts)
-	for slot, session := range sessions {
+	var workers sync.WaitGroup
+	for index := range attempts {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			for index := range jobs {
-				_, roundErr := executeOnlineV8DeviceRound(
-					ctx, resolver, baseTransport, profiles[slot], sources, session,
-					fmt.Sprintf("dummy-concurrent-certify-id-%d", index),
-				)
-				if roundErr == nil {
-					roundErr = session.Recycle(ctx)
-				}
-				if roundErr != nil {
-					roundErr = fmt.Errorf("round %d slot %d: %w", index, slot, roundErr)
-				}
-				roundResults <- roundErr
+			session, openErr := resolver.OpenDevice(ctx, baseTransport, profiles[index], deviceOptions)
+			if openErr != nil {
+				roundResults <- fmt.Errorf("round %d open: %w", index, openErr)
+				return
 			}
+			defer session.Close()
+			_, roundErr := executeOnlineV8DeviceRound(
+				ctx, resolver, baseTransport, profiles[index], sources, session,
+				fmt.Sprintf("dummy-concurrent-certify-id-%d", index),
+			)
+			if roundErr != nil {
+				roundErr = fmt.Errorf("round %d: %w", index, roundErr)
+			}
+			roundResults <- roundErr
 		}()
 	}
-	go func() {
-		for index := range attempts {
-			jobs <- index
-		}
-		close(jobs)
-	}()
 	workers.Wait()
 	close(roundResults)
 	for roundErr := range roundResults {

@@ -21,11 +21,9 @@ func TestClientOptionsMapsServiceConfiguration(t *testing.T) {
 	cfg.Prefix = "prefix9"
 	cfg.MaxConcurrency = 7
 	cfg.Timeout = 9 * time.Second
-	cfg.DevicePrewarmCapacity = 3
-	cfg.DeviceSessionReserve = 1
 	cfg.V8RuntimeLibrary = "/opt/ali-slider/libali_slider_v8_runtime.so"
 	options := clientOptions(cfg)
-	if options.DefaultSceneID != "scene" || options.DefaultPrefix != "prefix9" || options.MaxConcurrency != 7 || options.Timeout != 9*time.Second || options.DevicePrewarmCapacity != 3 || options.DeviceSessionReserve != 1 || options.V8RuntimeLibrary != "/opt/ali-slider/libali_slider_v8_runtime.so" {
+	if options.DefaultSceneID != "scene" || options.DefaultPrefix != "prefix9" || options.MaxConcurrency != 7 || options.Timeout != 9*time.Second || options.DevicePrewarmCapacity != 0 || options.DeviceSessionReserve != 0 || options.V8RuntimeLibrary != "/opt/ali-slider/libali_slider_v8_runtime.so" {
 		t.Fatalf("options=%+v", options)
 	}
 	if options.AssetMaxBytes != cfg.AssetMaxBytes || options.ArtifactRetention != cfg.ArtifactRetention {

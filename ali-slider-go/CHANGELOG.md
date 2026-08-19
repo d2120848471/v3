@@ -2,9 +2,20 @@
 
 本文件记录 `ali-slider-go` 的用户可见变化。格式参考 Keep a Changelog，版本遵循语义化版本。
 
-> **发布状态**：`1.0.0` 仍为 Unreleased。候选使用 Go 进程内 V8 `149.4.0` 维持同挑战 FeiLin 状态，并以“精确 PE `StaticPath` 的当前 V8 oracle → 完整差分 → 纯 Go 快路或 V8 fallback”取代每挑战的无条件 V8 PE 执行，生产不启动 Node。最终安全候选真实50次为 `47/50`、mean `2562ms`、P50 `2157ms`、P95 `4910ms`；3次均为业务 `F015`，分类错误为0。正确性不低于 `46/50` 基线，但并发10下mean约1秒的目标仍未通过。HTTP端到端、生产资源峰值和长时间稳定性仍待验证。
+> **发布状态**：`1.0.0` 仍为 Unreleased。当前实现使用 Go 进程内 V8 `149.4.0`；每轮立即冷建并关闭独立 Device/V8 会话，不设置本地 live 并发槽，生产不启动 Node，也不使用预热池。2026-08-09历史预热池候选的 `47/50`、mean `2562ms` 等数据不能作为当前冷建路径验收；当时5个对齐存活VM出现过字段合同异常，取消本地保护后该现象属于已知风险。当前冷建在线探针只完成编译，尚未连接真实上游重跑。HTTP端到端、生产资源峰值和长时间稳定性仍待验证。
 
 ## [1.0.0] - Unreleased
+
+### 当前变更（2026-08-19）
+
+- 服务启动不再调用 `Prime`，也不创建 Device/V8 会话或访问 Device RPC；`Client.Prime` 仅作为兼容 no-op 保留。
+- 每个合法 `Solve` 都立即冷建独立的 Device/V8 完整会话，并在完成或失败后关闭，不再回收 Isolate、补充预热库存或等待本地 live 会话槽。
+- 取消 Device/V8 本地并发保护；`MaxConcurrency` 只保留为每 route/host 的 Transport 连接与 PE 资源预算，不限制 Device 会话数或 HTTP 在途请求，也不触发本地 `429`。2026-08-09 发现的5个对齐存活VM字段合同异常保留为已知风险，当前无界冷建路径尚未真实在线验收。
+- 删除内部 `DeviceSessionPool`、Lease 注入和 `Recycle` 入口；`clientCleanup` 现在包含真实 Device/V8 关闭与槽位释放耗时。
+- 公开 SDK、精确 PE 源码及 profile 缓存继续保留；DeviceToken、`CertifyId`、轨迹和 `data` 仍不跨轮复用。
+- `DevicePrewarmCapacity`、`DeviceSessionReserve`、`--device-prewarm`、`--device-reserve` 及对应环境变量仅为旧配置兼容保留，现在只接受 `0`，非零值会在配置或 Client 创建阶段报错。
+
+下方其他条目保留 `1.0.0` 开发过程的里程碑；其中提到的预热、Lease、Recycle 和补货已被上述当前变更取代，不再是待发布版的运行行为。
 
 ### Added
 
@@ -160,7 +171,7 @@
 | `internal/challenge/performance_test.go:21`、`:65`；[脱敏验证证据](docs/evidence/validation-2026-08-07.md) | 32 路 Mock 正确性通过；200 样本纯计算 `P99=57.05075ms`，达到硬门槛。 | concurrent mock / explicit local sampler → verified compute gate |
 | `internal/device/rpc.go:119`、`:130`；`internal/device/session_test.go:130`、`:146`、`:150`、`:165`；`internal/device/online_session_test.go:17` | Device schema 修复只在 Log1 解析对象，Log2/3 接受非对象成功结果；在线 Log1/2/3 约 `0.53s` 通过。 | raw response → action-specific decode → offline regression → authorized probe |
 | `pkg/slider/online_acceptance_test.go:37`、`:49`、`:98`、`:128`、`:147`、`:165`、`:168`；[脱敏验证证据](docs/evidence/validation-2026-08-07.md) | 授权候选 200/32/应用层零重试批次成功 `196/200`，Client 完整链墙钟 P95 `984ms`，两项冻结门槛通过；该 harness 不经过 HTTP Handler，最终 one-shot 加固后未再在线重跑。 | authorized jobs → one Solve each → sanitized aggregate → bounded acceptance |
-| `internal/challenge/device_pool.go:22`、`:134`、`:190` | 设备预热池已实现有界 Prime/Lease、key 隔离和冷建回退。 | startup Prime → request Lease → release/refill |
+| `internal/pe/keys.go` · `NewKeyResolverWithCapacity`；`internal/pe/device_runtime.go` · `OpenDevice` / `Close` | 当前每轮立即冷建独立Device/V8，不设置本地live并发槽，结束时关闭会话。 | cold Open/Complete → Close |
 | `cmd/server/main.go:36`、`:49`、`:55`、`:60`、`:93`、`:111`、`:147` | 可执行服务、启动/定时清理和优雅关闭已经接线。 | config → Client → HTTP → cleanup |
 | `internal/server/server.go` · `checkSolveOrigin` / `decodeQueryRequest` / `requestFromPayload`；`internal/server/server_test.go` · `TestLegacyGETQueryCompatibility` / `TestLegacyGETQueryValidationNeverCallsSolver` / `TestSolveParameterSourcesStaySeparated` / `TestBrowserOriginBoundaryPreservesLegacyClients` | 已废弃 GET query 的传输兼容、方法参数源隔离和 GET/POST 跨源边界已固定。 | method + path → origin + JSON/query gate → one Solver call |
 | `Makefile` · `build-linux`；`.github/workflows/ali-slider-go-ci.yml` · `quality` | Linux AMD64 静态二进制已有本地和 CI 构建路径。 | commit → verified server binary |

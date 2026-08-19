@@ -43,7 +43,7 @@ func run(args []string, getenv func(string) string, logger *log.Logger) error {
 	address := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
-		// 先占用端口，避免启动失败时仍对外发起设备预热。
+		// 先占用端口，避免完成本地 V8 自检后才发现端口冲突。
 		return fmt.Errorf("HTTP 服务退出: %w", err)
 	}
 	defer listener.Close()
@@ -62,18 +62,6 @@ func run(args []string, getenv func(string) string, logger *log.Logger) error {
 	} else {
 		logger.Printf("event=artifact_purge status=ok removed=%d", removed)
 	}
-	if cfg.DevicePrewarmCapacity > 0 {
-		primeContext, cancelPrime := context.WithTimeout(context.Background(), cfg.Timeout)
-		primeErr := client.Prime(primeContext)
-		cancelPrime()
-		if primeErr != nil {
-			// 预热是性能优化；失败后请求仍会按相同合同冷建会话。
-			logger.Printf("event=device_prewarm status=warning capacity=%d error=%q", cfg.DevicePrewarmCapacity, primeErr.Error())
-		} else {
-			logger.Printf("event=device_prewarm status=ok capacity=%d", cfg.DevicePrewarmCapacity)
-		}
-	}
-
 	handler, err := server.New(server.Options{
 		Solver: client, DefaultSceneID: cfg.SceneID, DefaultPrefix: cfg.Prefix,
 		Timeout: cfg.Timeout, Logger: logger,
@@ -137,8 +125,6 @@ func clientOptions(cfg config.Config) slider.ClientOptions {
 	options.FirstTouchAgeMin, options.FirstTouchAgeMax = cfg.FirstTouchAgeMin, cfg.FirstTouchAgeMax
 	options.ArtifactDir, options.ArtifactRetention = cfg.ArtifactDir, cfg.ArtifactRetention
 	options.AssetMaxBytes, options.AssetMaxDimension = cfg.AssetMaxBytes, cfg.AssetMaxDimension
-	options.DevicePrewarmCapacity = cfg.DevicePrewarmCapacity
-	options.DeviceSessionReserve = cfg.DeviceSessionReserve
 	options.V8RuntimeLibrary = cfg.V8RuntimeLibrary
 	return options
 }

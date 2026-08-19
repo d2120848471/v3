@@ -1,17 +1,17 @@
 # 性能测试与容量口径
 
-> **当前结论**：生产运行时使用同进程V8 `149.4.0`采集动态Device，并对每个精确PE `StaticPath`做V8 oracle与纯Go完整差分。最终安全候选真实50次为 `47/50`、mean `2562ms`、P50 `2157ms`、P95 `4910ms`，3次均为业务 `F015`，分类错误0；后25次mean `2232ms`。默认直连组件A/B证明5个对齐存活的Device VM已破坏字段合同，所以预热池默认和硬上限均为4。相较基线P50 `4722ms`已明显改善，但并发10下平均仍未达到约1秒；HTTP端到端、资源峰值和长稳也尚无结论。
+> **当前结论**：生产运行时使用同进程V8 `149.4.0`采集动态Device，并对每个精确PE `StaticPath`做V8 oracle与纯Go完整差分。当前已移除Device预热/复用：每个合法Solve立即冷建独立Device/V8并在结束时关闭；公开SDK/PE源码和结构画像仍跨轮缓存；`OpenDevice → Close` 没有本地并发槽。2026-08-09记录的 `47/50`、mean `2562ms`、P50 `2157ms`、P95 `4910ms`及reserve/prewarm A/B均属于历史预热实验；当时5个对齐存活VM出现过字段合同异常，取消本地保护后该现象属于已知风险，不能当作当前逐请求冷建路径的正确性或性能结论。当前HTTP端到端、资源峰值和长稳仍无结论。
 
 ## 性能目标
 
 | 维度 | 冻结口径 | 性质 | 当前状态 |
 |---|---:|---|---|
-| 已自校验 PE 的 `buildVerifyData` | 尽可能 `<=100 ms` | 本地计算目标 | 真实 50 次 mean `1–2ms`；强制 V8 约 `530ms` |
-| 热态直连 Client 完整求解链 | mean 约 `1000 ms` | 本次优化目标 | 最终50次mean `2562ms`；后25次mean `2232ms`，未通过 |
+| 已自校验 PE 的 `buildVerifyData` | 尽可能 `<=100 ms` | 本地计算目标 | 历史真实50次mean `1–2ms`；强制V8约 `530ms`，当前路径待复测 |
+| 直连 Client 完整求解链 | mean 约 `1000 ms` | 本次优化目标 | 当前逐请求冷建路径未测；历史预热候选50次mean `2562ms`，未通过 |
 | HTTP 同时在途挑战 | 无本地硬上限 | 服务合同 | 64 个并发合法请求全部进入 Solver；不是生产容量结论 |
-| Client每route/host连接与PE预算 | `1..32` | 兼容配置边界 | `MaxConcurrency`只约束Transport/PE，不是HTTP admission |
-| 默认直连池保留的Device VM | 最多 `4` | 公开SDK/上游正确性边界 | 4-slot/10-job组件探针通过；5个对齐存活会话字段不完整 |
-| 本次真实50次成功率 | 不低于基线 `46/50` | 正确性门槛 | 最终候选 `47/50`，通过 |
+| Client每route/host连接与PE预算 | `1..32` | 兼容配置边界 | `MaxConcurrency`只约束Transport/PE；不是Device或HTTP admission |
+| 每轮独立Device VM的live数量 | 无本地上限 | 当前实现选择 | 来流直接放大V8、CPU、内存、线程和上游压力；历史5个对齐存活会话出现过字段合同异常，当前尚未在线重验 |
+| 当前路径真实成功率 | 不低于基线 `46/50` | 正确性门槛 | 逐请求冷建实现尚未在线重测；历史预热候选为 `47/50` |
 
 `P95 <=1000 ms` 不表示每个请求都必须低于 1 秒。设备 RPC、Captcha Init/Verify、TLS、CDN、DNS 和代理均可能产生不可控尾延迟；报告必须同时给出分位数、失败分类和网络环境。
 
@@ -22,7 +22,7 @@
 | Key | 边界 | 主要内容 |
 |---|---|---|
 | `setup` | 请求校验后到客户端准备完成 | 画像选择、route/transport、设备与 Captcha client 构造 |
-| `deviceSession` | Lease/Open 开始到首枚 token 可用 | 预热 V8 Device Isolate 命中，或冷建同一 FeiLin 状态的 Log1/2/3 |
+| `deviceSession` | Open开始到首枚token可用 | 本轮独立V8 Device Isolate冷建和Log1/2/3；不含本地live槽等待 |
 | `init` | Captcha Init 请求往返 | InitCaptchaV3 |
 | `resolvePEKey` | Init 后到当前 PE 结构画像可用 | 缓存命中，或公开 SDK/PE 下载、V8 采样与纯 Go 完整差分；SDK 软 TTL 5 分钟，PE 硬 TTL 30 分钟 |
 | `downloadAssets` | 两图下载整体墙钟 | 背景图和 shadow 并行下载 |
@@ -32,7 +32,7 @@
 | `buildVerifyData` | 轨迹到 PE data | 已验证分片使用动态 profile + 纯 Go Builder；其余使用禁网 V8 fallback；两者都做 Pack/Unpack、getter、事件和时钟合同自检 |
 | `completeDevice` | 设备完成态 | 同一 FeiLin VM 事件回放/getter、Verify token 和最终 Log2 |
 | `verify` | Captcha Verify 请求往返 | 唯一一次 VerifyCaptchaV3 |
-| `clientCleanup` | release 开始到返回 | 关闭已消费会话并触发有界补货 |
+| `clientCleanup` | release 开始到返回 | 关闭本轮Device/V8；不补货、不回池 |
 | `total` | `challenge.Solver.Solve` 墙钟 | 上述完整 Solver 生命周期 |
 
 双图并行使 `downloadAssets` 不等于两个单图耗时之和。毫秒取整也会使阶段相加与 total 有小幅差异。
@@ -87,7 +87,7 @@ CPU:      Apple M3 Max
 
 module、CI 和 Docker 构建均固定 Go `1.26.5`，wrapper 构建固定 Rust `1.88.0`/V8 `149.4.0`。Linux AMD64/ARM64 只验证了功能构建/native ABI，不能与 Mac 性能基线混为同一结论。
 
-每份性能报告还必须记录 commit、工作树状态、Go toolchain、OS/arch、`GOMAXPROCS`、电源模式、温度/降频、后台负载、直连/代理、预热容量及 benchmark 参数。
+每份性能报告还必须记录 commit、工作树状态、Go toolchain、OS/arch、`GOMAXPROCS`、电源模式、温度/降频、后台负载、直连/代理、`MaxConcurrency`、同时存活的Device会话峰值及 benchmark 参数。
 
 ## 已记录视觉基准
 
@@ -115,20 +115,13 @@ GOMAXPROCS=16 go test ./internal/vision \
 
 `BenchmarkSolveParallel` 只反映视觉函数的并行吞吐趋势，不包含设备会话、HTTP、上游网络、成功率或 32 个完整挑战的内存峰值。
 
-## 设备预热的性能含义
+## 当前逐请求冷建与历史预热实验
 
-兼容字段 `MaxConcurrency` 控制Client每个route/host的出站连接与PE资源预算，保持 `1..32`校验。Device prewarm默认和硬上限为4，并随更小的MaxConcurrency收敛；默认会话最大空闲年龄为20秒。它不限制HTTP在途请求。启动器先完成 `net.Listen`绑定，再在开始 `Serve`前调用 `Client.Prime`，把设备Log1/2/3尽量移出请求关键路径，同时避免端口占用时先访问上游。
+兼容字段 `MaxConcurrency` 只控制Client每个route/host的出站连接与PE资源预算，保持 `1..32`校验；它不限制Device会话或HTTP请求进入。每个合法Solve立即从 `OpenDevice` 冷建整轮会话，并在 `Close` 后销毁。启动器不调用 `Client.Prime`，`Prime`只保留为不发外部请求的源码兼容空操作。旧 `--device-prewarm` 与 `--device-reserve` 参数只接受 `0`，非0配置明确失败。
 
-必须同时报告两种模式：
+当前每轮报告都应视为冷建：`deviceSession` 包含完整Device Log1/2/3，不含本地live额度等待；`clientCleanup`包含本轮Device/V8关闭。没有ready库存、热态命中、idle过期、recycle、后台补货或live并发槽。进程级KeyResolver仍复用公开SDK、精确PE源码和已验证结构画像，因此Device逐轮冷建不等于所有公开脚本与PE画像也逐轮下载/采样。
 
-- 冷建：`--device-prewarm=0`，`deviceSession` 包含完整设备初始化。
-- 热态：预热完成、key 匹配且会话未过期，`deviceSession` 主要为 Lease。
-
-预热池只在endpoint、prefix、region、route、timeout和设备时序范围一致时复用；每个slot自行持有独立画像，租出后整轮HTTP/PE/Device都使用该实际画像。逐请求代理与默认直连池key不同，会走冷建。Complete后挑战态被消费，外层Isolate原位回收并重建浏览器context、session ID和token。资源边界为 `ready + pending + leased <= capacity + reserve <= 4`；满池matching请求等待现有slot recycle，不绕过池额外冷建。reserve默认0。
-
-`reserve=4` 和 `reserve=1` 的真实 50 次 A/B 都没有改善总耗时：虽然 Device 等待下降，但新 Device 采集与冷 PE 采样/Complete 争用 CPU 和网络。因此默认为 0；只有在目标服务器上完成同口径 A/B 后才应显式开启。
-
-预热失败会记录 warning，成功库存仍保留，后续请求可冷建兜底。不得把 Prime 失败隐藏为性能成功。
+下方2026-08-09表格中的 `reserve=4`、`reserve=1`、`prewarm16` 和“最终4-live满池等待”等数据属于历史预热池实验。它们说明5个同时存活Device VM不安全、reserve没有改善当时总耗时，但不代表这些配置仍可启用，也不证明当前逐请求冷建路径的延迟。
 
 ## 历史纯 Go oracle P99 方法
 
@@ -160,7 +153,7 @@ ALI_SLIDER_PERF=1 GOMAXPROCS=16 \
 完整 Solver 和服务入口已存在，可直接建立受控 Mock 负载：
 
 - 并发至少按 `1/4/8/16/32/64` 逐级测试，固定每档请求数和 Mock 阶段延迟。
-- 同时测冷建与热态；记录预热命中、冷建、过期和补货失败。
+- 记录每轮Device冷建、Close、同host连接等待和公开SDK/PE缓存命中；不存在Device热态命中、过期或补货。
 - 64 并发直通回归使用当前 POST JSON 入口，必须证明每个合法 HTTP 请求都已进入 Solver；释放 Mock 后全部返回 200，且没有 `Retry-After`。
 - deprecated GET 用单独功能回归锁定 64 KiB query、别名/重复/空值、GET/POST 分源和跨源拒绝；不把 GET 预取、爬虫、uptime 监控或浏览器自动化当作负载发生器，因为每次 GET 都有真实求解副作用。
 - OpenAPI 的 Solve POST 与 deprecated GET response 都只声明 200/400/403/500，其中 403 仅是明确浏览器跨源拒绝；不得包含 429、`Retry-After` 或旧本地过载字段。
@@ -168,11 +161,11 @@ ALI_SLIDER_PERF=1 GOMAXPROCS=16 \
 - 记录完成吞吐、P50/P95/P99/max、错误分类、goroutine、RSS 和 GC；外层代理 429 与第三方上游 429 分开归因。
 - 在 `-race` 下复跑状态正确性，但性能数字来自无 race 插桩版本。
 
-离线 `TestSolverOffline32ConcurrentSuccess` 证明状态隔离；历史 Client harness 以 32 并发完成 200 轮。热构建缓存下的 Mock 与 `200×32=6,400` 次离线 Solve 都使用 fake PE runtime，不启动 production V8 Isolate；这些数字只证明 Go 编排和池状态，不是当前 V8 的吞吐、RSS 或泄漏证明。生产形态的 V8/Go RSS、heap、GC、goroutine/原生线程峰值、持续吞吐和长时间稳定性仍待测。
+离线 `TestSolverOffline32ConcurrentSuccess` 证明状态隔离；历史 Client harness 以 32 并发完成 200 轮。热构建缓存下的 Mock 与 `200×32=6,400` 次离线 Solve 都使用 fake PE runtime，不启动 production V8 Isolate；这些数字只证明 Go 编排和状态隔离，不是当前 V8 的吞吐、RSS 或泄漏证明。生产形态的 V8/Go RSS、heap、GC、goroutine/原生线程峰值、持续吞吐和长时间稳定性仍待测。
 
-取消本地 HTTP admission 后，Handler goroutine 与已进入的 Solve 数可随来流增长；Transport 连接数和预热库存有界，并不能把 HTTP 在途数变成有界。当前尚未验证生产流量下请求堆积、上游连接等待、超时风暴、RSS/GC 峰值或进程耗尽边界，因此 64 并发回归不得写成“服务支持无界并发”或生产容量结论。需要保护生产实例时，应在外层反向代理、负载均衡或 API 网关配置容量与速率策略，并把其 429 单独统计。
+取消本地 HTTP 和 Device live admission 后，Handler goroutine、已进入的 Solve 数和同时存活的Device/V8会话都可随来流增长；只有Transport连接数和PE预算仍由 `MaxConcurrency` 约束。当前尚未验证生产流量下无界冷建、上游连接等待、超时风暴、RSS/GC峰值或进程耗尽边界，因此64并发回归不得写成“服务支持无界并发”或生产容量结论。需要保护生产实例时，应在外层反向代理、负载均衡或API网关配置容量与速率策略，并把其429单独统计。
 
-## 2026-08-09 当前路径真实验收
+## 2026-08-09 历史预热池路径真实验收
 
 口径为 Linux AMD64 最终 V8 wrapper、同一 `slider.Client`、直连、并发 10、每个 job 一次 Solve、应用层零重试，每个新 `CertifyId` 最多一次 Verify。严格成功要求 `T001`、`VerifyResult=true` 且 token 非空。数字为 Client Solve 墙钟，不经 HTTP Handler。
 
@@ -188,7 +181,7 @@ ALI_SLIDER_PERF=1 GOMAXPROCS=16 \
 | 4-live冷溢出候选 | `48/50` | `2657ms` | `2760ms` | `4356ms` | `4711ms` | F015=2，分类错误0 |
 | 最终4-live满池等待 | `47/50` | `2562ms` | `2157ms` | `4910ms` | `5859ms` | F015=3，分类错误0；后25 mean2232ms |
 
-最终安全候选将P50从 `4722ms`降到 `2157ms`，约下降54%；成功率从92%到94%。但mean `2562ms`明确未达到约1秒。最终阶段mean中 `buildVerifyData=1ms`、`resolvePEKey=204ms`，主瓶颈是默认直连池4槽安全边界下的 `deviceSession=1644ms`；不能通过恢复同池5+会话规避排队。
+该历史安全候选将P50从 `4722ms`降到 `2157ms`，约下降54%；成功率从92%到94%。但mean `2562ms`明确未达到约1秒。最终阶段mean中 `buildVerifyData=1ms`、`resolvePEKey=204ms`，当时主瓶颈是直连预热池4槽边界下的 `deviceSession=1644ms`。当前生产实现已移除该预热池和live并发保护，这些数字不再作为当前路径验收；历史5+ live Device会话出现过字段合同异常，现作为已知风险保留，而不是当前限制。
 
 长时运行的缓存现采用两层时限：每 5 分钟重下 SDK 并比较字节；SDK 未变时延长已验证分片的软 TTL；任一分片超过 30 分钟仍强制重下 PE 和完整 V8 差分。SDK 字节变化则立即清空所有画像。这能避免稳定服务每 5 分钟重复采样 32 个分片，但不会改善全新进程的首批冷启动。
 
@@ -233,7 +226,7 @@ ALI_SLIDER_PERF=1 GOMAXPROCS=16 \
 2. 先用 `timingsMs`、CPU profile 和 allocation profile 定位热点。
 3. 优先减少热路径分配、重复颜色转换和临时切片；缓冲复用必须按请求隔离并通过 race。
 4. 保留双图并发、route 隔离和连接池；禁止跨代理共享连接或跨请求共享 token/session。
-5. 在授权环境启用预热；单独记录启动成本、命中率、过期和冷建回退。
+5. 分离记录Device逐轮冷建/关闭、同host连接等待和公开SDK/PE缓存命中，不把缓存命中误写成Device会话复用。
 6. 外部阶段慢时定位 DNS、TLS、代理、CDN 或上游，不得靠放大 timeout 伪装性能优化。
 
 ## 结果模板
@@ -243,8 +236,8 @@ ALI_SLIDER_PERF=1 GOMAXPROCS=16 \
 | 版本 | commit、dirty 状态、Go `1.26.5`、Rust `1.88.0`、V8 `149.4.0` |
 | 环境 | OS、arch、CPU、内存、`GOMAXPROCS`、电源模式 |
 | 数据集 | fixture/授权样本数量及普通、困难、负例分布 |
-| 模式 | 冷建/热态、直连/代理、并发度 |
-| 样本 | 预热数、实测数、重复轮次 |
+| 模式 | 逐请求冷建、直连/代理、并发度、`MaxConcurrency`与Device live峰值 |
+| 样本 | 实测数、重复轮次 |
 | 延迟 | mean、P50、P95、P99、max，单位 ms |
 | 资源 | B/op、allocs/op、RSS、Go GC、V8 heap、goroutine/原生线程峰值 |
 | 正确性 | oracle 通过数或在线严格成功数；失败分类 |
@@ -256,12 +249,12 @@ ALI_SLIDER_PERF=1 GOMAXPROCS=16 \
 |---|---|---|
 | `internal/challenge/solver.go:107`、`:149`、`:431` | 完整 Solver 已实现，并固定 12 个阶段耗时 key。 | Solve → stage timings → Result |
 | `internal/challenge/solver_test.go` · `TestSolverOfflineCompleteSuccess` | 完整离线链成功路径和阶段输出已有 Mock 证据。 | device/init/assets/vision/PE/verify → outcome |
-| `internal/challenge/device_pool.go` · `NewRuntimeDeviceSessionPoolWithReserve` / `LeaseRuntime` / `runRecycle` | 预热池有20s默认年龄、4槽库存硬边界、独立slot画像和满池等待；Complete后外层Isolate可回收，挑战状态不复用。 | Prime → Lease/wait → Complete → fresh-context recycle or cold refill |
+| `internal/pe/keys.go` · `NewKeyResolverWithCapacity`；`internal/pe/device_runtime.go` · `OpenDevice` / `Close`；`pkg/slider/client.go` · `NewClient` / `Prime` | 当前每个合法Solve立即冷建/关闭独立Device/V8，本地没有live并发槽；公开SDK/PE缓存仍复用；`Prime`是无外部请求的兼容空操作。 | Solve → Open → Complete → Close → Verify |
 | `internal/server/server.go` · `decodeQueryRequest` / `handleSolve`；`internal/server/server_test.go` · `TestLegacyGETQueryCompatibility` / `TestSolveParameterSourcesStaySeparated` / `TestConcurrentRequestsAlwaysEnterSolver` | Handler 同时兼容 deprecated GET query 与 POST JSON，两者共用 Solver 链但不合并参数源；64 个并发合法 POST 全部进入 Solver。 | valid request → timeout context → Solve |
 | `internal/server/openapi.go` · `legacyQueryParameters` / `solveResponses`；`internal/server/server_test.go` · `TestOnlyFrozenRoutesAreExposed` | OpenAPI 在四路径内同时声明 Solve POST/deprecated GET，两者只有 200/400/403/500，并回归禁止 429 与旧本地过载字段。 | API document → response contract → no local 429 |
 | `pkg/slider/client.go:183` | 公共 Result 的 elapsedMs 来自 Solver total，而非客户端完整 HTTP 墙钟。 | Solver timings → library result |
 | `internal/vision/solver_test.go:260`、`:271` | 视觉 benchmark 只提供均值/并行趋势；项目 P99 结论来自独立逐次纯计算门禁。 | repeated vision Solve → mean throughput only |
 | `internal/challenge/performance_test.go:21`、`:65`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 32 路 Mock 正确性通过；200 样本纯计算 `P99=57.05075ms`，达到硬门槛；6,400 次离线 Solve 压力通过。 | concurrent mock / explicit local sampler / repeated stress → verified compute and capacity gates |
-| `internal/pe/keys.go` · `Prepare` / `runtimeProfileCacheFresh` / `ProfileCacheStats`；`internal/pe/v8_runtime.go` · `runtimeProfileMatchesPureGo`；`pkg/slider/online_acceptance_test.go` | 精确分片只有经当前V8完整差分后才走纯Go；软5/硬30分钟且统计不暴露路径/key。最终50次mean `2562ms`，未达1s。 | StaticPath → source/profile singleflight → V8 oracle → verified pure-Go or V8 fallback → one Verify |
+| `internal/pe/keys.go` · `Prepare` / `runtimeProfileCacheFresh` / `ProfileCacheStats`；`internal/pe/v8_runtime.go` · `runtimeProfileMatchesPureGo`；`pkg/slider/online_acceptance_test.go` | 精确分片只有经当前V8完整差分后才走纯Go；软5/硬30分钟且统计不暴露路径/key。历史预热池50次mean `2562ms`，未达1s；当前逐请求冷建路径待复测。 | StaticPath → source/profile singleflight → V8 oracle → verified pure-Go or V8 fallback → one Verify |
 | `pkg/slider/online_acceptance_test.go:37`、`:49`、`:98`、`:128`、`:147`、`:165`、`:168`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 200/32/应用层零重试候选批次成功率 `98%`、Client 完整求解链 P95 `984ms`，两项门槛通过；不经过 HTTP Handler，最终 one-shot 加固后未再在线重跑。 | authorized jobs → one Solve each → aggregate percentiles → bounded acceptance |
 | `go.mod:3`；`Dockerfile:3` | 正式构建工具链固定 Go `1.26.5`。 | source → pinned build → comparable baseline |

@@ -1,6 +1,6 @@
 # Python 到 Go 迁移指南
 
-> **迁移状态**：Go主链已落地。2026-08-08同机A/B发现早期迁移丢失两个动态边界：旧版在同一挑战内保持FeiLin VM，并按当轮 `StaticPath`执行当前PE；迁移版改成纯Go Device+静态key/近似PE，最终持续 `F001`。当前实现用同进程V8 `149.4.0`恢复动态语义：同一Device会话跨Open/Complete，PE按精确 `StaticPath`由当前V8与纯Go完整差分，兼容后才纯算，否则回退V8；每个live slot独立画像，默认直连池最多保留4个VM。最终安全候选真实50次 `47/50`、mean `2562ms`，mean约1秒未通过。旧Python源码可从Git历史提交 `0509bfd`恢复，用户指定对照提交为 `d92c7d1`。
+> **迁移状态**：Go主链已落地。2026-08-08同机A/B发现早期迁移丢失两个动态边界：旧版在同一挑战内保持FeiLin VM，并按当轮 `StaticPath`执行当前PE；迁移版改成纯Go Device+静态key/近似PE，最终持续 `F001`。当前实现用同进程V8 `149.4.0`恢复动态语义：每个合法请求立即冷建独立Device/V8，会话在Open到Complete之间保持同一VM，结束后关闭；PE按精确 `StaticPath`由当前V8与纯Go完整差分，兼容后才纯算，否则回退V8。本地没有live会话并发槽，也没有预热、库存或回收复用。2026-08-09历史预热池候选真实50次为 `47/50`、mean `2562ms`，且当时5个对齐存活VM出现过字段合同异常；取消本地保护后该现象属于已知风险，不能作为当前冷建路径的正确性或性能结论。旧Python源码可从Git历史提交 `0509bfd`恢复，用户指定对照提交为 `d92c7d1`。
 
 ## 目标与冻结边界
 
@@ -29,12 +29,12 @@
 | `challenge/assets.py` | `internal/challenge/assets.go` | 已实现 | 固定 CDN、双图并发、内存下载和边界 |
 | `challenge/track.py` | `internal/track/track.go` | 已实现 | embedded fixture、缩放、抽稀和有界扰动 |
 | `vision/gap_solver.py`、`geometry.py` | `internal/vision` | 已实现 | 纯 Go PNG、缺口定位、fallback 和几何 |
-| `runtime/pe.py`、历史 `runtime/node_pe.py` | `internal/pe`、`internal/v8runtime`、`native/v8runtime` | 已实现 | 同挑战持久 V8 Device 会话、外层 Isolate recycle/新 context、精确 PE 动态差分、纯 Go 快路/V8 fallback、getter/event/data 自检；SDK 软 5 分钟、PE 硬 30 分钟 |
+| `runtime/pe.py`、历史 `runtime/node_pe.py` | `internal/pe`、`internal/v8runtime`、`native/v8runtime` | 已实现 | 每轮独立 V8 Device 会话、精确 PE 动态差分、纯 Go 快路/V8 fallback、getter/event/data 自检；SDK 软 5 分钟、PE 硬 30 分钟 |
 | `challenge/session.py` | `internal/challenge/rpc.go`、`solver.go` | 已实现 | Init → Assets → Vision → PE/Device → 唯一 Verify |
-| `challenge/device_pool.py` | `internal/challenge/device_pool.go` | 已实现 | 有界 Prime/Lease、完整 key 隔离、过期和补货 |
+| `challenge/device_pool.py` | 无生产对应实现 | 已移除 | 不再 Prime/Lease/recycle；每个合法请求立即冷建并关闭，本地不设置live并发槽 |
 | `entrypoints/api.py` | `internal/server`、`cmd/server` | 已实现 | HTTP、内嵌测试页、OpenAPI、直接分派 Solve、日志、启动与优雅关闭 |
 | `errors.py` | `pkg/slider.Error`、`challenge.Failure` | 已实现 | 稳定错误类别、阶段和脱敏消息 |
-| Python 对外 client | `pkg/slider.Client` | 已实现 | `NewClient`、`Solve`、`Prime`、`PurgeArtifacts`、`Close` |
+| Python 对外 client | `pkg/slider.Client` | 已实现 | `NewClient`、`Solve`、`PurgeArtifacts`、`Close`；`Prime`仅为兼容空操作 |
 | `challenge/business.py` | 无端到端目标 | 排除 | 1.0.0 不提交或重放业务请求 |
 
 `protocol.BuildBusiness*` 仍作为纯函数和 oracle 兼容性测试存在；这不表示业务提交链路被纳入运行范围。
@@ -44,10 +44,10 @@
 ```text
 HTTP / library Request
   → route-isolated Transport
-  → V8 Device Isolate（预热 Lease 或冷建 Log1/2/3）
+  → 冷建独立 V8 Device Isolate（Log1/2/3）
   → InitCaptchaV3
-  ├─ TRACELESS → 同一 SDK/FeiLin VM 调用官方无痕流程 → VerifyCaptchaV3（一次）
-  └─ PUZZLE → KeyResolver → 双图 → vision/track/PE → 同一 VM Complete → VerifyCaptchaV3（一次）
+  ├─ TRACELESS/SLIDING → 同一 SDK/FeiLin VM 调用官方流程 → VerifyCaptchaV3（一次）→ Close
+  └─ PUZZLE → KeyResolver → 双图 → vision/track/PE → 同一 VM Complete → Close → VerifyCaptchaV3（一次）
   → slider.Result / 脱敏分类错误
 ```
 
@@ -82,7 +82,7 @@ HTTP / library Request
 - `/api/slider` 响应包含 `X-Trace-ID`；全部响应使用 `Cache-Control: no-store`。
 - Handler 不生成本地 429、`Retry-After`、`TooManyChallenges`、活动数或退避字段。外层网关仍可按自身策略返回 429；上游 429 属于上游非 2xx，进入 Solver 的稳定网络错误分类，不作为本地过载响应透传。
 
-`MaxConcurrency` / `--max-concurrency`是兼容旧名，只作为每route/host连接与PE资源预算；默认Device预热池库存另有硬上限4。它们都不限制HTTP在途请求数，也不决定Handler是否接收请求。
+`MaxConcurrency` / `--max-concurrency`是兼容旧名，只控制每route/host连接与PE资源预算。它不限制Device整轮live数量或HTTP在途请求数，也不决定Handler是否接收请求；每个合法Solve立即冷建独立Device/V8。
 
 当前 HTTP 直达合同已通过 HTTP Mock 和并发 Handler 回归验证。Device Log1/2/3 在线探针与 2026-08-07 的 `Client.Solve` 在线批次分别证明设备链和 Client 链；两者都不能替代 HTTP 传输端到端测量。
 
@@ -98,7 +98,7 @@ HTTP / library Request
 | prefix 仅 ASCII 字母数字 | 与协议域名边界一致 | 标点/Unicode prefix 被拒绝 |
 | 普通日志强制脱敏 | 防止敏感材料落盘 | 用 traceId、稳定阶段和 artifact 排障 |
 | proxy route 隔离、哈希 key、LRU proxy 淘汰 | 防跨出口复用、凭据明文驻留 key 和无界池 | proxy churn 会关闭最久未使用的 proxy route；直连不淘汰 |
-| 设备预热只命中完整 key | 禁止跨代理、画像和时序复用 mutable session | 逐请求代理通常冷建 |
+| Device会话逐请求立即冷建并关闭 | 彻底禁止跨请求复用 mutable session | 每轮都承担完整Log1/2/3，本地不限制live会话数；资源与历史5+并发合同异常风险由部署方承担 |
 | 未知 JSON 字段忽略 | 保持前向兼容 | 已知字段类型错误仍为 400 |
 | 无本地并发接纳闸门 | 合法请求必须直达 `Solve`，`MaxConcurrency` 仅保留为 Client 资源预算 | 外层必须落实鉴权以及按身份/IP 的频率、并发和总量限制 |
 
@@ -150,7 +150,6 @@ file dist/linux-amd64/libali_slider_v8_runtime.so
 - 创建 `slider.Client`；
 - 在 ready 前校验 wrapper、C ABI 与 V8/ICU；
 - 启动前清理过期 artifact；
-- 按配置并行 Prime 设备会话；
 - 注入完整 Client 到 HTTP Handler；
 - 每小时再次执行 artifact 清理；
 - 捕获 SIGINT/SIGTERM，HTTP 优雅关闭后等待 Client 活跃任务并释放池。
@@ -167,11 +166,11 @@ file dist/linux-amd64/libali_slider_v8_runtime.so
 
 ### 阶段 3：授权性能与在线验收——组件通过，完整 Solve 需重测
 
-当前路径已在Linux AMD64验证精确PE的强制V8/纯Go差分为0，并完成最终安全候选真实50次：`47/50`、mean `2562ms`、P50 `2157ms`、P95 `4910ms`，分类错误0。Mac ARM64纯Go200样本、2026-08-07旧路径和2026-08-08单挑战仍只作历史对照。HTTP端到端、资源峰值和长时间容量仍未单独测量。
+当前源码已在Linux AMD64验证精确PE的强制V8/纯Go差分为0。2026-08-09历史预热池候选真实50次为 `47/50`、mean `2562ms`、P50 `2157ms`、P95 `4910ms`，但该数据不能外推到当前逐请求冷建路径。冷建在线探针已通过build-tag编译，尚未连接真实上游执行。HTTP端到端、资源峰值和长时间容量仍未单独测量。
 
 ### 阶段 4：小流量切换——待验收通过
 
-外部路由只把新请求按固定比例送往 Go。监控成功率、P95/P99、外层网关/上游 429、错误分类、预热命中、内存、goroutine 和 artifact 磁盘。
+外部路由只把新请求按固定比例送往 Go。监控成功率、P95/P99、外层网关/上游 429、错误分类、`deviceSession`冷建耗时、`clientCleanup`关闭耗时、live V8峰值、内存、goroutine、原生线程和 artifact 磁盘。
 
 ### 阶段 5：默认切换——待前序门槛通过
 
@@ -182,13 +181,13 @@ file dist/linux-amd64/libali_slider_v8_runtime.so
 - 通过反向代理或服务发现切换新请求，不共享 Python/Go 的 in-flight 状态。
 - 回滚只影响新挑战；已经进入 Verify 的 Go 请求不得交给 Python 重试。
 - 保留上一个已验证 Go launcher + 匹配 V8 wrapper、镜像 digest、配置快照和 OpenAPI 快照；敏感配置不入库。
-- 触发条件至少包含成功率、P95/P99、500、外层网关/上游 429、RSS、goroutine、预热失败、artifact 磁盘和脱敏告警。
+- 触发条件至少包含成功率、P95/P99、500、外层网关/上游 429、RSS、goroutine、Device会话冷建/关闭失败、artifact 磁盘和脱敏告警。
 - 旧 Python 源码不在当前工作树；需要 oracle/回滚时从 Git 历史提交 `0509bfd` 临时恢复，不维持长期双栈。
 
 ## 切换前清单
 
 - [x] 公共 `slider.Client` 与完整 `challenge.Solver` 已接通全部阶段。
-- [x] `cmd/server`、优雅关闭、预热池、连接池和 artifact 定时清理已接线。
+- [x] `cmd/server`、优雅关闭、逐轮Device会话、连接池和 artifact 定时清理已接线。
 - [x] HTTP/OpenAPI、唯一 Verify、错误脱敏和完整 Mock 链测试通过。
 - [x] Go `1.26.5` 全量 test/race/vet/staticcheck/govulncheck 通过。
 - [x] Linux AMD64/ARM64 V8 Rust native、Go→ABI 测试与双文件包构建通过。
@@ -198,7 +197,7 @@ file dist/linux-amd64/libali_slider_v8_runtime.so
 - [ ] 最终发布 commit 的统一覆盖率报告已归档。
 - [x] 纯计算 P99 有可复现报告：200 样本 `P99=57.05075ms`。
 - [x] 当前生产 V8 Device/PE 公开组件探针通过；它不创建 Captcha Init/Verify。
-- [x] 当前Device+精确PE自校验架构完成50次Client Solve验收；最终安全候选 `47/50`、mean `2562ms`，1秒目标未通过；默认直连池4槽边界由公开组件A/B验证。
+- [x] 历史Device+精确PE自校验架构完成50次Client Solve验收：`47/50`、mean `2562ms`；公开组件A/B当时观察到5个对齐存活VM字段合同异常。当前已取消live保护，该异常列为已知风险，逐请求无界冷建路径仍需重新在线验收。
 - [ ] 补充 HTTP 端到端、P99、RSS/GC/goroutine/原生线程峰值和长时间稳定性报告。
 - [ ] 实际机器资源下的 RSS、GC、goroutine 峰值和长时间稳定性压测有可复现报告。
 - [ ] 生产外层鉴权、网络、日志、磁盘、回滚与值班流程通过评审。
@@ -207,15 +206,15 @@ file dist/linux-amd64/libali_slider_v8_runtime.so
 
 | Evidence | Finding | Path |
 |---|---|---|
-| `pkg/slider/client.go:82`、`:160`、`:188`、`:203`、`:213` | 公共 Client 已实现创建、Solve、Prime、Purge 和并发安全 Close。 | library request → complete solver → result/lifecycle |
+| `pkg/slider/client.go` · `NewClient` / `Solve` / `Prime` / `Close` | 公共 Client 每轮冷建独立Device/V8；`Prime`为兼容空操作，Close等待活动调用并释放进程级资源。 | library request → cold device round → result/lifecycle |
 | `internal/challenge/solver.go:107`、`:149`、`:289` | 具体 Solver 已串接 Device、Init、Assets、Vision、PE、Device Complete 和 Verify。 | request → one complete Go challenge |
 | `internal/challenge/solver_test.go` · `TestSolverOfflineCompleteSuccess` / `TestSolverLowConfidenceStopsBeforeVerify` / `TestSolverVerifyNetworkErrorIsSingleAttemptAndSanitized` | 完整 Mock 链证明成功一次 Verify、低置信零 Verify、网络错误一次尝试。 | fixture transport → state gates → counted Verify |
-| `internal/challenge/device_pool.go:22`、`:134`、`:190`、`:299` | 预热池按完整 key 隔离，并提供有界 Prime/Lease/冷建/过期/补货。 | Prime → key match → lease or cold open |
-| `cmd/server/main.go:36`、`:49`、`:55`、`:60`、`:93`、`:111`、`:147` | 启动器已接线配置、预热、启动/定时清理和优雅关闭。 | config → Client → HTTP → lifecycle cleanup |
+| `internal/pe/keys.go` · `NewKeyResolverWithCapacity`；`internal/pe/device_runtime.go` · `OpenDevice` / `Close` | 每个合法请求立即冷建独立Device/V8，本地没有live并发槽，完成或失败后关闭。 | cold Open → Complete → Close |
+| `cmd/server/main.go` · `run` | 启动器已接线配置、runtime自检、启动/定时清理和优雅关闭；不调用Prime或Device RPC。 | config → local runtime check → HTTP → lifecycle cleanup |
 | `internal/server/server.go` · `checkSolveOrigin` / `decodeRequest` / `decodeQueryRequest` / `requestFromPayload` / `handleSolve`；`internal/server/server_test.go` · `TestLegacyGETQueryCompatibility` / `TestLegacyGETQueryValidationNeverCallsSolver` / `TestSolveParameterSourcesStaySeparated` / `TestBrowserOriginBoundaryPreservesLegacyClients` / `TestConcurrentRequestsAlwaysEnterSolver` | 旧 GET query 的字段、重复键、默认值、64 KiB、非法 encoding 和跨源边界均有回归；通过校验的 GET/POST 直接调用 Solver，没有本地 429。 | method → origin + JSON/query gate → timeout context → Solve exactly once |
 | `go.mod`；`native/v8runtime/Cargo.toml`；`Makefile` · `build-linux-amd64` / `build-linux-arm64`；`Dockerfile` | Go `1.26.5` launcher、Rust 1.88/V8 149.4 wrapper 与 Debian/glibc 组成完整容器部署候选。 | Go + Rust source → native/ABI tests → launcher + wrapper → image |
 | `.github/workflows/ali-slider-go-ci.yml` · `quality` / `race` / `linux-runtime` / `windows-package` | Linux AMD64/ARM64 用真实 `.so`，Windows 用真实 DLL，组成跨平台发布门禁。 | change → split-platform Go/Rust/V8 evidence → release gate |
 | `internal/vision/solver_test.go:17`；`internal/pe/v8_*_test.go`；`internal/v8runtime/runtime_test.go` | Python/Node oracle 只作静态迁移对照；生产主链在受控 V8 Isolate 执行当前脚本并由 Go 复核。 | fixture + exact StaticPath + challenge input → embedded V8 → Go assertions |
-| `internal/pe/v8_runtime_online_test.go` | 生产 `KeyResolver` 验证同一外层 V8 Device Isolate 的两轮 session/token 独立，并对当前精确 PE 做强制 V8/纯 Go payload、事件和时钟差分；不调用 Captcha Init/Verify。 | public SDK/PE + Device RPC → recycled outer Isolate / fresh round → V8 oracle → verified builder |
+| `internal/pe/v8_runtime_online_test.go` · `TestOnlineV8DeviceRuntimeColdRounds` / `TestOnlineV8DeviceRuntimeConcurrentColdFlows` | 探针已改为独立冷建round/job，并检查session/token隔离与精确PE的V8/纯Go差分；改写后只通过online-tag编译，尚未重新在线执行。 | public SDK/PE + Device RPC → independent cold round → V8 oracle → verified builder |
 | `internal/challenge/performance_test.go:65`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 200 样本纯计算 `P99=57.05075ms`，满足硬门槛。 | fixture → Vision/Track/PE → nearest-rank P99 |
 | `pkg/slider/online_acceptance_test.go:37`、`:49`、`:98`、`:128`、`:147`、`:165`、`:168`；[脱敏验证证据](./evidence/validation-2026-08-07.md) | 2026-08-07 的历史 Client harness 以 200/32/应用层零重试运行，严格成功 `196/200`、完整链 P95 `984ms`；它不经过 HTTP Handler，不证明当前 HTTP 限流或端到端延迟，最终 one-shot 加固后也未在线重跑。 | dated authorization → one Client.Solve per job → sanitized aggregate → bounded historical finding |

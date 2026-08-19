@@ -34,7 +34,7 @@ type v8AssetCacheEntry struct {
 }
 
 // v8AssetCache 只保存公开 CDN 静态响应字节。挑战 Init/Verify、token、DOM 和
-// VM 状态都不进入缓存；短 TTL 仅覆盖 Device pool 的热回收窗口。
+// VM 状态都不进入缓存；短 TTL 仅去重同一 Device engine 生命期内的重复静态资源请求。
 type v8AssetCache struct {
 	mu      sync.Mutex
 	now     func() time.Time

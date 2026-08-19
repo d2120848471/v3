@@ -1,6 +1,6 @@
 # 排障手册
 
-> **当前边界**：生产Device和精确PE oracle使用Go进程内V8 `149.4.0`，不启动Node；PE只在当前V8与纯Go完整差分一致后才在TTL内走纯算，其余保留V8 fallback。每个live Device slot独立画像，默认直连预热池库存默认和硬上限为4。最终安全候选真实50次为 `47/50`、mean `2562ms`、P50 `2157ms`、P95 `4910ms`，分类错误0，明确未达mean约1秒；资源峰值和长稳压测仍无结论。排障时不得擅自扩大在线流量或重试同一 `CertifyId`。
+> **当前边界**：生产Device和精确PE oracle使用Go进程内V8 `149.4.0`，不启动Node；PE只在当前V8与纯Go完整差分一致后才在TTL内走纯算，其余保留V8 fallback。启动器不预热Device；每个合法Solve立即冷建独立Device/V8并在结束时关闭，本地不限制live数量，公开SDK/PE缓存仍复用。2026-08-09历史预热池候选真实50次为 `47/50`、mean `2562ms`、P50 `2157ms`、P95 `4910ms`，且当时5个对齐存活VM出现过字段合同异常；当前取消保护后该异常是已知风险，不能外推历史性能或正确性。资源峰值和长稳压测仍无结论。排障时不得擅自扩大在线流量或重试同一 `CertifyId`。
 
 ## 快速分流
 
@@ -17,7 +17,7 @@ make race
 
 `make race` 与完整 `make check` 的严格无 CGo race 只在 Darwin 可运行；Linux 使用 `make check-linux`，并由根 CI 的 macOS job补齐 race。Go 1.26 的 Linux race runtime 强制要求 CGo，不要临时放宽后把结果记为本项目纯 Go 门禁。
 
-启动本地服务但关闭设备预热，避免仅做 health 冒烟时产生设备外部请求：
+启动本地服务。当前启动过程本身不会产生Device外部请求；保留 `--device-prewarm=0` 只用于验证旧脚本兼容：
 
 ```bash
 export ALI_SLIDER_V8_LIBRARY=/absolute/path/libali_slider_v8_runtime.so
@@ -43,19 +43,18 @@ curl --fail --silent http://127.0.0.1:8000/health
 
 | 现象 | 直接证据 | 常见原因 | 处理 |
 |---|---|---|---|
-| `配置无效` | 进程退出并给出配置边界 | host/port、连接/PE预算、timeout、artifact，或prewarm>4、prewarm+reserve>4 | 对照[配置说明](./configuration.md)修正flag/env；不要绕过Validate或提高预热池库存上限 |
+| `配置无效` | 进程退出并给出配置边界 | host/port、连接/PE预算、timeout、artifact，或旧prewarm/reserve参数非0 | 对照[配置说明](./configuration.md)修正flag/env；`--device-prewarm`与`--device-reserve`只能为0 |
 | `HTTP 服务退出: bind... address already in use` | 启动器退出 | 端口被占用 | Unix 用 `lsof -nP -iTCP:8000 -sTCP:LISTEN`；Windows 用 `Get-NetTCPConnection -LocalPort 8000`；关闭旧实例或换端口 |
-| `event=device_prewarm status=warning` | 进程继续启动 | 设备 RPC 超时、部分 Prime 失败或配置/出口问题 | 请求会冷建兜底；检查网络和 device 日志阶段，不把 warning 当预热成功 |
 | `检查内嵌 V8` 后进程退出 | 未出现 ready | wrapper 文件缺失、架构/格式错误、C ABI 不匹配或 V8/ICU 初始化失败 | 检查 `--v8-library`/`ALI_SLIDER_V8_LIBRARY`、`file`；Linux 再用 `ldd`，Windows 确认 EXE 与 DLL 同为 AMD64；不绕过启动自检 |
-| 服务 ready 前较慢 | 端口已绑定，但尚未出现 `event=listen status=ready` | 默认预热会在开始 `Serve` 前执行 Log1/2/3 | 开发 health 冒烟用 `--device-prewarm=0`；生产记录 Prime 耗时 |
+| 服务 ready 前较慢 | 端口已绑定，但尚未出现 `event=listen status=ready` | V8 wrapper/ABI/ICU自检或artifact启动清理较慢 | 检查runtime自检与purge日志；当前启动器不调用Prime，也不执行Device Log1/2/3 |
 | `event=artifact_purge status=warning` | 启动或每小时出现 | artifact 目录权限/ACL、磁盘或读取失败 | Unix 检查 UID/mode；Windows 检查解压目录可写性和 NTFS ACL；清理失败不应阻止服务，但必须告警 |
 | 非回环绑定出现 security warning | `unauthenticated=true` | 服务监听 `0.0.0.0` 或非回环 IP | 确认外层鉴权、防火墙、TLS 和来源限制；否则改回回环 |
-| SIGTERM 后关闭慢 | `event=shutdown status=starting` 后等待 | 活跃 Solve/Prime/Purge 尚未结束 | 等待总 timeout；检查上游取消传播和长尾阶段，不要强制重复 Verify |
+| SIGTERM 后关闭慢 | `event=shutdown status=starting` 后等待 | 活跃 Solve/Purge 尚未结束，或某轮Device/V8仍在关闭 | 等待总 timeout；检查上游取消传播、Device Close和长尾阶段，不要强制重复 Verify |
 | `/health` ready 但 solve 失败 | health 200、solve 4xx/5xx | health 只验证 HTTP handler，不探测全部上游 | 按 errorType/traceId 和阶段排查；不要把 health 当在线成功率证明 |
 
 启动器会在创建 Client 后立即清理一次 artifact，随后每小时清理，并在 SIGINT/SIGTERM 时执行 HTTP 优雅关闭和 `Client.Close`。
 
-`MaxConcurrency` / `--max-concurrency`只控制Client每route/host的出站连接与PE资源预算，不是HTTP Handler并发闸门。默认直连Device预热池4槽是实测协议正确性边界，也不拒绝HTTP请求；满池请求会在Solver中等待。外部部署仍必须由网关落实鉴权、频率、并发和总量限制。
+`MaxConcurrency` / `--max-concurrency`只控制Client每route/host的出站连接与PE资源预算，不是Device live或HTTP Handler并发闸门。每个合法请求进入Solver后立即冷建独立Device/V8。外部部署仍必须由网关落实鉴权、频率、并发和总量限制。
 
 ## HTTP 排障矩阵
 
@@ -89,15 +88,15 @@ library 错误的 `Stage` 和成功结果 `timingsMs` 使用稳定阶段名：
 | 阶段 | 常见问题 | 检查 |
 |---|---|---|
 | `setup` | proxy route、画像或 client 构造 | proxy 格式、route 容量、prefix |
-| `deviceSession` | 预热 Lease 或冷建同一 V8/FeiLin Isolate 的 Log1/2/3 | wrapper/ABI、pool key、会话年龄、设备 endpoint/时钟、代理 |
+| `deviceSession` | 冷建本轮独立V8/FeiLin Isolate并执行Log1/2/3；不含本地live槽等待 | wrapper/ABI、V8/系统资源、设备endpoint/时钟、代理 |
 | `init` | InitCaptchaV3 | 签名、SceneId/prefix、出口 |
 | `resolvePEKey` | 精确 `StaticPath` 的公开 SDK/PE 下载、V8 画像采样 + 纯 Go 完整差分，或缓存命中 | V8 wrapper、CDN allowlist、代理路由；SDK 软 TTL 5 分钟，PE 硬 TTL 30 分钟；有效缓存命中应接近 0 ms |
 | `downloadAssets` | CDN/重定向/大小 | 相对路径、HTTPS allowlist、Content-Length |
 | `vision` | PNG 或低置信 | alpha、尺寸、候选、edge-decoy |
 | `buildVerifyData` | 已验证分片用纯 Go Builder，其余在禁网 V8 Isolate 执行；两者都独立复核 | Track、ExpectedXPos、DeviceConfig、getter、Pack/Unpack、逻辑时钟；V8 fallback 再检查 timeout/heap |
-| `completeDevice` | 在同一FeiLin VM回放PE events/getter并执行最终Log2 | VM生命周期、事件顺序、getter、DeviceToken；若默认直连并发出现137/138字段或sequence错误，确认未绕过预热池4槽边界 |
+| `completeDevice` | 在同一FeiLin VM回放PE events/getter并执行最终Log2 | VM生命周期、事件顺序、getter、DeviceToken；若并发出现137/138字段或sequence错误，参照2026-08-09的5+ live历史异常，降低外层并发复验 |
 | `verify` | 唯一 Verify 请求/响应 | 网络未知也不得重试同一挑战 |
-| `clientCleanup` | release/关闭/补货 | pool Lease 所有权、Close 竞态 |
+| `clientCleanup` | 关闭本轮Device/V8 | session Close、V8/子进程清理和取消竞态；当前不补货、不回池 |
 
 HTTP 错误响应不会回显底层 cause。只有受控 library 调用方可以读取脱敏 `slider.Error.Stage`；不要为排障把完整 error chain 或 Result 写入公共日志。
 
@@ -116,19 +115,18 @@ HTTP 错误响应不会回显底层 cause。只有受控 library 调用方可以
 
 同一轮设备、Init、图片和 Verify 使用同一 transport。不同 route 不共享 TCP/TLS 连接。
 
-## 设备预热池
+## 逐请求Device会话
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| 已Prime但请求仍冷建 | pool key与请求不一致或4个slot均不可用 | 检查prefix、route、timeout和设备时序范围；默认直连slot各有独立画像，不能要求某个外部ProfileID命中 |
-| 使用逐请求 proxy 时未命中直连池 | route 不同，按设计隔离 | 为安全保留冷建；不得跨 proxy 复用会话 |
-| 约 20 秒后首次请求变慢 | idle 会话超过默认最大年龄 | 记录过期/冷建；通过 library 配置评估合理年龄，不无限延长 |
-| 消费后后台出现设备请求 | release 后原位 recycle 会重建新 context/session/token，失败时冷补货 | 正常；监控 recycle/补货失败；资源最多 `capacity+reserve`，reserve 默认 0 |
-| 开启 `--device-reserve` 后 Device 快但总耗时变慢 | 额外 Device V8/网络与冷 PE 画像或 Complete 争用 | 先回到默认 0；只根据本机同口径 A/B 开启，不用单一 `deviceSession` 阶段做决策 |
-| Prime 部分失败 | opener/网络失败 | 成功库存保留；可在授权环境再次 Prime，其他请求冷建 |
-| Close 与 Lease 并发 | 关停过程取消任务并清理 ownership | 应由 `Client.Close` 统一关闭；不要绕过 release |
+| 每次请求的 `deviceSession` 都包含初始化 | 当前设计每轮都冷建Device/V8，不存在预热命中 | 按预期记录完整Log1/2/3；不要尝试恢复会话复用 |
+| 并发升高后 `deviceSession` 变慢或出现137/138字段、sequence错误 | 本地不限制Device/V8 live数量；CPU/内存/线程和上游压力直接增长，且历史5+ live曾出现字段合同异常 | 先在外层网关降低并发并受控复验；调整 `MaxConcurrency` 只改变连接/PE预算，不会限制Device会话数 |
+| 调低 `MaxConcurrency` 后仍同时冷建大量Device会话 | 该字段不再是Device live并发限制 | 在外层网关实施经过容量验证的并发/速率限制；不要提高prewarm/reserve，它们只接受0 |
+| 请求完成后仍持续占用V8/子进程资源 | Device session未走到Close，或V8关闭阻塞 | 查看 `clientCleanup`、context取消与线程采样；成功、失败和取消都必须Close |
+| 调用 `Client.Prime` 没有Device流量 | `Prime`只保留为源码兼容空操作 | 正常；不要把Prime返回nil当作热态已建立 |
+| `--device-prewarm`/`--device-reserve` 非0启动失败 | 预热/复用已移除，旧参数只兼容0 | 删除旧非0配置，或显式设置两者为0 |
 
-`Client.Prime` 会发送真实设备 Log1/2/3。只有授权环境才可调用；纯本地 health 冒烟设置预热容量为 0。
+公开SDK、精确PE源码和已验证结构画像仍由进程级KeyResolver按TTL复用；这类缓存命中不会复用DeviceToken、`CertifyId`、DeviceConfig、轨迹或Device/V8会话。
 
 Device RPC 的成功响应 schema 按 action 处理：Log1 必须给出对象形式的 `ResultObject.DeviceConfig`；Log2/Log3 只要求成功 Code，`ResultObject` 可以是非对象。若 Log1 通过而 Log2/Log3 报 `invalid ResultObject`，优先确认没有回退到“所有 action 共用对象 schema”的旧实现。当前独立在线 Log1/2/3 探针约 `0.53s` 通过。
 
@@ -182,9 +180,9 @@ go test -count=1 -race \
 | 完整请求超过 1 秒 | 先改视觉或扩大 timeout | 用 `timingsMs` 分离 device/init/download/vision/PE/verify |
 | 并发升高后时延、RSS、goroutine 或连接等待上升 | 误以为 Handler 会用本地 429 自动保护进程 | 用 `timingsMs`、RSS、GC、goroutine、连接池和上游指标定位瓶颈；在外层网关设置经容量验证的频率、并发和总量限制 |
 | 2026-08-07 的 32 并发历史短批次和离线 RSS 筛查通过 | 把 6.16 秒 Client harness 或含 Go 驱动的 Mock maxRSS 外推成生产长稳容量 | 按实际机器资源另测生产 RSS、GC、goroutine 峰值、持续吞吐和长时间稳定性 |
-| 热态与冷态差异大 | 忽略预热 key/年龄 | 分开报告 Prime、命中、过期、冷建和 proxy |
+| 同一进程前后耗时差异大 | 把公开SDK/PE缓存命中误认为Device预热 | Device始终逐轮冷建；分开报告Device冷建、同host连接等待和 `resolvePEKey` 缓存命中/刷新 |
 | 并行视觉快但在线慢 | 把算法吞吐当完整链 | 分别报告视觉、纯计算、Solver、HTTP 和在线 |
-| 前25次与后25次不同 | 把后半窗口写成全部50次结果 | 同时报告全批和后半；最终全批mean为 `2562ms`，不是后25的 `2232ms`；同时检查默认池4槽等待、分片数和 `resolvePEKey` |
+| 历史前25次与后25次不同 | 把后半窗口写成全部50次结果，或把旧预热池结果外推到当前实现 | 历史全批mean为 `2562ms`，不是后25的 `2232ms`；当前逐请求冷建路径必须重新采样，并检查Device冷建、同host连接等待、分片数和 `resolvePEKey` |
 
 当前纯计算 `P99=57.05075ms`；2026-08-07 的历史授权 Client harness 严格成功 `196/200`，完整求解链墙钟 `P95=984ms`，达到当时两项冻结目标。该批 `P99=1018ms`，不得声称 P99 小于 1 秒、HTTP 端到端已测或 200/32 是当前 Handler 限制；也不得把它写成 one-shot 加固后最终源码的第二份在线报告。完整方法见[性能测试与容量口径](./performance.md)和[脱敏验证证据](./evidence/validation-2026-08-07.md)。
 
@@ -230,13 +228,13 @@ go test -count=1 -race \
 
 | Evidence | Finding | Path |
 |---|---|---|
-| `cmd/server/main.go:36`、`:49`、`:55`、`:60`、`:93`、`:111`、`:147` | 启动器已实现配置、Prime、启动/每小时清理和优雅关闭。 | config → Client → HTTP → lifecycle |
+| `cmd/server/main.go` · `run` | 启动器已实现配置、runtime自检、启动/每小时清理和优雅关闭；不调用Prime。 | config → Client/runtime check → HTTP → lifecycle |
 | `internal/server/server.go` · `checkSolveOrigin` / `decodeQueryRequest` / `handleSolve`；`internal/server/server_test.go` · `TestLegacyGETQueryCompatibility` / `TestLegacyGETQueryValidationNeverCallsSolver` / `TestSolveParameterSourcesStaySeparated` / `TestBrowserOriginBoundaryPreservesLegacyClients` / `TestConcurrentRequestsAlwaysEnterSolver` | POST JSON 与 deprecated GET query 分源解析；无效输入和明确跨源在 Solver 前拒绝，其他合法请求不按活动数拒绝。 | method/source → origin + JSON/query validation → timeout context → Solve or stable error |
 | `internal/server/testpage.go` · `writeTestPage`；`internal/server/server_test.go` · `TestEmbeddedAPITestPage` | 根路径只允许 GET，返回带严格页面安全头的内嵌测试台且不触发 Solver。 | start → browser GET `/` → health / explicit solve |
 | `internal/challenge/solver.go:107`、`:149`、`:289` | 完整 Solver 已按阶段执行并只在前置门禁后 Verify。 | setup → device/init/assets/vision/PE → Verify |
 | `internal/challenge/solver_test.go` · `TestSolverLowConfidenceStopsBeforeVerify` / `TestSolverVerifyNetworkErrorIsSingleAttemptAndSanitized` | 低置信零 Verify、网络未知单次 Verify 有计数测试。 | failure branch → counted transport calls |
-| `internal/challenge/device_pool.go:190`、`:299` | 预热池按完整 key Lease，Close 有界清理后台任务。 | Prime/Lease → release/refill → Close |
-| `pkg/slider/client.go:203`、`:213` | library 暴露 Purge，并在 Close 前等待活跃 Solve/Prime/Purge。 | caller lifecycle → safe resource cleanup |
+| `internal/pe/keys.go` · `NewKeyResolverWithCapacity`；`internal/pe/device_runtime.go` · `OpenDevice` / `Close` | 每个合法Solve立即冷建/关闭Device会话，本地没有live并发槽；公开SDK/PE缓存不含挑战态。 | Solve → Open → Close |
+| `pkg/slider/client.go` · `Prime` / `PurgeArtifacts` / `Close` | `Prime`是兼容空操作；library暴露Purge，并在Close前等待活跃Solve/Prime/Purge。 | caller lifecycle → safe resource cleanup |
 | `internal/artifact/store.go:121`；`cmd/server/main.go:147` | Store 只清理受管过期文件；服务已按小时调度。 | failure artifact → retention → scheduled Purge |
 | `.github/workflows/ali-slider-go-ci.yml` · `quality` / `race` / `windows-package` | Linux quality、Darwin race 与 Windows 原生 package 都固定 `CGO_ENABLED=0`；只有全部通过才上传便携 ZIP。 | source change → cross-platform gates → verified ZIP |
 | `Dockerfile`；`internal/pe/v8_runtime.go`；`internal/v8runtime/runtime.go`；`native/v8runtime/src/lib.rs` | 运行镜像固定携带同架构 V8 wrapper，服务在 ready 前校验 ABI/V8/ICU 并保持非 root；生产不依赖 Node/PATH。 | Go launcher + V8 wrapper → startup check → bounded script cache + per-challenge Isolates |

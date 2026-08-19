@@ -38,7 +38,6 @@ const (
 	keyBridgeReferer    = keyBridgeOrigin + "/"
 	dummyCertifyID      = "0123456789abcdef"
 	maxV8PEIdle         = 32
-	maxV8DeviceActive   = 4
 )
 
 var (
@@ -109,12 +108,11 @@ type KeyResolver struct {
 	now           func() time.Time
 	collect       keyCollector
 
-	v8Mu        sync.Mutex
-	v8Library   *v8runtime.Library
-	v8PEIdle    []*v8runtime.Runtime
-	v8PELimit   int
-	v8Closed    bool
-	deviceSlots chan struct{}
+	v8Mu      sync.Mutex
+	v8Library *v8runtime.Library
+	v8PEIdle  []*v8runtime.Runtime
+	v8PELimit int
+	v8Closed  bool
 
 	mu           sync.RWMutex
 	keys         map[string]cachedRuntimeProfile
@@ -140,7 +138,6 @@ func NewKeyResolverWithCapacity(libraryPath string, capacity int) *KeyResolver {
 	return &KeyResolver{
 		v8LibraryPath: libraryPath,
 		v8PELimit:     capacity,
-		deviceSlots:   make(chan struct{}, min(capacity, maxV8DeviceActive)),
 		now:           time.Now,
 		keys:          make(map[string]cachedRuntimeProfile),
 		peLoads:       make(map[string]*pendingScriptLoad),

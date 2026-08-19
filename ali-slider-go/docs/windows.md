@@ -4,7 +4,7 @@ GitHub Actions 在 Linux quality、Darwin race 与 Linux V8 双架构门禁通�
 
 平台下限依据 Go 1.26 的官方 [Minimum Requirements](https://go.dev/wiki/MinimumRequirements)。
 
-> 本程序是本机控制台HTTP服务，不是桌面图形应用，但内置浏览器API测试页。当前包只支持Windows AMD64/x64。默认启动会访问外部Device RPC建立4个独立画像slot；测试页手工求解还会访问Captcha RPC和图片CDN。仅限自有系统或明确授权环境，不能提高默认预热池4槽边界。
+> 本程序是本机控制台HTTP服务，不是桌面图形应用，但内置浏览器API测试页。当前包只支持Windows AMD64/x64。默认启动只做本地V8 DLL/ABI/ICU自检，不访问Device RPC；每次合法手工求解都会立即冷建独立Device/V8并访问Device、Captcha RPC和按类型需要的图片CDN，结束后立即关闭会话。本地不限制同时存活的Device会话数。仅限自有系统或明确授权环境。
 
 测试页需要现代 Edge、Chrome 或 Firefox，不支持 Internet Explorer。没有现代浏览器时，Go 服务和 PowerShell/API 仍可使用；包内 V8 DLL 由 Go 服务在进程内加载，不会启动 Node 子进程或打开窗口。
 
@@ -141,7 +141,7 @@ Unix 构建强制 Artifact 目录/文件为 `0700/0600`。Windows 的 Go `FileMo
 5. 把 `ali_slider_v8_runtime.dll` 和 `THIRD-PARTY-NOTICES.txt` 纳入包，生成构建信息、UTF-8 BOM 中文说明、包内 SHA-256 和明确文件白名单；
 6. 解压到含中文及空格的临时路径；
 7. 通过最终 `start.bat` 启动 EXE，启动时必须先通过 DLL/ABI/V8/ICU 自检，再验证参数转发、内嵌页、`/health`、OpenAPI、跨源和非法输入合同；
-8. smoke 强制 `--device-prewarm=0`，不会发送 Device、Init、图片或 Verify 请求；
+8. smoke 保留兼容参数 `--device-prewarm=0`；启动本身不预热Device，且smoke只访问无副作用路由或在Solver前被拒绝的输入，不会发送Device、Init、图片或Verify请求；
 9. `main` push 和 `workflow_dispatch` 直传单层 ZIP，PR 只验证不上传；官方 actions 使用完整 commit SHA 固定，工作流权限保持 `contents: read`。
 
 本地只构建 EXE：

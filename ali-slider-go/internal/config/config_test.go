@@ -13,7 +13,7 @@ func TestDefaultsValidate(t *testing.T) {
 	if err := config.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if config.Host != "127.0.0.1" || config.MaxConcurrency != 32 || config.DevicePrewarmCapacity != MaxDevicePrewarmCapacity || config.DeviceSessionReserve != 0 || config.SceneID != DefaultSceneID || config.Prefix != DefaultPrefix || filepath.Base(config.V8RuntimeLibrary) != v8runtime.DefaultLibraryName() {
+	if config.Host != "127.0.0.1" || config.MaxConcurrency != 32 || config.DevicePrewarmCapacity != 0 || config.DeviceSessionReserve != 0 || config.SceneID != DefaultSceneID || config.Prefix != DefaultPrefix || filepath.Base(config.V8RuntimeLibrary) != v8runtime.DefaultLibraryName() {
 		t.Fatalf("unexpected defaults: %+v", config)
 	}
 }
@@ -23,15 +23,13 @@ func TestParsePrecedence(t *testing.T) {
 		"ALI_SLIDER_PORT":            "9000",
 		"ALI_SLIDER_TIMEOUT":         "12s",
 		"ALI_SLIDER_MAX_CONCURRENCY": "8",
-		"ALI_SLIDER_DEVICE_PREWARM":  "3",
-		"ALI_SLIDER_DEVICE_RESERVE":  "3",
 		"ALI_SLIDER_V8_LIBRARY":      "/environment/libali_slider_v8_runtime.so",
 	}
-	config, err := Parse([]string{"-port=9100", "-max-concurrency=4", "-device-prewarm=2", "-device-reserve=2", "-v8-library=/flag/libali_slider_v8_runtime.so"}, func(key string) string { return environment[key] })
+	config, err := Parse([]string{"-port=9100", "-max-concurrency=4", "-v8-library=/flag/libali_slider_v8_runtime.so"}, func(key string) string { return environment[key] })
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.Port != 9100 || config.MaxConcurrency != 4 || config.DevicePrewarmCapacity != 2 || config.DeviceSessionReserve != 2 || config.Timeout != 12*time.Second || config.V8RuntimeLibrary != "/flag/libali_slider_v8_runtime.so" {
+	if config.Port != 9100 || config.MaxConcurrency != 4 || config.DevicePrewarmCapacity != 0 || config.DeviceSessionReserve != 0 || config.Timeout != 12*time.Second || config.V8RuntimeLibrary != "/flag/libali_slider_v8_runtime.so" {
 		t.Fatalf("unexpected precedence: %+v", config)
 	}
 }
@@ -45,10 +43,23 @@ func TestParseRejectsInvalidValues(t *testing.T) {
 	}); err == nil {
 		t.Fatal("expected environment parse error")
 	}
-	for _, arguments := range [][]string{{"-max-concurrency=33"}, {"-device-prewarm=5"}, {"-device-reserve=5"}, {"-device-prewarm=0", "-device-reserve=1"}, {"-device-prewarm=4", "-device-reserve=1"}, {"-prefix=bad_prefix"}, {"-host=example.com"}, {"extra"}} {
+	for _, arguments := range [][]string{{"-max-concurrency=33"}, {"-device-prewarm=1"}, {"-device-reserve=1"}, {"-prefix=bad_prefix"}, {"-host=example.com"}, {"extra"}} {
 		if _, err := Parse(arguments, func(string) string { return "" }); err == nil {
 			t.Fatalf("expected error for %v", arguments)
 		}
+	}
+	for _, key := range []string{"ALI_SLIDER_DEVICE_PREWARM", "ALI_SLIDER_DEVICE_RESERVE"} {
+		if _, err := Parse(nil, func(name string) string {
+			if name == key {
+				return "1"
+			}
+			return ""
+		}); err == nil {
+			t.Fatalf("expected non-zero legacy environment %s to fail", key)
+		}
+	}
+	if _, err := Parse([]string{"-device-prewarm=0", "-device-reserve=0"}, func(string) string { return "" }); err != nil {
+		t.Fatalf("zero-valued compatibility flags failed: %v", err)
 	}
 	invalid := Defaults()
 	invalid.V8RuntimeLibrary = ""

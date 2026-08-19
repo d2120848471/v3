@@ -3,7 +3,6 @@ package slider
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -18,34 +17,33 @@ import (
 	"github.com/d2120848471/v3/ali-slider-go/internal/runtimekit"
 )
 
-const dynamicDevicePoolProfileID = "dynamic-device-profile-slot"
-
 // ClientOptions 配置可并发复用的 Go Client。直接使用零值结构时会按
 // DefaultClientOptions 补齐。如需显式传递有意义的零（如置信度 0、
-// GatherCost 0..0 或关闭预热），应先调用 DefaultClientOptions 再覆盖。
+// GatherCost 0..0），应先调用 DefaultClientOptions 再覆盖。
 type ClientOptions struct {
 	DefaultSceneID string
 	DefaultPrefix  string
-	// MaxConcurrency 是兼容旧名：控制每 route/host 出站连接与 PE 资源预算，不限制 Solve 调用。
-	MaxConcurrency        int
-	MaxTransportRoutes    int
-	Timeout               time.Duration
-	MinimumConfidence     float64
-	GatherCostMin         int
-	GatherCostMax         int
-	FirstTouchAgeMin      int
-	FirstTouchAgeMax      int
-	ArtifactDir           string
-	ArtifactRetention     time.Duration
-	AssetMaxBytes         int64
-	AssetMaxDimension     int
-	AssetMaxPixels        int64
+	// MaxConcurrency 是兼容旧名：控制每 route/host 出站连接与 PE 资源预算。
+	// Device 整轮会话和 HTTP/Solve 调用不受本地信号量限制。
+	MaxConcurrency     int
+	MaxTransportRoutes int
+	Timeout            time.Duration
+	MinimumConfidence  float64
+	GatherCostMin      int
+	GatherCostMax      int
+	FirstTouchAgeMin   int
+	FirstTouchAgeMax   int
+	ArtifactDir        string
+	ArtifactRetention  time.Duration
+	AssetMaxBytes      int64
+	AssetMaxDimension  int
+	AssetMaxPixels     int64
+	// DevicePrewarmCapacity / DeviceSessionReserve 仅保留为升级兼容字段。
+	// 生产路径不再预热或复用 Device 会话，两者必须为 0。
 	DevicePrewarmCapacity int
-	// DeviceSessionReserve 是有会话租出时投机保留的小额备用库存。
-	// Prime 仍只建 DevicePrewarmCapacity 个，无租约时也收缩回该容量。
-	DeviceSessionReserve int
-	DeviceSessionMaxAge  time.Duration
-	V8RuntimeLibrary     string
+	DeviceSessionReserve  int
+	DeviceSessionMaxAge   time.Duration // Deprecated: 仅保留字段兼容，当前实现忽略该值。
+	V8RuntimeLibrary      string
 
 	defaultsResolved bool
 }
@@ -63,7 +61,6 @@ func DefaultClientOptions() ClientOptions {
 		AssetMaxBytes: defaults.AssetMaxBytes, AssetMaxDimension: defaults.AssetMaxDimension,
 		AssetMaxPixels: 16 << 20, DevicePrewarmCapacity: defaults.DevicePrewarmCapacity,
 		DeviceSessionReserve: defaults.DeviceSessionReserve,
-		DeviceSessionMaxAge:  challenge.DefaultDeviceSessionMaxAge,
 		V8RuntimeLibrary:     defaults.V8RuntimeLibrary,
 		defaultsResolved:     true,
 	}
@@ -73,13 +70,13 @@ type challengeSolver interface {
 	Solve(context.Context, challenge.SolveRequest) (challenge.SolveOutcome, error)
 }
 
-// Client 可被多个 goroutine 并发复用。每次 Solve 仍持有独立挑战、设备画像与
-// Verify 尝试位；共享连接池、密码学熵、公开 PE 脚本/画像缓存和可选预热池。
+// Client 可被多个 goroutine 并发复用。每次 Solve 都冷建独立 Device/V8 会话，
+// 持有独立挑战、设备画像与 Verify 尝试位；只共享连接池、密码学熵和
+// 不含挑战态的公开 SDK/PE 脚本与画像缓存。
 type Client struct {
 	options    ClientOptions
 	solver     challengeSolver
 	transports *challenge.TransportPool
-	devices    *challenge.DeviceSessionPool
 	peRuntime  *pe.KeyResolver
 	artifacts  artifact.Store
 
@@ -90,8 +87,8 @@ type Client struct {
 	closeDone chan struct{}
 }
 
-// NewClient 创建 Go Client，不发外部请求。需要启动预热时显式调用 Prime；
-// 设备与动态 PE 在进程内的 V8 Isolate 中执行，公开脚本和结构画像复用五分钟。
+// NewClient 创建 Go Client，不发外部请求。每轮 Solve 才冷建 Device/V8 会话；
+// 公开 SDK/PE 脚本和结构画像仍按既有 TTL 复用。
 func NewClient(options ClientOptions) (*Client, error) {
 	if !options.defaultsResolved {
 		options = fillClientDefaults(options)
@@ -104,8 +101,8 @@ func NewClient(options ClientOptions) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 无论是否开启预热都先保留直连路由，避免随机代理占满路由表后阻断默认路径。
-	directTransport, _, err := transports.Get("")
+	// 先保留直连路由，避免随机代理占满路由表后阻断默认路径。
+	_, _, err = transports.Get("")
 	if err != nil {
 		transports.CloseIdleConnections()
 		return nil, err
@@ -116,57 +113,20 @@ func NewClient(options ClientOptions) (*Client, error) {
 	}
 
 	peRuntime := pe.NewKeyResolverWithCapacity(options.V8RuntimeLibrary, options.MaxConcurrency)
-	var devicePool *challenge.DeviceSessionPool
-	if options.DevicePrewarmCapacity > 0 {
-		poolProfile := device.Profile{ProfileID: dynamicDevicePoolProfileID}
-		deviceOptions := productionDeviceOptions(options, poolProfile, sources)
-		poolOpen := func(ctx context.Context) (challenge.DeviceSession, error) {
-			profile, profileErr := device.GenerateProfile(sources.Entropy)
-			if profileErr != nil {
-				return nil, fmt.Errorf("generate device slot profile: %w", profileErr)
-			}
-			return peRuntime.OpenDevice(ctx, directTransport, profile, pe.DeviceRuntimeOptions{
-				Prefix: options.DefaultPrefix, Region: "cn", Timeout: options.Timeout,
-				GatherCostMin: options.GatherCostMin, GatherCostMax: options.GatherCostMax,
-				FirstTouchAgeMin: options.FirstTouchAgeMin, FirstTouchAgeMax: options.FirstTouchAgeMax,
-				Sources: sources,
-			})
-		}
-		devicePool, err = challenge.NewRuntimeDeviceSessionPoolWithReserve(
-			options.DevicePrewarmCapacity, options.DeviceSessionReserve, options.DeviceSessionMaxAge,
-			challenge.DevicePoolKeyFrom(deviceOptions, ""), poolOpen,
-		)
-		if err != nil {
-			_ = peRuntime.Close()
-			transports.CloseIdleConnections()
-			return nil, err
-		}
-	}
 	openDevice := func(ctx context.Context, transport http.RoundTripper, profile device.Profile, request challenge.SolveRequest) (challenge.DeviceSession, func(), error) {
-		opener := func(openContext context.Context) (challenge.DeviceSession, error) {
-			return peRuntime.OpenDevice(openContext, transport, profile, pe.DeviceRuntimeOptions{
-				Prefix: request.Prefix, Region: "cn", Proxy: request.Proxy, Timeout: options.Timeout,
-				GatherCostMin: options.GatherCostMin, GatherCostMax: options.GatherCostMax,
-				FirstTouchAgeMin: options.FirstTouchAgeMin, FirstTouchAgeMax: options.FirstTouchAgeMax,
-				Sources: sources,
-			})
-		}
-		deviceOptions := productionDeviceOptions(options, profile, sources)
-		deviceOptions.Prefix = request.Prefix
-		if devicePool != nil {
-			poolKey := challenge.DevicePoolKeyFrom(deviceOptions, request.Proxy)
-			poolKey.ProfileID = dynamicDevicePoolProfileID
-			return devicePool.LeaseRuntime(ctx, poolKey, opener)
-		}
-		session, openErr := opener(ctx)
+		session, openErr := peRuntime.OpenDevice(ctx, transport, profile, pe.DeviceRuntimeOptions{
+			Prefix: request.Prefix, Region: "cn", Proxy: request.Proxy, Timeout: options.Timeout,
+			GatherCostMin: options.GatherCostMin, GatherCostMax: options.GatherCostMax,
+			FirstTouchAgeMin: options.FirstTouchAgeMin, FirstTouchAgeMax: options.FirstTouchAgeMax,
+			Sources: sources,
+		})
 		if openErr != nil || session == nil {
 			if session != nil {
 				session.Close()
 			}
 			return nil, nil, openErr
 		}
-		var releaseOnce sync.Once
-		return session, func() { releaseOnce.Do(session.Close) }, nil
+		return session, session.Close, nil
 	}
 
 	getTransport := func(proxy string) (http.RoundTripper, bool, error) {
@@ -183,15 +143,12 @@ func NewClient(options ClientOptions) (*Client, error) {
 		PEKeys: peRuntime,
 	})
 	if err != nil {
-		if devicePool != nil {
-			devicePool.Close()
-		}
 		_ = peRuntime.Close()
 		transports.CloseIdleConnections()
 		return nil, err
 	}
 	return &Client{
-		options: options, solver: engine, transports: transports, devices: devicePool, peRuntime: peRuntime,
+		options: options, solver: engine, transports: transports, peRuntime: peRuntime,
 		artifacts: store, closeDone: make(chan struct{}),
 	}, nil
 }
@@ -223,24 +180,19 @@ func (client *Client) Solve(ctx context.Context, request Request) (Result, error
 	}, nil
 }
 
-// Prime 并行预热默认直连配置的设备会话。预热关闭时立即成功。
-// 部分预热失败会返回错误；已成功的槽位仍保留，后续请求可正常冷建兜底。
-func (client *Client) Prime(ctx context.Context) error {
+// Prime 仅保留为源码兼容入口。Device 预热/复用已移除；调用它不发外部请求。
+//
+// Deprecated: 新代码不需要调用 Prime。
+func (client *Client) Prime(_ context.Context) error {
 	if client == nil || !client.begin() {
 		return &Error{Kind: ErrorInternal, Stage: "prime", Message: "Client 已关闭或不可用"}
 	}
 	defer client.active.Done()
-	if client.devices == nil {
-		return nil
-	}
-	if err := client.devices.Prime(ctx); err != nil {
-		return &Error{Kind: ErrorNetwork, Stage: "prime", Message: "设备会话预热未完全成功", Cause: err}
-	}
 	return nil
 }
 
 // CheckRuntime 立即校验本地 V8 wrapper、C ABI 和 ICU 初始化。HTTP 服务在
-// 开始预热和对外报告 ready 前调用；普通 library 调用方也可用于部署探针。
+// 对外报告 ready 前调用；普通 library 调用方也可用于部署探针。
 func (client *Client) CheckRuntime() error {
 	if client == nil || !client.begin() {
 		return &Error{Kind: ErrorInternal, Stage: "runtime", Message: "Client 已关闭或不可用"}
@@ -264,7 +216,7 @@ func (client *Client) PurgeArtifacts() (int, error) {
 	return client.artifacts.Purge()
 }
 
-// Close 等待正在执行的 Solve/Prime/Purge 返回，再关闭预热会话和空闲连接。
+// Close 等待正在执行的 Solve/Prime/Purge 返回，再关闭 V8 runtime 和空闲连接。
 // 多个 goroutine 可安全重复调用。
 func (client *Client) Close() {
 	if client == nil {
@@ -275,9 +227,6 @@ func (client *Client) Close() {
 		client.closed = true
 		client.mu.Unlock()
 		client.active.Wait()
-		if client.devices != nil {
-			client.devices.Close()
-		}
 		if client.peRuntime != nil {
 			_ = client.peRuntime.Close()
 		}
@@ -340,15 +289,6 @@ func fillClientDefaults(options ClientOptions) ClientOptions {
 	if options.AssetMaxPixels == 0 {
 		options.AssetMaxPixels = defaults.AssetMaxPixels
 	}
-	if options.DevicePrewarmCapacity == 0 {
-		options.DevicePrewarmCapacity = defaults.DevicePrewarmCapacity
-	}
-	if options.DeviceSessionReserve == 0 {
-		options.DeviceSessionReserve = defaults.DeviceSessionReserve
-	}
-	if options.DeviceSessionMaxAge == 0 {
-		options.DeviceSessionMaxAge = defaults.DeviceSessionMaxAge
-	}
 	if options.V8RuntimeLibrary == "" {
 		options.V8RuntimeLibrary = defaults.V8RuntimeLibrary
 	}
@@ -377,25 +317,13 @@ func validateClientOptions(options ClientOptions) error {
 	if options.AssetMaxBytes < 1 || options.AssetMaxBytes > 64<<20 || options.AssetMaxDimension < 1 || options.AssetMaxDimension > 16_384 || options.AssetMaxPixels < 1 {
 		return errors.New("asset limits are invalid")
 	}
-	if options.DevicePrewarmCapacity < 0 || options.DevicePrewarmCapacity > min(options.MaxConcurrency, config.MaxDevicePrewarmCapacity) ||
-		options.DeviceSessionReserve < 0 || options.DeviceSessionReserve > config.MaxDeviceSessionReserve ||
-		options.DevicePrewarmCapacity == 0 && options.DeviceSessionReserve != 0 ||
-		options.DevicePrewarmCapacity+options.DeviceSessionReserve > config.MaxDevicePrewarmCapacity || options.DeviceSessionMaxAge <= 0 {
-		return errors.New("device prewarm settings are invalid")
+	if options.DevicePrewarmCapacity != 0 || options.DeviceSessionReserve != 0 {
+		return errors.New("device prewarm and reserve have been removed; both must be 0")
 	}
 	if options.V8RuntimeLibrary == "" || len(options.V8RuntimeLibrary) > 4_096 || strings.ContainsRune(options.V8RuntimeLibrary, 0) || !utf8.ValidString(options.V8RuntimeLibrary) {
 		return errors.New("V8 runtime library path must contain 1..4096 valid UTF-8 bytes")
 	}
 	return nil
-}
-
-func productionDeviceOptions(options ClientOptions, profile device.Profile, sources runtimekit.Sources) device.ClientOptions {
-	result := device.DefaultClientOptions(profile, sources)
-	result.Prefix = options.DefaultPrefix
-	result.Timeout = options.Timeout
-	result.GatherCostMin, result.GatherCostMax = options.GatherCostMin, options.GatherCostMax
-	result.FirstTouchAgeMin, result.FirstTouchAgeMax = options.FirstTouchAgeMin, options.FirstTouchAgeMax
-	return result
 }
 
 func publicError(err error) error {

@@ -12,7 +12,7 @@ Ali Slider Go Windows AMD64 便携版
 1. 仅限自有系统或获得明确授权的测试环境。
 2. 默认只监听 127.0.0.1:8000，不要改成 0.0.0.0 后直接暴露到公网或共享网络。
 3. 服务没有应用内鉴权，也不会按本机在途请求数主动返回 429；只能在受控机器和网络中运行。
-4. 启动时会先加载包内 V8 DLL、校验 C ABI 并初始化 V8/ICU；默认再预热 32 个进程内设备 Isolate，访问外部 Device RPC。真实求解会在同进程 V8 中执行当前动态 PE，并访问 Captcha RPC、公开脚本和图片 CDN。公开 SDK/PE 源码及画像缓存 5 分钟，token、CertifyId、轨迹和 data 不跨轮复用；不启动 Node 子进程。
+4. 启动时只加载包内 V8 DLL、校验 C ABI 并初始化 V8/ICU，不创建设备会话，也不访问 Device RPC。每次真实求解会立即冷建独立 Device/V8 会话，在同进程 V8 中执行当前动态 PE，并访问 Device/Captcha RPC、公开脚本和图片 CDN；完成或失败后关闭整个会话。本地不限制同时存活的完整会话数。公开 SDK/PE 源码及画像继续按 TTL 缓存，token、CertifyId、轨迹和 data 不跨轮复用；不启动 Node 子进程。
 5. 失败或低置信样本可能写入 var\artifacts。请解压到当前用户的私有可写目录，不要放在 Web root、公共共享盘、多人共享目录或公开同步目录。
 6. Windows 文件权限继承解压目录的 NTFS ACL。不要把 var\artifacts、日志、token、certifyId、代理密码或完整响应发送给无关人员。
 7. 旧 GET query 会立即执行真实求解，不是 health 或只读页面。禁止在 URL 放入 AaduaneId 或含账号密码的 proxy。
@@ -29,7 +29,7 @@ Ali Slider Go Windows AMD64 便携版
 7. OpenAPI：http://127.0.0.1:8000/openapi.json
 8. 停止服务：在服务窗口按 Ctrl+C，然后等待窗口退出。
 
-默认预热失败时，程序会记录 warning 并继续冷启动服务；网络较慢时，ready 最多可能等待约 25 秒。
+启动阶段不会访问真实上游；出现 status=ready 只表示本地 HTTP 服务与 V8 运行时已就绪。第一次真实上游访问和完整会话冷建发生在点击求解或调用 API 后。
 
 浏览器测试
 ----------
@@ -86,6 +86,8 @@ start.bat --port=8001
 
 ali-slider-go.exe --help
 
+旧版的 --device-prewarm 和 --device-reserve 参数仅为配置兼容保留，现在都只接受 0。不要在 start.bat 后传入非零值，否则服务会报告配置错误并停止启动。
+
 常见问题
 --------
 
@@ -93,13 +95,13 @@ ali-slider-go.exe --help
    端口 8000 已被占用。关闭旧实例，或使用 start.bat --port=8001。
 
 2. 健康检查暂时失败
-   等待 status=ready。默认预热会先访问外部 Device RPC；网络慢时启动会延迟。
+   等待 status=ready。启动不会访问 Device RPC；若一直未 ready，请根据控制台日志检查 DLL、端口和本机运行环境。
 
 3. 测试页打不开
    确认控制台已出现 status=ready，并使用启动日志中的实际端口。若改为 --port=8001，页面地址也是 http://127.0.0.1:8001/。
 
 4. 页面已打开，但 solve 失败
-   页面打开和 /health 只证明本地 HTTP 服务可响应，不检查上游。根据 HTTP 状态、errorType 和 traceId 排查网络或协议问题。
+   页面打开和 /health 只证明本地 HTTP 服务可响应，不检查上游。每次合法 solve 都会立即创建独立 Device/V8 会话并访问真实上游；根据 HTTP 状态、errorType 和 traceId 排查网络或协议问题。本地没有 Device/V8 并发槽，来流会直接放大 CPU、内存、线程和上游压力。
 
 5. Windows Defender / SmartScreen 提示未知发布者
    当前自动构建未做商业 Authenticode 代码签名。请只从可信仓库取得文件，并核对 SHA256SUMS.txt；不要关闭系统防护或绕过组织安全策略。

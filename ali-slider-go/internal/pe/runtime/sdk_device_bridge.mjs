@@ -10,8 +10,8 @@
  * - `challenge-worker`：保持同一个 FeiLin VM；先输出 Init token，再从 stdin
  *   接收动态 PE 实际观测到的 getter 参数，在同一 VM 内回放动态 PE native mm，
  *   并生成 Verify token；
- * - `challenge-host`：一个 Node 进程内启动多个隔离 Worker/VM，按
- *   `sessionId` 对 JSONL 消息分流；池化模式可原位重建已完成的 VM 槽位。
+ * - `challenge-host`：仅供历史 Node oracle/并发测试；在一个 Node 进程内
+ *   启动多个隔离 Worker/VM，按 `sessionId` 对 JSONL 消息分流。生产 Client 不调用该模式。
  */
 
 import fs from "node:fs";

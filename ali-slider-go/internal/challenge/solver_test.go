@@ -32,7 +32,6 @@ func TestChallengeTypesRedactFormatting(t *testing.T) {
 		SolveOutcome{SecurityToken: "token-secret", CertifyID: "certify-secret"},
 		CaptchaChallenge{CertifyID: "certify-secret", ImagePath: "asset-secret"},
 		VerifyResult{SecurityToken: "token-secret", CertifyID: "certify-secret"},
-		DevicePoolKey{Route: "http://user:password@proxy.invalid"},
 	}
 	for _, value := range values {
 		for _, formatted := range []string{fmt.Sprint(value), fmt.Sprintf("%#v", value)} {
@@ -407,6 +406,30 @@ func TestSolverOfflineCompleteSuccess(t *testing.T) {
 	}
 }
 
+func TestSolverColdDeviceFlowRunsEveryRound(t *testing.T) {
+	transport := newSolverTransport(t, "gap")
+	solver, _ := newIntegrationSolver(t, transport, 0.45)
+	for round := range 2 {
+		outcome, err := solver.Solve(context.Background(), SolveRequest{
+			SceneID: fmt.Sprintf("cold-round-%d", round), Prefix: "fsgtmi",
+		})
+		if err != nil {
+			t.Fatalf("round %d: %v", round, err)
+		}
+		if !outcome.OK || outcome.VerifyCode != "T001" || !outcome.VerifyResult {
+			t.Fatalf("round %d outcome=%+v", round, outcome)
+		}
+	}
+
+	transport.mu.Lock()
+	initCount, verifyCount := transport.initCount, transport.verifyCount
+	actions := append([]string(nil), transport.deviceActions...)
+	transport.mu.Unlock()
+	if initCount != 2 || verifyCount != 2 || strings.Join(actions, ",") != "Log1,Log2,Log3,Log2,Log1,Log2,Log3,Log2" {
+		t.Fatalf("init=%d verify=%d actions=%v", initCount, verifyCount, actions)
+	}
+}
+
 func TestSolverRoutesImageLessTracelessThroughDeviceSession(t *testing.T) {
 	transport := newSolverTransport(t, "gap")
 	transport.captchaType = "TRACELESS"
@@ -501,18 +524,21 @@ func TestSolverReleasesCompletedDeviceBeforeVerifyOnce(t *testing.T) {
 	}
 	solver, _ := newIntegrationSolver(t, transport, 0.45)
 	solver.options.OpenDevice = func(context.Context, http.RoundTripper, device.Profile, SolveRequest) (DeviceSession, func(), error) {
-		return &completedDeviceSession{}, func() { releases.Add(1) }, nil
+		return &completedDeviceSession{}, func() {
+			time.Sleep(20 * time.Millisecond)
+			releases.Add(1)
+		}, nil
 	}
 	outcome, err := solver.Solve(context.Background(), SolveRequest{SceneID: "scene", Prefix: "prefix1"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !outcome.OK || releases.Load() != 1 {
-		t.Fatalf("outcome=%+v releases=%d", outcome, releases.Load())
+	if !outcome.OK || releases.Load() != 1 || outcome.TimingsMS["clientCleanup"] < 15 {
+		t.Fatalf("outcome=%+v releases=%d clientCleanup=%d", outcome, releases.Load(), outcome.TimingsMS["clientCleanup"])
 	}
 }
 
-func TestSolverUsesLeasedDeviceProfileForWholeRound(t *testing.T) {
+func TestSolverUsesOpenedDeviceProfileForWholeRound(t *testing.T) {
 	transport := newSolverTransport(t, "gap")
 	resolver := &staticPEKeyResolver{profile: pe.RuntimeProfile{
 		ArgumentKey: "0kd8i0mclivjow32", IncludeScreenInfo: true,
@@ -522,8 +548,8 @@ func TestSolverUsesLeasedDeviceProfileForWholeRound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	profile.ProfileID = "leased-profile"
-	profile.UserAgent = "leased-device-user-agent"
+	profile.ProfileID = "opened-profile"
+	profile.UserAgent = "opened-device-user-agent"
 	solver.options.OpenDevice = func(context.Context, http.RoundTripper, device.Profile, SolveRequest) (DeviceSession, func(), error) {
 		return &profiledCompletedDeviceSession{profile: profile}, func() {}, nil
 	}

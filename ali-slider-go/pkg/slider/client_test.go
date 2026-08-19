@@ -46,14 +46,22 @@ func TestDefaultOptionsPreserveExplicitZeroValues(t *testing.T) {
 	}
 }
 
-func TestZeroOptionsUseProductionPrewarmDefault(t *testing.T) {
+func TestZeroOptionsDisableDevicePrewarm(t *testing.T) {
 	client, err := NewClient(ClientOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	if client.options.DevicePrewarmCapacity != DefaultClientOptions().DevicePrewarmCapacity || client.options.DeviceSessionReserve != DefaultClientOptions().DeviceSessionReserve || client.devices == nil {
-		t.Fatalf("zero options prewarm capacity=%d reserve=%d poolNil=%t", client.options.DevicePrewarmCapacity, client.options.DeviceSessionReserve, client.devices == nil)
+	if client.options.DevicePrewarmCapacity != 0 || client.options.DeviceSessionReserve != 0 {
+		t.Fatalf("zero options prewarm capacity=%d reserve=%d", client.options.DevicePrewarmCapacity, client.options.DeviceSessionReserve)
+	}
+	if err := client.Prime(context.Background()); err != nil {
+		t.Fatalf("disabled Prime returned error: %v", err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := client.Prime(canceled); err != nil {
+		t.Fatalf("compatibility Prime should stay a no-op: %v", err)
 	}
 }
 

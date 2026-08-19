@@ -92,9 +92,6 @@ func (SolveOutcome) GoString() string { return "challenge.SolveOutcome{redacted}
 // TransportGetter 为生产连接池和完全离线的 Mock RoundTripper 提供同一入口。
 type TransportGetter func(proxy string) (http.RoundTripper, bool, error)
 
-// DeviceLeaseFunc 允许公共 Client 接入预热池。release 必须并发安全且可重复调用。
-type DeviceLeaseFunc func(context.Context, DevicePoolKey, *device.Client) (*device.Session, func(), error)
-
 // DeviceSession 是 Solver 实际需要的最小设备会话合同。纯 Go Session 与保持
 // 同一 FeiLin VM 的 Node Session 都可实现它。
 type DeviceSession interface {
@@ -136,7 +133,7 @@ type PEKeyResolver interface {
 }
 
 // SolverOptions 固定进程级资源边界。FixedProfile 只供离线/兼容调用固定画像；
-// 生产动态会话会在 Lease 后提供 slot 实际画像，并贯穿 HTTP、设备与 PE。
+// 生产动态会话会在 Open 后提供 slot 实际画像，并贯穿 HTTP、设备与 PE。
 type SolverOptions struct {
 	Timeout           time.Duration
 	MinimumConfidence float64
@@ -151,7 +148,6 @@ type SolverOptions struct {
 	GetTransport      TransportGetter
 	Artifacts         *artifact.Store
 	FixedProfile      *device.Profile
-	LeaseDevice       DeviceLeaseFunc
 	OpenDevice        DeviceOpenFunc
 	PEKeys            PEKeyResolver
 }
@@ -161,7 +157,7 @@ type Solver struct {
 	options SolverOptions
 }
 
-// NewSolver 构造无共享挑战状态的编排器；连接池、熵和可选设备池由调用方共享。
+// NewSolver 构造无共享挑战状态的编排器；连接池、熵和公开 SDK/PE 缓存由调用方共享。
 func NewSolver(options SolverOptions) (*Solver, error) {
 	if options.Timeout <= 0 || options.Timeout > 5*time.Minute {
 		return nil, errors.New("solver timeout must be within (0,5m]")
@@ -196,7 +192,6 @@ type setupState struct {
 	deviceClient *device.Client
 	rpcClient    *RPCClient
 	proxied      bool
-	deviceKey    DevicePoolKey
 }
 
 // Solve 完成一轮挑战。每次调用只创建一个 RPCClient，因此一个 CertifyId 最多
@@ -260,12 +255,14 @@ func (solver *Solver) Solve(parent context.Context, request SolveRequest) (outco
 		return outcome, fail(FailureInternal, currentStage, "设备会话释放器缺失", nil)
 	}
 	var releaseOnce sync.Once
-	releaseSession := func() { releaseOnce.Do(release) }
-	defer func() {
-		cleanupStarted := time.Now()
-		releaseSession()
-		timings["clientCleanup"] = elapsedMilliseconds(cleanupStarted)
-	}()
+	releaseSession := func() {
+		releaseOnce.Do(func() {
+			cleanupStarted := time.Now()
+			release()
+			timings["clientCleanup"] = elapsedMilliseconds(cleanupStarted)
+		})
+	}
+	defer releaseSession()
 	if provider, ok := session.(deviceProfileProvider); ok {
 		profile := provider.DeviceProfile()
 		if profile.ProfileID == "" {
@@ -529,8 +526,8 @@ func (solver *Solver) completeAndVerify(
 	if err := checkStageContext(ctx, *currentStage); err != nil {
 		return outcome, err
 	}
-	// Complete 后 session 已无后续消费者；提前开始池内 recycle，
-	// 使其与 Verify 网络重叠。外层 once+defer 仍保底所有早退路径。
+	// Complete 后不再需要本轮 Device/V8；立即关闭并释放本轮资源。
+	// 外层 once+defer 仍保底所有早退路径。
 	releaseSession()
 
 	*currentStage = "verify"
@@ -590,7 +587,7 @@ func (solver *Solver) setup(ctx context.Context, request SolveRequest) (setupSta
 	}
 	return setupState{
 		transport: transport, profile: profile, deviceClient: deviceClient,
-		proxied: proxied, deviceKey: DevicePoolKeyFrom(deviceOptions, request.Proxy),
+		proxied: proxied,
 	}, nil
 }
 
@@ -604,12 +601,9 @@ func (solver *Solver) openDeviceSession(ctx context.Context, setup setupState, r
 			if session != nil {
 				session.Close()
 			}
-			return nil, nil, errors.New("device runtime opener returned an incomplete lease")
+			return nil, nil, errors.New("device runtime opener returned an incomplete session")
 		}
 		return session, release, nil
-	}
-	if solver.options.LeaseDevice != nil {
-		return solver.options.LeaseDevice(ctx, setup.deviceKey, setup.deviceClient)
 	}
 	session, err := setup.deviceClient.Open(ctx)
 	if err != nil {

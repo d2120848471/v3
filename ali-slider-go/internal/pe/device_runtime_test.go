@@ -769,32 +769,6 @@ func TestOpenDeviceAndCompletionFailureBoundaries(t *testing.T) {
 	}
 }
 
-func TestDeviceExecutionGateCapacityAndCancellation(t *testing.T) {
-	if got := cap(NewKeyResolverWithCapacity("fixture", 10).deviceSlots); got != maxV8DeviceActive {
-		t.Fatalf("large resolver device capacity=%d, want %d", got, maxV8DeviceActive)
-	}
-	if got := cap(NewKeyResolverWithCapacity("fixture", 2).deviceSlots); got != 2 {
-		t.Fatalf("small resolver device capacity=%d, want 2", got)
-	}
-
-	slots := make(chan struct{}, 1)
-	release, err := acquireDeviceExecutionSlot(context.Background(), slots)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if _, err := acquireDeviceExecutionSlot(ctx, slots); !errors.Is(err, context.Canceled) {
-		t.Fatalf("full gate cancellation=%v", err)
-	}
-	release()
-	releaseAgain, err := acquireDeviceExecutionSlot(context.Background(), slots)
-	if err != nil {
-		t.Fatal(err)
-	}
-	releaseAgain()
-}
-
 func TestDeviceRuntimeSessionProfileIsCloned(t *testing.T) {
 	session := &DeviceRuntimeSession{profile: device.Profile{
 		ProfileID: "slot-profile", Languages: []string{"zh-CN"},

@@ -12,16 +12,12 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/d2120848471/v3/ali-slider-go/internal/config"
 )
 
 type onlineAcceptanceSummary struct {
 	Attempts               int              `json:"attempts"`
 	Concurrency            int              `json:"concurrency"`
 	ClientMaxConcurrency   int              `json:"clientMaxConcurrency"`
-	DevicePrewarmCapacity  int              `json:"devicePrewarmCapacity"`
-	DeviceSessionReserve   int              `json:"deviceSessionReserve"`
 	Success                int              `json:"success"`
 	BusinessFailure        int              `json:"businessFailure"`
 	ErrorsByKind           map[string]int   `json:"errorsByKind"`
@@ -70,15 +66,7 @@ func TestOnlineAcceptance(t *testing.T) {
 	if attempts == 200 && concurrency != 32 {
 		t.Fatalf("formal 200-attempt acceptance requires concurrency=32")
 	}
-	prewarm := acceptanceInteger(t, "ALI_SLIDER_ONLINE_PREWARM", min(concurrency, config.MaxDevicePrewarmCapacity))
-	reserve := acceptanceInteger(t, "ALI_SLIDER_ONLINE_DEVICE_RESERVE", 0)
-	if prewarm < 0 || prewarm > min(concurrency, config.MaxDevicePrewarmCapacity) {
-		t.Fatalf("ALI_SLIDER_ONLINE_PREWARM must be within 0..min(concurrency,%d)", config.MaxDevicePrewarmCapacity)
-	}
-	if reserve < 0 || reserve > config.MaxDeviceSessionReserve || prewarm == 0 && reserve != 0 || prewarm+reserve > config.MaxDevicePrewarmCapacity {
-		t.Fatalf("ALI_SLIDER_ONLINE_DEVICE_RESERVE must be valid and total live capacity must not exceed %d", config.MaxDevicePrewarmCapacity)
-	}
-	clientMaxConcurrency := max(concurrency, prewarm)
+	clientMaxConcurrency := concurrency
 	artifactDirectory := os.Getenv("ALI_SLIDER_ONLINE_ARTIFACT_DIR")
 	if artifactDirectory == "" {
 		t.Fatal("ALI_SLIDER_ONLINE_ARTIFACT_DIR is required")
@@ -86,8 +74,6 @@ func TestOnlineAcceptance(t *testing.T) {
 
 	options := DefaultClientOptions()
 	options.MaxConcurrency = clientMaxConcurrency
-	options.DevicePrewarmCapacity = prewarm
-	options.DeviceSessionReserve = reserve
 	options.ArtifactDir = artifactDirectory
 	if libraryPath := os.Getenv("ALI_SLIDER_V8_LIBRARY"); libraryPath != "" {
 		options.V8RuntimeLibrary = libraryPath
@@ -103,16 +89,6 @@ func TestOnlineAcceptance(t *testing.T) {
 		t.Fatal("create online Client failed")
 	}
 	defer client.Close()
-	primeContext, cancelPrime := context.WithTimeout(context.Background(), options.Timeout)
-	err = client.Prime(primeContext)
-	cancelPrime()
-	if err != nil {
-		var domainError *Error
-		if errors.As(err, &domainError) && domainError.Cause != nil {
-			t.Fatalf("device prewarm failed before challenge dispatch: kind=%s cause=%v", domainError.Kind, domainError.Cause)
-		}
-		t.Fatal("device prewarm failed before challenge dispatch")
-	}
 
 	type attemptResult struct {
 		index      int
@@ -173,8 +149,8 @@ func TestOnlineAcceptance(t *testing.T) {
 
 	summary := onlineAcceptanceSummary{
 		Attempts: attempts, Concurrency: concurrency,
-		ClientMaxConcurrency: clientMaxConcurrency, DevicePrewarmCapacity: prewarm, DeviceSessionReserve: reserve,
-		ErrorsByKind: make(map[string]int), ErrorsByStage: make(map[string]int), BusinessCodes: make(map[string]int),
+		ClientMaxConcurrency: clientMaxConcurrency,
+		ErrorsByKind:         make(map[string]int), ErrorsByStage: make(map[string]int), BusinessCodes: make(map[string]int),
 		TimingSamples: make(map[string]int), TimingMeanMS: make(map[string]int64), TimingP95MS: make(map[string]int64),
 		SecondHalfTimingMeanMS: make(map[string]int64),
 		UniqueVerifyRule:       "one Solve, one RPCClient, one issued CertifyId, at most one Verify attempt",

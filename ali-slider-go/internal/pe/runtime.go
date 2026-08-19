@@ -57,7 +57,7 @@ type RuntimeInput struct {
 	InitBeginTimeMS int64
 	FirstTouchAgeMS int
 	// SDKSource 是本轮 Device VM 实际使用的公开 SDK 快照；不进入 JSON，
-	// 只用于避免预热会话跨缓存刷新点时混用不同 SDK。
+	// 避免同一轮在缓存刷新边界前后混用不同版本的 SDK。
 	SDKSource []byte
 }
 

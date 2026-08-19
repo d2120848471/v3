@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +23,20 @@ const (
 	testDynamicPath = "3.29.0/pe.058.77d5c01b1737016e"
 	testArgumentKey = "dmmlums5zuewlgt7"
 )
+
+func TestNewKeyResolverCapacityOnlyLimitsPEIdleRuntimes(t *testing.T) {
+	resolver := NewKeyResolverWithCapacity("fixture", 10)
+	if resolver.v8PELimit != 10 {
+		t.Fatalf("PE idle capacity=%d, want 10", resolver.v8PELimit)
+	}
+
+	resolverType := reflect.TypeOf(resolver).Elem()
+	for _, fieldName := range []string{"deviceExecutionSlots", "liveDeviceSessions"} {
+		if _, exists := resolverType.FieldByName(fieldName); exists {
+			t.Fatalf("KeyResolver still contains local execution gate %q", fieldName)
+		}
+	}
+}
 
 type scriptTransport struct {
 	mu    sync.Mutex

@@ -17,10 +17,12 @@ import (
 )
 
 const (
-	DefaultSceneID           = "1ug4aptr"
-	DefaultPrefix            = "fsgtmi"
-	MaxDevicePrewarmCapacity = 4
-	MaxDeviceSessionReserve  = 4
+	DefaultSceneID = "1ug4aptr"
+	DefaultPrefix  = "fsgtmi"
+	// 预热/复用已从生产路径移除。旧参数仍接受 0，便于现有
+	// 启动脚本平滑升级；非 0 值明确拒绝，不会静默重新启用会话池。
+	MaxDevicePrewarmCapacity = 0
+	MaxDeviceSessionReserve  = 0
 )
 
 // Config 只包含部署和算法边界；逐轮 SceneId、prefix、AaduaneId、proxy 不在此共享。
@@ -64,7 +66,7 @@ func Defaults() Config {
 		ArtifactRetention:     7 * 24 * time.Hour,
 		AssetMaxBytes:         8 << 20,
 		AssetMaxDimension:     16_384,
-		DevicePrewarmCapacity: 4,
+		DevicePrewarmCapacity: 0,
 		DeviceSessionReserve:  0,
 		V8RuntimeLibrary:      v8runtime.DefaultLibraryPath(),
 	}
@@ -76,7 +78,6 @@ func Parse(args []string, getenv func(string) string) (Config, error) {
 		getenv = os.Getenv
 	}
 	cfg := Defaults()
-	prewarmConfigured := strings.TrimSpace(getenv("ALI_SLIDER_DEVICE_PREWARM")) != ""
 	var err error
 	if cfg.Host, err = envString(getenv, "ALI_SLIDER_HOST", cfg.Host); err != nil {
 		return Config{}, err
@@ -149,22 +150,14 @@ func Parse(args []string, getenv func(string) string) (Config, error) {
 	set.DurationVar(&cfg.ArtifactRetention, "artifact-retention", cfg.ArtifactRetention, "失败样本保留时长")
 	set.Int64Var(&cfg.AssetMaxBytes, "asset-max-bytes", cfg.AssetMaxBytes, "单张图片最大字节数")
 	set.IntVar(&cfg.AssetMaxDimension, "asset-max-dimension", cfg.AssetMaxDimension, "图片最大边长")
-	set.IntVar(&cfg.DevicePrewarmCapacity, "device-prewarm", cfg.DevicePrewarmCapacity, "设备会话预热容量")
-	set.IntVar(&cfg.DeviceSessionReserve, "device-reserve", cfg.DeviceSessionReserve, "租出期设备会话备用容量")
+	set.IntVar(&cfg.DevicePrewarmCapacity, "device-prewarm", cfg.DevicePrewarmCapacity, "兼容参数，必须为 0（预热已移除）")
+	set.IntVar(&cfg.DeviceSessionReserve, "device-reserve", cfg.DeviceSessionReserve, "兼容参数，必须为 0（会话复用已移除）")
 	set.StringVar(&cfg.V8RuntimeLibrary, "v8-library", cfg.V8RuntimeLibrary, "设备与动态 PE 使用的内嵌 V8 动态库")
 	if err := set.Parse(args); err != nil {
 		return Config{}, err
 	}
 	if set.NArg() != 0 {
 		return Config{}, fmt.Errorf("unexpected arguments: %s", strings.Join(set.Args(), " "))
-	}
-	set.Visit(func(flagValue *flag.Flag) {
-		if flagValue.Name == "device-prewarm" {
-			prewarmConfigured = true
-		}
-	})
-	if !prewarmConfigured && cfg.DevicePrewarmCapacity > cfg.MaxConcurrency {
-		cfg.DevicePrewarmCapacity = cfg.MaxConcurrency
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -207,17 +200,8 @@ func (c Config) Validate() error {
 	if c.AssetMaxBytes < 1 || c.AssetMaxBytes > 64<<20 || c.AssetMaxDimension < 1 || c.AssetMaxDimension > 16_384 {
 		return errors.New("invalid asset limits")
 	}
-	if c.DevicePrewarmCapacity < 0 || c.DevicePrewarmCapacity > min(c.MaxConcurrency, MaxDevicePrewarmCapacity) {
-		return fmt.Errorf("device prewarm must be within 0..min(max-concurrency,%d)", MaxDevicePrewarmCapacity)
-	}
-	if c.DeviceSessionReserve < 0 || c.DeviceSessionReserve > MaxDeviceSessionReserve {
-		return fmt.Errorf("device reserve must be within 0..%d", MaxDeviceSessionReserve)
-	}
-	if c.DevicePrewarmCapacity == 0 && c.DeviceSessionReserve != 0 {
-		return errors.New("device reserve requires a non-zero device prewarm capacity")
-	}
-	if c.DevicePrewarmCapacity+c.DeviceSessionReserve > MaxDevicePrewarmCapacity {
-		return fmt.Errorf("device prewarm plus reserve must not exceed %d", MaxDevicePrewarmCapacity)
+	if c.DevicePrewarmCapacity != 0 || c.DeviceSessionReserve != 0 {
+		return errors.New("device prewarm and reserve have been removed; both must be 0")
 	}
 	if c.V8RuntimeLibrary == "" || len(c.V8RuntimeLibrary) > 4_096 || strings.ContainsRune(c.V8RuntimeLibrary, 0) || !utf8.ValidString(c.V8RuntimeLibrary) {
 		return errors.New("V8 runtime library path must contain 1..4096 valid UTF-8 bytes")

@@ -1,6 +1,6 @@
 # 测试与质量门禁
 
-> **当前结论**：生产运行时已从Node子进程迁到同进程V8 `149.4.0`。Device使用动态V8；PE按精确 `StaticPath`先做当前V8/纯Go完整差分，兼容才开启纯Go快路，其余保留V8 fallback。Linux AMD64/ARM64已通过Rust wrapper和Go→V8 ABI测试；Windows AMD64 DLL已交叉构建。最终安全候选真实50次为 `47/50`、mean `2562ms`、P50 `2157ms`、P95 `4910ms`，分类错误0；成功率不低于基线，但mean约1秒未通过。
+> **当前结论**：生产运行时已从Node子进程迁到同进程V8 `149.4.0`。Device使用动态V8；PE按精确 `StaticPath`先做当前V8/纯Go完整差分，兼容才开启纯Go快路，其余保留V8 fallback。Linux AMD64/ARM64已通过Rust wrapper和Go→V8 ABI测试；Windows AMD64 DLL已交叉构建。2026-08-09历史预热池候选真实50次为 `47/50`、mean `2562ms`、P50 `2157ms`、P95 `4910ms`；该数据不能代表当前逐请求冷建路径。冷建在线探针已通过build-tag编译，尚未连接真实上游执行。
 
 ## 测试原则
 
@@ -18,11 +18,11 @@
 |---|---|---|---|---|
 | L0 单元 | 编码、加密、配置、设备、动态 PE/runtime、脚本缓存、视觉、轨迹和边界分支 | 各包 `*_test.go` | 禁止真实外网；V8 host 网络用替身，Node 仅在可选历史 oracle/上下文差异测试中出现 | 通过 |
 | L1 跨语言 oracle | 锁定 Python 与 Go 的协议和困难视觉语义 | `protocol/testdata`、`vision/testdata`、PE oracle | 静态 fixture | 通过 |
-| L2 组件集成 | 验证设备 RPC schema、Captcha RPC、代理、下载、预热池及清理 | `internal/device`、`internal/challenge`、`internal/artifact` | Fake `RoundTripper` | 通过 |
+| L2 组件集成 | 验证设备 RPC schema、Captcha RPC、代理、下载及资源清理 | `internal/device`、`internal/challenge`、`internal/artifact` | Fake `RoundTripper` | 通过 |
 | L3 完整离线链 | 验证 Device → Init → 类型自动分流；Puzzle 进入 PE/Assets/Vision/Complete/Verify，TRACELESS/SLIDING 进入 SDK completion/Verify | `solver_test.go`、`device_runtime_test.go`、`sdk_device_bridge_test.go` | 单一 Mock transport / fake PE runtime / Node bridge fixture | 通过 |
 | L4 服务合同 | HTTP 四路径、POST JSON + deprecated GET query、内嵌页/CSP、别名/空值/参数源、状态码、OpenAPI、64 并发直通、无本地主动 429、日志脱敏、启动配置 | `server_test.go`、`cmd/server/main_test.go` | Mock Solver/占用端口 | 通过 |
 | L5 工程门禁 | fmt、vet、test、race、coverage、staticcheck、govulncheck、V8 native/ABI 测试与便携包 | `Makefile`、Docker BuildKit、CI | Linux AMD64/ARM64 实际 V8 `.so`；Windows AMD64 原生 DLL；工具/依赖获取可联网 | 本地候选已验证；发布 commit 由 CI 重跑 |
-| L6 授权在线 | 生产 V8 Device、精确 PE 差分探针；受控挑战 acceptance | `v8_runtime_online_test.go`、`online_acceptance_test.go`、其他 `online` build tag 测试 | 双重显式开关/授权；普通 CI 永不执行 | 当前V8/纯Go差分为0；最终50次 `47/50`、mean `2562ms`；4-slot/10-job组件通过 |
+| L6 授权在线 | 生产 V8 Device、精确 PE 差分探针；受控挑战 acceptance | `v8_runtime_online_test.go`、`online_acceptance_test.go`、其他 `online` build tag 测试 | 双重显式开关/授权；普通 CI 永不执行 | PE差分历史已验证；旧预热池候选为 `47/50`；当前冷建探针仅编译通过，待授权重跑 |
 
 ## Go 版本与快速验证
 
@@ -130,30 +130,30 @@ Device RPC 的 `ResultObject` 在真实服务上并非所有 action 都使用同
 
 独立在线探针只执行 Device Log1/2/3，不调用 Captcha Init/Verify。它同时要求 `online` build tag 和显式环境开关，普通 test/CI 不会访问真实目标。当前授权探针通过，action 数为 3、指纹字段数为 111，墙钟约 `0.53s`。该结果只证明设备初始化链，不代表完整验证码成功率。
 
-## 动态 PE 与持久 V8 Device Isolate 组件探针
+## 动态 PE 与 V8 Device Isolate 组件探针
 
-生产探针直接构造 `NewKeyResolver(libraryPath)`，请求公开 SDK/Device/PE，验证同一外层 V8 Device Isolate 两轮 recycle 后 context/session/token 仍独立，并在单独禁网 PE context 中强制 V8 输出、再与纯 Go 逐字段差分。它使用 dummy `CertifyId` 和静态图片名，不创建 Captcha Init/Verify：
+该在线探针直接构造 `NewKeyResolver(libraryPath)`，请求公开 SDK/Device/PE，验证独立 Device round 的 context/session/token 隔离，并在单独禁网 PE context 中强制 V8 输出、再与纯 Go 逐字段差分。它使用 dummy `CertifyId` 和静态图片名，不创建 Captcha Init/Verify：
 
 ```bash
 ALI_SLIDER_V8_DEVICE_ONLINE=1 \
 ALI_SLIDER_V8_TEST_LIBRARY=/absolute/path/libali_slider_v8_runtime.so \
 CGO_ENABLED=0 go test -count=1 -tags online \
-  -run '^TestOnlineV8DeviceRuntime$' -v ./internal/pe
+  -run '^TestOnlineV8DeviceRuntimeColdRounds$' -v ./internal/pe
 ```
 
-Linux AMD64 最终 Debian/glibc 包中已验证：`tokenLength=1616`、`dataLength=1164`、Complete 后 142 个指纹字段、4 个请求，测试用时 `2.78s`。这只证明生产 V8 Device/PE 组件合同，不是验证码成功率。
+Linux AMD64 曾在旧回收型探针中验证：`tokenLength=1616`、`dataLength=1164`、Complete 后 142 个指纹字段、4 个请求，测试用时 `2.78s`。当前探针已经改为两轮各自独立 Open/Complete/Close，但改写后尚未重新在线执行；旧数字不能作为当前冷建路径验收。
 
-并发组件探针按默认直连生产模型创建最多4个独立画像池slot，以Complete→Recycle接力服务10个job；同样不创建Captcha Init/Verify：
+并发组件探针按 `ALI_SLIDER_V8_DEVICE_CONCURRENCY` 启动独立 cold job，每个 job 都立即独立 Open→Complete→Close；同样不创建 Captcha Init/Verify：
 
 ```bash
 ALI_SLIDER_V8_DEVICE_CONCURRENT_ONLINE=1 \
 ALI_SLIDER_V8_DEVICE_CONCURRENCY=10 \
 ALI_SLIDER_V8_TEST_LIBRARY=/absolute/path/libali_slider_v8_runtime.so \
 CGO_ENABLED=0 go test -count=1 -tags online \
-  -run '^TestOnlineV8DeviceRuntimeConcurrentPrime$' -v ./internal/pe
+  -run '^TestOnlineV8DeviceRuntimeConcurrentColdFlows$' -v ./internal/pe
 ```
 
-Linux AMD64实测10/10满足142字段、4请求合同，组件wall为9.27s。前置默认直连A/B已证明5个同时存活的Device VM出现138字段，10-live还会触发request sequence错误；因此该测试锁定4槽池模型，不提供提高预热库存上限的开关。
+Linux AMD64旧回收型探针历史实测10/10满足142字段、4请求合同，组件wall为9.27s。前置A/B曾观察到5个同时存活的Device VM出现138字段，10-live还会触发request sequence错误。当前实现不再预热、库存化或回收复用，也不设live并发保护；这些历史异常因此是当前无界冷建路径的已知风险。改写后的并发冷建探针只完成编译，尚未重新在线执行，不能据此声称高并发在线正确。
 
 `keys_online_test.go` 和 `device_runtime_online_test.go` 仍保留旧 Node 路径，仅用于人工回归 oracle，不由生产构造器、普通测试或发布包调用。普通 test/CI 不设置任何 online 开关，因此不会访问 CDN/Device。
 
@@ -175,12 +175,14 @@ go test -count=1 -v ./internal/challenge \
 
 这证明的是确定性 Mock 链路和状态机，不是第三方真实服务成功率。
 
-## 并发、预热池与 HTTP
+## 并发、逐轮冷建与 HTTP
 
 ```bash
 go test -count=1 -race ./...
 go test -count=1 -v ./internal/challenge \
-  -run 'DeviceSessionPool|Solver'
+  -run 'Solver'
+go test -count=1 -v ./internal/pe \
+  -run 'DeviceRuntimeClose|OpenDevice'
 go test -count=1 -v ./internal/server
 ```
 
@@ -189,8 +191,8 @@ go test -count=1 -v ./internal/server
 - 视觉 16 路并发结果完全一致。
 - 完整 Solver 的 32 路并发 Mock 正确性测试通过；热构建缓存下五次包测试用时 `0.166–0.193s`、maxRSS `155.2–177.6MiB`。
 - 最终源码的 `200×32=6,400` 次完整离线 Solve 以 package `31.996s`、命令 wall `32.27s`、maxRSS `242.2MiB` 通过。这仅是含 Go 驱动进程的短时筛查，不是生产内存预算或长稳证明。
-- 设备预热池的 `ready + pending + leased` 不超过配置容量，key 不同则冷建，不跨代理或画像复用。
-- 池处理过期、取消、失败、异步补货、并发 Lease/Close 和幂等 release。
+- 连续两轮完整 Solver 都独立执行 `Log1,Log2,Log3,Log2`、Init 和唯一 Verify，不会命中上一轮 Device 会话。
+- `OpenDevice` 失败、context 取消与重复 `Close` 都能完成独立会话清理；实现中没有live额度或等待槽。
 - `TestConcurrentRequestsAlwaysEnterSolver` 同时发出 64 个合法 HTTP 请求，在 Mock Solver 阻塞期间确认 `64/64` 均已进入；释放后全部返回 HTTP 200，且没有 `Retry-After`。
 - `TestEmbeddedAPITestPage` / `TestEmbeddedAPITestPageNonceFailure` 验证 `GET /` 返回内嵌 HTML 且不调用 Solver；POST/HEAD 根路径仍为 404；连续响应使用不同 128-bit nonce，CSP 无 unsafe 指令，页面无外链、浏览器持久化或危险 DOM API；随机源失败时返回脱敏 500 且零 Solver。
 - `TestLegacyGETQueryCompatibility` 锁定 GET query `64 KiB` 边界下的旧别名、同名参数最后值、canonical 压过 alias、空 canonical 抑制 alias 并回落默认值，以及未知字段忽略。
@@ -202,9 +204,9 @@ go test -count=1 -v ./internal/server
 - JSON/query/字段校验失败不调用 Client；每个合法 Solve 请求都进入 Solver，业务失败仍返回 HTTP `200`。
 - 外层反向代理、负载均衡或 API 网关可能在请求到达进程前返回 429；第三方上游也可能在 Solve 内返回 429。两者必须分开归因，不能写成本服务的本地 admission 429。
 - Solver error/panic、普通日志和 artifact 均不泄漏 token、`CertifyId`、代理凭据或原始正文。
-- `slider.Client.Close` 等待活跃 Solve/Prime/Purge，再关闭预热会话和空闲连接。
+- `slider.Client.Close` 等待活跃 Solve/Prime/Purge，再关闭 V8 runtime、公开 SDK/PE 缓存和空闲连接；`Prime` 仅为兼容空操作。
 
-64并发测试是服务合同回归，不是生产容量证明。Handler不设置HTTP在途硬上限；`MaxConcurrency`只限制每route/host连接与PE资源，默认直连Device池满4槽会让更多Solve等待而非返回429。生产来流超过下游消化速度时，goroutine、等待中的Solve、内存和超时仍可增长，详见[性能测试与容量口径](./performance.md#mock-solverhttp-分层容量方法)。
+64并发测试是服务合同回归，不是生产容量证明。Handler和Device/V8都不设置本地并发硬上限；`MaxConcurrency`只限制每route/host连接与PE资源。每个合法Solve立即冷建独立Device/V8，不在 `deviceSession` 等待本地槽，也不会因本地在途数返回429。生产来流超过下游消化速度时，goroutine、live V8、内存、线程和超时都可增长，详见[性能测试与容量口径](./performance.md#mock-solverhttp-分层容量方法)。
 
 ## Linux 双架构构建
 
@@ -248,7 +250,7 @@ PR 执行完整 Windows 验证但不上传。`main` push 和 `workflow_dispatch`
 
 ## Docker 功能冒烟
 
-Docker 镜像使用 Go `1.26.5` 构建层、Rust `1.88.0` V8 构建层、Debian bookworm-slim 运行层和非 root UID/GID `65532`。HTTP 服务在 ready 前加载 `.so`、校验 C ABI 并初始化 V8/ICU；以下 smoke 关闭设备预热，不会访问外部 Device/PE：
+Docker 镜像使用 Go `1.26.5` 构建层、Rust `1.88.0` V8 构建层、Debian bookworm-slim 运行层和非 root UID/GID `65532`。HTTP 服务在 ready 前加载 `.so`、校验 C ABI 并初始化 V8/ICU；启动过程本身不会访问外部 Device/PE。以下仍显式传 `0`，用于验证旧脚本的兼容参数：
 
 ```bash
 docker build --platform linux/amd64 -t ali-slider-go:test .
@@ -379,9 +381,9 @@ env \
 | `.github/workflows/ali-slider-go-ci.yml` · `quality` / `race` / `linux-runtime` / `windows-package` | Linux AMD64/ARM64 用真实 `.so`，Windows 用真实 DLL；只有平台 native/ABI/test/smoke 通过才上传产物。 | PR/push → cross-platform Go/Rust/V8 gates → verified artifacts |
 | `internal/protocol/protocol_test.go:47`、`:125`、`:211` | 协议关键输出由静态 Python oracle 锁定。 | Python fixture → Go primitives → equality |
 | `internal/vision/solver_test.go:17` | edge-decoy 正负 fixture 已通过跨语言静态对照。 | PNG fixture → Go vision → accept/reject assertion |
-| `internal/pe/builder_test.go`、`keys_test.go`、`runtime_test.go`、`v8_runtime_test.go`、`device_runtime_test.go` | PE 保留 Python oracle；SDK 5 分钟软 TTL、PE 30 分钟硬 TTL、分片 singleflight、V8/纯 Go 差分、路径/下载边界、Device recycle 和关闭生命周期均由测试锁定。 | profile + exact StaticPath + current V8 oracle → verified pure-Go or V8 fallback → independently checked output |
+| `internal/pe/builder_test.go`、`keys_test.go`、`runtime_test.go`、`v8_runtime_test.go`、`device_runtime_test.go` | PE 保留 Python oracle；SDK 5 分钟软 TTL、PE 30 分钟硬 TTL、分片 singleflight、V8/纯 Go 差分、路径/下载边界、Device独立冷建与幂等关闭均由测试锁定；没有Device live槽。 | profile + exact StaticPath + current V8 oracle → verified pure-Go or V8 fallback → independently checked output |
 | `internal/challenge/solver_test.go` · `TestSolverOfflineCompleteSuccess` / `TestSolverUsesResolvedDynamicPEKey` / `TestSolverClassifiesPEKeyFailuresBeforeAssetsAndVerify` | 完整离线链覆盖动态 runtime 注入、稳定错误分类和 Verify 前停止。 | Device → Init → PE profile → Vision/native PE → guarded Verify |
-| `internal/challenge/device_pool_test.go:138`、`:177`、`:930` | 预热池覆盖有界并行、key 隔离及 Lease/Close 竞态。 | Prime/Lease → bounded ownership → Close |
+| `internal/challenge/solver_test.go` · `TestSolverColdDeviceFlowRunsEveryRound` | 连续两轮各自执行完整 Device、Init 和 Verify，没有会话命中或跨轮复用。 | round 1 cold open/complete/close → round 2 cold open/complete/close |
 | `internal/server/server.go` · `checkSolveOrigin` / `decodeQueryRequest` / `handleSolve`；`internal/server/server_test.go` · `TestLegacyGETQueryCompatibility` / `TestLegacyGETQueryValidationNeverCallsSolver` / `TestSolveParameterSourcesStaySeparated` / `TestConcurrentRequestsAlwaysEnterSolver` / `TestBrowserOriginBoundaryPreservesLegacyClients`；`cmd/server/main_test.go` · `TestHeaderBudgetAcceptsMaximumLegacyQuery` | POST JSON 与 deprecated GET query 的输入、分源、HTTP header 预算和跨源合同有回归；HTTP 无本地 admission，64 个合法并发 POST 全部进入 Solver。 | origin + JSON/query gate → every valid Solve entered → release → 200 |
 | `internal/server/testpage.go`；`internal/server/server_test.go` · `TestEmbeddedAPITestPage` | 页面嵌入二进制，GET 不调用 Solver，nonce/安全头/无外链和无持久化合同均有离线回归。 | embedded source → GET `/` → constrained browser page |
 | `internal/server/openapi.go` · `legacyQueryParameters` / `solveResponses`；`internal/server/server_test.go` · `TestOnlyFrozenRoutesAreExposed` | OpenAPI 描述四路径和 Solve POST/deprecated GET；两种方法只声明 200/400/403/500，且回归禁止 429、`Retry-After` 和旧本地过载字段。 | generated contract → positive/negative assertions → stable surface |

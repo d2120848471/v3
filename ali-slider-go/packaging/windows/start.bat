@@ -23,7 +23,7 @@ echo 默认 API 测试页：http://127.0.0.1:8000/
 echo 默认本机 API：http://127.0.0.1:8000/api/slider
 echo 默认健康检查：http://127.0.0.1:8000/health
 echo 如追加了 flag，请以启动日志中的实际监听地址为准。
-echo 默认启动会预热设备会话，请等待 status=ready 日志。
+echo 启动不会访问 Device RPC；出现 status=ready 后，每次求解再独立创建完整会话。
 echo 在本窗口按 Ctrl+C 可停止服务。
 echo.
 

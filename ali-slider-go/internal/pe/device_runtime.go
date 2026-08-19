@@ -165,18 +165,16 @@ func (result SlidingResult) Succeeded() bool {
 type DeviceRuntimeSession struct {
 	mu sync.Mutex
 
-	command     *exec.Cmd
-	stdin       io.WriteCloser
-	stdout      *bufio.Reader
-	waitDone    chan struct{}
-	waitErr     error
-	stderr      *cappedWriter
-	tempDir     string
-	relay       *connectRelay
-	v8Engine    *v8runtime.Runtime
-	v8Open      []byte
-	profile     device.Profile
-	deviceSlots chan struct{}
+	command  *exec.Cmd
+	stdin    io.WriteCloser
+	stdout   *bufio.Reader
+	waitDone chan struct{}
+	waitErr  error
+	stderr   *cappedWriter
+	tempDir  string
+	relay    *connectRelay
+	v8Engine *v8runtime.Runtime
+	profile  device.Profile
 
 	options       DeviceRuntimeOptions
 	sdkSource     []byte
@@ -192,7 +190,7 @@ type DeviceRuntimeSession struct {
 	closed        bool
 }
 
-// DeviceProfile 返回该 V8 Device 槽位实际绑定的画像。
+// DeviceProfile 返回该 V8 Device 本轮会话实际绑定的画像。
 func (session *DeviceRuntimeSession) DeviceProfile() device.Profile {
 	if session == nil {
 		return device.Profile{}
@@ -215,12 +213,6 @@ func (resolver *KeyResolver) OpenDevice(ctx context.Context, transport http.Roun
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	releaseDeviceSlot, err := acquireDeviceExecutionSlot(ctx, resolver.deviceSlots)
-	if err != nil {
-		return nil, err
-	}
-	defer releaseDeviceSlot()
-
 	sdkSource, err := resolver.sdkSource(ctx, transport, profile, resolver.now())
 	if err != nil {
 		return nil, err
@@ -301,7 +293,7 @@ func (resolver *KeyResolver) OpenDevice(ctx context.Context, transport http.Roun
 	session := &DeviceRuntimeSession{
 		command: command, stdin: stdin, stdout: bufio.NewReaderSize(stdoutPipe, 32<<10),
 		waitDone: make(chan struct{}), stderr: stderr, tempDir: runtimeDirectory, relay: relay, options: options,
-		sdkSource: bytes.Clone(sdkSource), profile: profile.Clone(), deviceSlots: resolver.deviceSlots,
+		sdkSource: bytes.Clone(sdkSource), profile: profile.Clone(),
 	}
 	cleanupDirectory = false
 	go func() {
@@ -716,7 +708,7 @@ func (session *DeviceRuntimeSession) PEVerifyArgProfile() (string, string, error
 }
 
 // PESDKSource 返回创建本轮 Device VM 时使用的公开 SDK 快照。动态 PE 必须
-// 使用同一快照，避免预热会话恰好跨过五分钟刷新边界时混用两个 SDK 版本。
+// 使用同一快照，避免本轮处理恰好跨过五分钟刷新边界时混用两个 SDK 版本。
 func (session *DeviceRuntimeSession) PESDKSource() ([]byte, error) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
@@ -777,11 +769,6 @@ func (session *DeviceRuntimeSession) Complete(ctx context.Context, getterArgumen
 	}
 	session.completed = true
 	session.mu.Unlock()
-	releaseDeviceSlot, err := acquireDeviceExecutionSlot(ctx, session.deviceSlots)
-	if err != nil {
-		return device.Result{}, err
-	}
-	defer releaseDeviceSlot()
 	if engine != nil {
 		return session.completeV8Device(ctx, engine, payload, len(events))
 	}
@@ -844,11 +831,6 @@ func (session *DeviceRuntimeSession) SolveTraceless(ctx context.Context, input T
 	}
 	session.completed = true
 	session.mu.Unlock()
-	releaseDeviceSlot, err := acquireDeviceExecutionSlot(ctx, session.deviceSlots)
-	if err != nil {
-		return TracelessResult{}, err
-	}
-	defer releaseDeviceSlot()
 	if engine != nil {
 		return session.completeV8Traceless(ctx, engine, payload, input)
 	}
@@ -912,11 +894,6 @@ func (session *DeviceRuntimeSession) SolveSliding(ctx context.Context, input Sli
 	}
 	session.completed = true
 	session.mu.Unlock()
-	releaseDeviceSlot, err := acquireDeviceExecutionSlot(ctx, session.deviceSlots)
-	if err != nil {
-		return SlidingResult{}, err
-	}
-	defer releaseDeviceSlot()
 	if engine != nil {
 		return session.completeV8Sliding(ctx, engine, payload, input)
 	}
@@ -949,73 +926,6 @@ func (session *DeviceRuntimeSession) SolveSliding(ctx context.Context, input Sli
 		return SlidingResult{}, fmt.Errorf("%w: device bridge exit", ErrKeyRuntime)
 	}
 	return result, nil
-}
-
-// Recycle 在同一个已加载 bridge 的 V8 Isolate 内建立全新浏览器 context 和
-// Device session。它只复用宿主与编译结果，不复用上一轮 session/token/挑战态。
-func (session *DeviceRuntimeSession) Recycle(ctx context.Context) error {
-	if ctx == nil {
-		return errors.New("device runtime recycle context is nil")
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	session.mu.Lock()
-	if session.closed || !session.completed || session.v8Engine == nil || len(session.v8Open) == 0 {
-		session.mu.Unlock()
-		return errors.New("device runtime session is not recyclable")
-	}
-	engine := session.v8Engine
-	payload := bytes.Clone(session.v8Open)
-	session.mu.Unlock()
-	releaseDeviceSlot, err := acquireDeviceExecutionSlot(ctx, session.deviceSlots)
-	if err != nil {
-		return err
-	}
-	defer releaseDeviceSlot()
-
-	result, err := engine.Call(ctx, "__aliV8DeviceOpen", payload)
-	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		return fmt.Errorf("%w: recycle V8 Device: %v", ErrKeyRuntime, err)
-	}
-	var stage deviceBridgeStage
-	if err := decodeV8Result(result, &stage); err != nil {
-		return fmt.Errorf("%w: recycle V8 Device output", ErrKeyRuntime)
-	}
-
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	if session.closed || session.v8Engine != engine {
-		return errors.New("device runtime session closed during recycle")
-	}
-	session.secrets = protocol.FrontendSecrets{}
-	session.config = protocol.DeviceConfig{}
-	session.verifyProfile = deviceVerifyArgProfile{}
-	session.initToken = ""
-	session.initParsed = protocol.DeviceToken{}
-	session.initial = device.Result{}
-	session.firstTouchAge = 0
-	session.firstTouchSet = false
-	if err := session.acceptInitialStage(stage); err != nil {
-		return err
-	}
-	session.completed = false
-	return nil
-}
-
-func acquireDeviceExecutionSlot(ctx context.Context, slots chan struct{}) (func(), error) {
-	if slots == nil {
-		return func() {}, nil
-	}
-	select {
-	case slots <- struct{}{}:
-		return func() { <-slots }, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
 }
 
 func validateRuntimeInteractions(events []device.InteractionEvent) error {
@@ -1284,7 +1194,6 @@ func (session *DeviceRuntimeSession) Close() {
 	session.closed = true
 	engine := session.v8Engine
 	session.v8Engine = nil
-	session.v8Open = nil
 	stdin := session.stdin
 	session.stdin = nil
 	command := session.command
