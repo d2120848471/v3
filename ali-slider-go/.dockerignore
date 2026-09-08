@@ -8,3 +8,6 @@ coverage.html
 var/artifacts
 *.log
 native/v8runtime/target
+
+# Windows 便携包源文件不参与 Linux Docker 构建。
+build/packaging/windows

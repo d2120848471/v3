@@ -1,0 +1,633 @@
+{
+  "aliases": {
+    "Status": 200,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "VerifyCode": "T001",
+      "VerifyResult": true,
+      "certifyId": "fixture-certify",
+      "elapsedMs": 37,
+      "ok": true,
+      "proxied": true,
+      "sceneId": "场景",
+      "securityToken": "fixture-token",
+      "timingsMs": {
+        "total": 37,
+        "vision": 9
+      },
+      "traceId": "\u003cgenerated\u003e"
+    },
+    "Calls": 1,
+    "Request": {
+      "SceneID": "场景",
+      "Prefix": "pre1",
+      "RPCKeyID": "fixture-key",
+      "Proxy": "http://proxy.invalid:8080"
+    }
+  },
+  "array-body": {
+    "Status": 400,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "error": "请求体不是合法 JSON",
+      "errorType": "ApiRequestError",
+      "ok": false,
+      "traceId": "\u003cgenerated\u003e"
+    },
+    "Calls": 0,
+    "Request": {
+      "SceneID": "",
+      "Prefix": "",
+      "RPCKeyID": "",
+      "Proxy": ""
+    }
+  },
+  "bad-json-type": {
+    "Status": 400,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "error": "SceneId 必须是字符串",
+      "errorType": "ApiRequestError",
+      "ok": false,
+      "traceId": "\u003cgenerated\u003e"
+    },
+    "Calls": 0,
+    "Request": {
+      "SceneID": "",
+      "Prefix": "",
+      "RPCKeyID": "",
+      "Proxy": ""
+    }
+  },
+  "bad-prefix": {
+    "Status": 400,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "error": "prefix 只能是 ASCII 字母数字",
+      "errorType": "ApiRequestError",
+      "ok": false,
+      "traceId": "\u003cgenerated\u003e"
+    },
+    "Calls": 0,
+    "Request": {
+      "SceneID": "",
+      "Prefix": "",
+      "RPCKeyID": "",
+      "Proxy": ""
+    }
+  },
+  "bad-query": {
+    "Status": 400,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "error": "查询参数不是合法 URL encoding",
+      "errorType": "ApiRequestError",
+      "ok": false,
+      "traceId": "\u003cgenerated\u003e"
+    },
+    "Calls": 0,
+    "Request": {
+      "SceneID": "",
+      "Prefix": "",
+      "RPCKeyID": "",
+      "Proxy": ""
+    }
+  },
+  "body-over-query": {
+    "Status": 200,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "VerifyCode": "T001",
+      "VerifyResult": true,
+      "certifyId": "fixture-certify",
+      "elapsedMs": 37,
+      "ok": true,
+      "proxied": false,
+      "sceneId": "body",
+      "securityToken": "fixture-token",
+      "timingsMs": {
+        "total": 37,
+        "vision": 9
+      },
+      "traceId": "\u003cgenerated\u003e"
+    },
+    "Calls": 1,
+    "Request": {
+      "SceneID": "body",
+      "Prefix": "default1",
+      "RPCKeyID": "",
+      "Proxy": ""
+    }
+  },
+  "business-rejection": {
+    "Status": 200,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "VerifyCode": "F015",
+      "VerifyResult": false,
+      "certifyId": "fixture-certify",
+      "elapsedMs": 37,
+      "ok": false,
+      "proxied": false,
+      "sceneId": "default-scene",
+      "securityToken": "fixture-token",
+      "timingsMs": {
+        "total": 37,
+        "vision": 9
+      },
+      "traceId": "\u003cgenerated\u003e"
+    },
+    "Calls": 1,
+    "Request": {
+      "SceneID": "default-scene",
+      "Prefix": "default1",
+      "RPCKeyID": "",
+      "Proxy": ""
+    }
+  },
+  "cross-origin-get": {
+    "Status": 403,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "error": "不接受跨源浏览器请求",
+      "errorType": "ApiOriginError",
+      "ok": false,
+      "traceId": "\u003cgenerated\u003e"
+    },
+    "Calls": 0,
+    "Request": {
+      "SceneID": "",
+      "Prefix": "",
+      "RPCKeyID": "",
+      "Proxy": ""
+    }
+  },
+  "cross-origin-post": {
+    "Status": 403,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "error": "不接受跨源浏览器请求",
+      "errorType": "ApiOriginError",
+      "ok": false,
+      "traceId": "\u003cgenerated\u003e"
+    },
+    "Calls": 0,
+    "Request": {
+      "SceneID": "",
+      "Prefix": "",
+      "RPCKeyID": "",
+      "Proxy": ""
+    }
+  },
+  "empty": {
+    "Status": 200,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "VerifyCode": "T001",
+      "VerifyResult": true,
+      "certifyId": "fixture-certify",
+      "elapsedMs": 37,
+      "ok": true,
+      "proxied": false,
+      "sceneId": "default-scene",
+      "securityToken": "fixture-token",
+      "timingsMs": {
+        "total": 37,
+        "vision": 9
+      },
+      "traceId": "\u003cgenerated\u003e"
+    },
+    "Calls": 1,
+    "Request": {
+      "SceneID": "default-scene",
+      "Prefix": "default1",
+      "RPCKeyID": "",
+      "Proxy": ""
+    }
+  },
+  "health": {
+    "Status": 200,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "ok": true,
+      "status": "ready"
+    },
+    "Calls": 0,
+    "Request": {
+      "SceneID": "",
+      "Prefix": "",
+      "RPCKeyID": "",
+      "Proxy": ""
+    }
+  },
+  "invalid-error": {
+    "Status": 400,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "error": "参数无效",
+      "errorType": "InvalidRequest",
+      "ok": false,
+      "timingsMs": {},
+      "traceId": "\u003cgenerated\u003e"
+    },
+    "Calls": 1,
+    "Request": {
+      "SceneID": "default-scene",
+      "Prefix": "default1",
+      "RPCKeyID": "",
+      "Proxy": ""
+    }
+  },
+  "legacy": {
+    "Status": 200,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "VerifyCode": "T001",
+      "VerifyResult": true,
+      "certifyId": "fixture-certify",
+      "elapsedMs": 37,
+      "ok": true,
+      "proxied": true,
+      "sceneId": "last",
+      "securityToken": "fixture-token",
+      "timingsMs": {
+        "total": 37,
+        "vision": 9
+      },
+      "traceId": "\u003cgenerated\u003e"
+    },
+    "Calls": 1,
+    "Request": {
+      "SceneID": "last",
+      "Prefix": "default1",
+      "RPCKeyID": "",
+      "Proxy": "http://proxy.invalid:8080"
+    }
+  },
+  "legacy-utf8": {
+    "Status": 200,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "VerifyCode": "T001",
+      "VerifyResult": true,
+      "certifyId": "fixture-certify",
+      "elapsedMs": 37,
+      "ok": true,
+      "proxied": false,
+      "sceneId": "��",
+      "securityToken": "fixture-token",
+      "timingsMs": {
+        "total": 37,
+        "vision": 9
+      },
+      "traceId": "\u003cgenerated\u003e"
+    },
+    "Calls": 1,
+    "Request": {
+      "SceneID": "��",
+      "Prefix": "default1",
+      "RPCKeyID": "",
+      "Proxy": ""
+    }
+  },
+  "network-error": {
+    "Status": 500,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "error": "网络失败",
+      "errorType": "NetworkError",
+      "ok": false,
+      "timingsMs": {},
+      "traceId": "\u003cgenerated\u003e"
+    },
+    "Calls": 1,
+    "Request": {
+      "SceneID": "default-scene",
+      "Prefix": "default1",
+      "RPCKeyID": "",
+      "Proxy": ""
+    }
+  },
+  "null-body": {
+    "Status": 400,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "error": "请求体必须是 JSON object",
+      "errorType": "ApiRequestError",
+      "ok": false,
+      "traceId": "\u003cgenerated\u003e"
+    },
+    "Calls": 0,
+    "Request": {
+      "SceneID": "",
+      "Prefix": "",
+      "RPCKeyID": "",
+      "Proxy": ""
+    }
+  },
+  "object": {
+    "Status": 200,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "VerifyCode": "T001",
+      "VerifyResult": true,
+      "certifyId": "fixture-certify",
+      "elapsedMs": 37,
+      "ok": true,
+      "proxied": false,
+      "sceneId": "default-scene",
+      "securityToken": "fixture-token",
+      "timingsMs": {
+        "total": 37,
+        "vision": 9
+      },
+      "traceId": "\u003cgenerated\u003e"
+    },
+    "Calls": 1,
+    "Request": {
+      "SceneID": "default-scene",
+      "Prefix": "default1",
+      "RPCKeyID": "",
+      "Proxy": ""
+    }
+  },
+  "panic": {
+    "Status": 500,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "error": "未处理的协议运行错误",
+      "errorType": "UnhandledProtocolError",
+      "ok": false,
+      "timingsMs": {},
+      "traceId": "\u003cgenerated\u003e"
+    },
+    "Calls": 1,
+    "Request": {
+      "SceneID": "default-scene",
+      "Prefix": "default1",
+      "RPCKeyID": "",
+      "Proxy": ""
+    }
+  },
+  "primary-empty": {
+    "Status": 200,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "VerifyCode": "T001",
+      "VerifyResult": true,
+      "certifyId": "fixture-certify",
+      "elapsedMs": 37,
+      "ok": true,
+      "proxied": false,
+      "sceneId": "default-scene",
+      "securityToken": "fixture-token",
+      "timingsMs": {
+        "total": 37,
+        "vision": 9
+      },
+      "traceId": "\u003cgenerated\u003e"
+    },
+    "Calls": 1,
+    "Request": {
+      "SceneID": "default-scene",
+      "Prefix": "default1",
+      "RPCKeyID": "",
+      "Proxy": ""
+    }
+  },
+  "trailing-body": {
+    "Status": 400,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "error": "请求体只能包含一个 JSON object",
+      "errorType": "ApiRequestError",
+      "ok": false,
+      "traceId": "\u003cgenerated\u003e"
+    },
+    "Calls": 0,
+    "Request": {
+      "SceneID": "",
+      "Prefix": "",
+      "RPCKeyID": "",
+      "Proxy": ""
+    }
+  },
+  "unexpected-error": {
+    "Status": 500,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "error": "未处理的协议运行错误",
+      "errorType": "UnhandledProtocolError",
+      "ok": false,
+      "timingsMs": {},
+      "traceId": "\u003cgenerated\u003e"
+    },
+    "Calls": 1,
+    "Request": {
+      "SceneID": "default-scene",
+      "Prefix": "default1",
+      "RPCKeyID": "",
+      "Proxy": ""
+    }
+  },
+  "unknown-fields": {
+    "Status": 200,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "VerifyCode": "T001",
+      "VerifyResult": true,
+      "certifyId": "fixture-certify",
+      "elapsedMs": 37,
+      "ok": true,
+      "proxied": false,
+      "sceneId": "last",
+      "securityToken": "fixture-token",
+      "timingsMs": {
+        "total": 37,
+        "vision": 9
+      },
+      "traceId": "\u003cgenerated\u003e"
+    },
+    "Calls": 1,
+    "Request": {
+      "SceneID": "last",
+      "Prefix": "default1",
+      "RPCKeyID": "",
+      "Proxy": ""
+    }
+  },
+  "unknown-route": {
+    "Status": 404,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "error": "未知路径",
+      "ok": false
+    },
+    "Calls": 0,
+    "Request": {
+      "SceneID": "",
+      "Prefix": "",
+      "RPCKeyID": "",
+      "Proxy": ""
+    }
+  },
+  "wrong-method": {
+    "Status": 404,
+    "Headers": {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "Retry-After": "",
+      "X-Content-Type-Options": "nosniff"
+    },
+    "Body": {
+      "error": "未知路径",
+      "ok": false
+    },
+    "Calls": 0,
+    "Request": {
+      "SceneID": "",
+      "Prefix": "",
+      "RPCKeyID": "",
+      "Proxy": ""
+    }
+  }
+}

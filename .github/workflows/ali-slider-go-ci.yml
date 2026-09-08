@@ -70,7 +70,7 @@ jobs:
           go vet ./...
           staticcheck ./...
 
-      - name: Unit, integration and fuzz seeds
+      - name: Unit, integration, architecture and fuzz seeds
         env:
           GOPROXY: "off"
         run: |
@@ -84,11 +84,11 @@ jobs:
           total="$(go tool cover -func="${RUNNER_TEMP}/all.cover" | awk '/^total:/{gsub(/%/,"",$3); print $3}')"
           awk -v got="${total}" 'BEGIN { if (got + 0 < 80) exit 1 }'
 
-          go test -count=1 -coverprofile="${RUNNER_TEMP}/protocol.cover" ./internal/protocol
+          go test -count=1 -coverprofile="${RUNNER_TEMP}/protocol.cover" ./internal/domain/protocol
           protocol="$(go tool cover -func="${RUNNER_TEMP}/protocol.cover" | awk '/^total:/{gsub(/%/,"",$3); print $3}')"
           awk -v got="${protocol}" 'BEGIN { if (got + 0 < 90) exit 1 }'
 
-          go test -count=1 -coverprofile="${RUNNER_TEMP}/vision.cover" ./internal/vision
+          go test -count=1 -coverprofile="${RUNNER_TEMP}/vision.cover" ./internal/domain/vision
           vision="$(go tool cover -func="${RUNNER_TEMP}/vision.cover" | awk '/^total:/{gsub(/%/,"",$3); print $3}')"
           awk -v got="${vision}" 'BEGIN { if (got + 0 < 90) exit 1 }'
 
@@ -169,6 +169,7 @@ jobs:
       - name: Test native wrapper in target architecture
         run: |
           docker buildx build \
+            --file ali-slider-go/build/docker/Dockerfile \
             --platform "linux/${{ matrix.arch }}" \
             --target native-test \
             --progress plain \
@@ -177,6 +178,7 @@ jobs:
       - name: Test Go-to-V8 ABI and browser bridges
         run: |
           docker buildx build \
+            --file ali-slider-go/build/docker/Dockerfile \
             --platform "linux/${{ matrix.arch }}" \
             --target v8-test \
             --progress plain \
@@ -188,12 +190,14 @@ jobs:
           package_dir="${RUNNER_TEMP}/ali-slider-go-linux-${{ matrix.arch }}"
           mkdir -p "${package_dir}"
           docker buildx build \
+            --file ali-slider-go/build/docker/Dockerfile \
             --platform "linux/${{ matrix.arch }}" \
             --load \
             --tag "${image}" \
             --progress plain \
             ali-slider-go
           docker buildx build \
+            --file ali-slider-go/build/docker/Dockerfile \
             --platform "linux/${{ matrix.arch }}" \
             --target package \
             --output "type=local,dest=${package_dir}" \
@@ -305,7 +309,7 @@ jobs:
           go test `
             -count=1 `
             -run "TestNativeLibraryIntegration|TestV8BundlesParseInNativeEngine|TestKeyResolverChecksNativeRuntime" `
-            ./internal/v8runtime ./internal/pe
+            ./internal/platform/v8runtime ./internal/infrastructure/engine
           Remove-Item Env:ALI_SLIDER_V8_TEST_LIBRARY
 
       - name: Build and assemble portable package
@@ -328,7 +332,7 @@ jobs:
           }
 
           Copy-Item `
-            "packaging/windows/start.bat" `
+            "build/packaging/windows/start.bat" `
             (Join-Path $packageDir "start.bat")
 
           Copy-Item `
@@ -341,7 +345,7 @@ jobs:
           $utf8 = [System.Text.UTF8Encoding]::new($false)
           $utf8WithBOM = [System.Text.UTF8Encoding]::new($true)
           $readme = Get-Content `
-            -LiteralPath "packaging/windows/README-Windows.txt" `
+            -LiteralPath "build/packaging/windows/README-Windows.txt" `
             -Encoding utf8 `
             -Raw
           [IO.File]::WriteAllText(

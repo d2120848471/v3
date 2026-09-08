@@ -8,5 +8,5 @@
 !/var/artifacts/.gitkeep
 
 # 以下四张是脱敏合成 oracle fixture，不是运行失败样本。
-!/internal/vision/testdata/python-edge-decoy/*/back.png
-!/internal/vision/testdata/python-edge-decoy/*/shadow.png
+!/internal/domain/vision/testdata/python-edge-decoy/*/back.png
+!/internal/domain/vision/testdata/python-edge-decoy/*/shadow.png

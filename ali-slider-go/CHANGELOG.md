@@ -2,11 +2,31 @@
 
 本文件记录 `ali-slider-go` 的用户可见变化。格式参考 Keep a Changelog，版本遵循语义化版本。
 
-> **发布状态**：`1.0.0` 仍为 Unreleased。当前实现使用 Go 进程内 V8 `149.4.0`；每轮立即冷建并关闭独立 Device/V8 会话，不设置本地 live 并发槽，生产不启动 Node，也不使用预热池。2026-08-09历史预热池候选的 `47/50`、mean `2562ms` 等数据不能作为当前冷建路径验收；当时5个对齐存活VM出现过字段合同异常，取消本地保护后该现象属于已知风险。当前冷建在线探针只完成编译，尚未连接真实上游重跑。HTTP端到端、生产资源峰值和长时间稳定性仍待验证。
+> **发布状态**：`1.0.0` 仍为 Unreleased。当前使用同进程 V8，每轮独立冷建并关闭 Device，会话不跨请求复用。目录重构保持 HTTP 与公共 Go SDK 合同；完整 Client/HTTP 线上性能和长时间资源稳定性仍需验证。下方历史记录的路径、版本、预热池和测量数字仅描述当时快照。
 
 ## [1.0.0] - Unreleased
 
-### 当前变更（2026-08-19）
+### 应用边界与目录重构（2026-09-08）
+
+- 单轮编排迁入 `internal/application/solve`，通过消费方 `RoundFactory`、`Round`、`FailureRecorder` 接入外部能力；应用不依赖 infrastructure、HTTP 或公共 SDK。
+- `internal/application/service` 统一 SDK/HTTP 的默认请求值、活动调用与关闭协调；`internal/bootstrap` 成为共享资源组装点，HTTP 启动位于 `internal/bootstrap/server`，`cmd/server` 保留薄入口，`pkg/slider` 保留公开 DTO、方法和兼容映射。
+- 纯 device/PE/protocol/track/vision 归入 domain；网络、Aliyun 单轮/RPC、engine 和 artifact 归入 infrastructure；V8 ABI 归入 platform，运行时基础注入归入 foundation。原扁平 internal 路径不保留兼容空壳。
+- 保持 module 根及 `pkg/slider` 公共包路径。新增生产依赖方向与迁移前 SDK 黄金快照检查，`make test`/CI 自然覆盖。
+- 增加迁移前 24 组 HTTP 实际响应快照对比，以及 SDK 不得间接引入 HTTP 接口包的依赖检查。
+- 修正可选 Node bridge 的 stdout 所有权：子进程退出后，末阶段输出仍可读取，读端由会话关闭。新增确定性退出时序与读端释放回归，避免并发 `Wait` 提前关闭管道。
+- Dockerfile 迁到 `build/docker/Dockerfile`，context 仍为 module 根；Windows 打包素材迁到 `build/packaging/windows`，最终 ZIP 结构不变。Makefile、CI 与换行规则同步迁移，工具版本及覆盖率 80%/90% 门槛不变。
+- 文档分为 guides、reference、design 与 archive；根/module README 保留接入与导航。原始历史报告和证据保留，前轮离线数字与本轮复测分开标识。目录与命令映射见 [迁移指南](docs/guides/migration.md)。
+
+### 目录迁移前的兼容整理与离线优化（2026-09-08）
+
+- 按职责拆分公共 SDK 的配置与错误、HTTP 的输入输出、Solver 的合同与初始化；保持公共 Go 签名及既有 HTTP 字段、状态、别名和唯一 Verify 行为。
+- PE 设备运行时按会话、桥接、代理与合同校验分文件，保留原函数体与可选 Node oracle，补充当前包级说明。
+- 内部 Solver 明确要求调用方注入并管理 PE resolver；动态设备路径跳过未使用的兼容客户端构造。
+- OpenAPI 增加稳定 operationId，并在 Handler 构造时编码复用；旧 GET query 去掉 JSON 编解码中转，保留原有文本语义。
+- 视觉 sRGB 使用原公式查找表；Chamfer 在单轮内复用相同几何条件的 alpha 距离场，新增逐位等价与裁剪边界回归。
+- 整理项目与文档入口，区分当前行为与历史证据；新增 `make bench` 和可执行 SDK 示例。离线困难图基准耗时约减少 35%，范围与命令见 [性能文档](docs/design/performance.md)，不代表线上完整链结果。
+
+### 会话生命周期变更（2026-08-19）
 
 - 服务启动不再调用 `Prime`，也不创建 Device/V8 会话或访问 Device RPC；`Client.Prime` 仅作为兼容 no-op 保留。
 - 每个合法 `Solve` 都立即冷建独立的 Device/V8 完整会话，并在完成或失败后关闭，不再回收 Isolate、补充预热库存或等待本地 live 会话槽。
@@ -17,6 +37,10 @@
 - Go module 与 Docker 构建层同步升级到 Go `1.26.6`，修复 Go `1.26.5` 标准库漏洞导致的 `govulncheck` 门禁失败。
 
 下方其他条目保留 `1.0.0` 开发过程的里程碑；其中提到的预热、Lease、Recycle 和补货已被上述当前变更取代，不再是待发布版的运行行为。
+
+## 历史开发里程碑
+
+以下原始条目记录早期 1.0.0 开发快照。旧路径和阶段性通过状态不表示当前目录或本轮验证结果；当前配置/接口/命令以 [文档索引](docs/README.md) 为准。
 
 ### Added
 
@@ -161,7 +185,7 @@
 - Python 业务提交/重放、交互式 CLI、桌面 UI、PyInstaller 和 Swagger UI 不属于 1.0.0 范围；`GET /` 第一方测试页不改变这些排除项。
 - Windows EXE 尚未配置 Authenticode 代码签名，Defender/SmartScreen 可能提示未知发布者；SHA-256 不能替代发布者签名。
 
-## Evidence → Finding → Path
+## 历史证据定位
 
 | Evidence | Finding | Path |
 |---|---|---|
@@ -169,9 +193,9 @@
 | `pkg/slider/client.go:82`、`:160`、`:188`、`:203`、`:213` | 对外 Client 和完整生命周期已经实现。 | library caller → Solve/Prime/Purge → Close |
 | `internal/challenge/solver.go:107`、`:149`、`:289` | 具体 Solver 已串接完整单轮链路。 | request → Device/Init/Vision/PE → one Verify |
 | `internal/challenge/solver_test.go` · `TestSolverOfflineCompleteSuccess` / `TestSolverLowConfidenceStopsBeforeVerify` / `TestSolverVerifyNetworkErrorIsSingleAttemptAndSanitized` | 成功、前置失败和网络未知的 Verify 次数已有离线计数证据。 | Mock transport → state gates → counted attempt |
-| `internal/challenge/performance_test.go:21`、`:65`；[脱敏验证证据](docs/evidence/validation-2026-08-07.md) | 32 路 Mock 正确性通过；200 样本纯计算 `P99=57.05075ms`，达到硬门槛。 | concurrent mock / explicit local sampler → verified compute gate |
+| `internal/challenge/performance_test.go:21`、`:65`；[脱敏验证证据](docs/archive/evidence/validation-2026-08-07.md) | 32 路 Mock 正确性通过；200 样本纯计算 `P99=57.05075ms`，达到硬门槛。 | concurrent mock / explicit local sampler → verified compute gate |
 | `internal/device/rpc.go:119`、`:130`；`internal/device/session_test.go:130`、`:146`、`:150`、`:165`；`internal/device/online_session_test.go:17` | Device schema 修复只在 Log1 解析对象，Log2/3 接受非对象成功结果；在线 Log1/2/3 约 `0.53s` 通过。 | raw response → action-specific decode → offline regression → authorized probe |
-| `pkg/slider/online_acceptance_test.go:37`、`:49`、`:98`、`:128`、`:147`、`:165`、`:168`；[脱敏验证证据](docs/evidence/validation-2026-08-07.md) | 授权候选 200/32/应用层零重试批次成功 `196/200`，Client 完整链墙钟 P95 `984ms`，两项冻结门槛通过；该 harness 不经过 HTTP Handler，最终 one-shot 加固后未再在线重跑。 | authorized jobs → one Solve each → sanitized aggregate → bounded acceptance |
+| `pkg/slider/online_acceptance_test.go:37`、`:49`、`:98`、`:128`、`:147`、`:165`、`:168`；[脱敏验证证据](docs/archive/evidence/validation-2026-08-07.md) | 授权候选 200/32/应用层零重试批次成功 `196/200`，Client 完整链墙钟 P95 `984ms`，两项冻结门槛通过；该 harness 不经过 HTTP Handler，最终 one-shot 加固后未再在线重跑。 | authorized jobs → one Solve each → sanitized aggregate → bounded acceptance |
 | `internal/pe/keys.go` · `NewKeyResolverWithCapacity`；`internal/pe/device_runtime.go` · `OpenDevice` / `Close` | 当前每轮立即冷建独立Device/V8，不设置本地live并发槽，结束时关闭会话。 | cold Open/Complete → Close |
 | `cmd/server/main.go:36`、`:49`、`:55`、`:60`、`:93`、`:111`、`:147` | 可执行服务、启动/定时清理和优雅关闭已经接线。 | config → Client → HTTP → cleanup |
 | `internal/server/server.go` · `checkSolveOrigin` / `decodeQueryRequest` / `requestFromPayload`；`internal/server/server_test.go` · `TestLegacyGETQueryCompatibility` / `TestLegacyGETQueryValidationNeverCallsSolver` / `TestSolveParameterSourcesStaySeparated` / `TestBrowserOriginBoundaryPreservesLegacyClients` | 已废弃 GET query 的传输兼容、方法参数源隔离和 GET/POST 跨源边界已固定。 | method + path → origin + JSON/query gate → one Solver call |

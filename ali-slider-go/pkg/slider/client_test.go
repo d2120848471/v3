@@ -4,17 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/d2120848471/v3/ali-slider-go/internal/artifact"
-	"github.com/d2120848471/v3/ali-slider-go/internal/challenge"
-	"github.com/d2120848471/v3/ali-slider-go/internal/config"
-	"github.com/d2120848471/v3/ali-slider-go/internal/runtimekit"
+	"github.com/d2120848471/v3/ali-slider-go/internal/application/service"
+	"github.com/d2120848471/v3/ali-slider-go/internal/application/solve"
+	"github.com/d2120848471/v3/ali-slider-go/internal/bootstrap/config"
 )
 
 func TestPublicTypesRedactFormatting(t *testing.T) {
@@ -65,17 +62,17 @@ func TestZeroOptionsDisableDevicePrewarm(t *testing.T) {
 	}
 }
 
-type fakeChallengeSolver struct {
+type fakeExecutor struct {
 	mu        sync.Mutex
-	request   challenge.SolveRequest
-	outcome   challenge.SolveOutcome
+	request   solve.Request
+	outcome   solve.Outcome
 	err       error
 	entered   chan struct{}
 	release   chan struct{}
 	enterOnce sync.Once
 }
 
-func (solver *fakeChallengeSolver) Solve(ctx context.Context, request challenge.SolveRequest) (challenge.SolveOutcome, error) {
+func (solver *fakeExecutor) Solve(ctx context.Context, request solve.Request) (solve.Outcome, error) {
 	solver.mu.Lock()
 	solver.request = request
 	solver.mu.Unlock()
@@ -86,29 +83,28 @@ func (solver *fakeChallengeSolver) Solve(ctx context.Context, request challenge.
 		select {
 		case <-solver.release:
 		case <-ctx.Done():
-			return challenge.SolveOutcome{}, ctx.Err()
+			return solve.Outcome{}, ctx.Err()
 		}
 	}
 	return solver.outcome, solver.err
 }
 
-func newFakeClient(t *testing.T, solver challengeSolver) *Client {
+func newFakeClient(t *testing.T, executor service.Executor) *Client {
 	t.Helper()
 	options := DefaultClientOptions()
 	options.DevicePrewarmCapacity = 0
-	sources := runtimekit.NewSystemSources()
-	return &Client{
-		options: options, solver: solver,
-		artifacts: artifact.Store{
-			Directory: filepath.Join(t.TempDir(), "artifacts"), Retention: 7 * 24 * time.Hour,
-			Entropy: sources.Entropy,
-		},
-		closeDone: make(chan struct{}),
+	application, err := service.New(service.Options{
+		Executor: executor, Resources: &fakeResources{},
+		DefaultSceneID: options.DefaultSceneID, DefaultPrefix: options.DefaultPrefix,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
+	return &Client{options: options, service: application}
 }
 
 func TestClientSolveMapsDefaultsAndResult(t *testing.T) {
-	engine := &fakeChallengeSolver{outcome: challenge.SolveOutcome{
+	engine := &fakeExecutor{outcome: solve.Outcome{
 		OK: true, SecurityToken: "secret", VerifyCode: "T001", VerifyResult: true,
 		CertifyID: "certify", SceneID: "1ug4aptr", Proxied: true,
 		TimingsMS: map[string]int{"total": 37, "vision": 9},
@@ -136,18 +132,18 @@ func TestClientSolveMapsDefaultsAndResult(t *testing.T) {
 
 func TestClientMapsStableFailureKinds(t *testing.T) {
 	tests := []struct {
-		failure challenge.FailureKind
+		failure solve.FailureKind
 		want    ErrorKind
 	}{
-		{challenge.FailureInvalidRequest, ErrorInvalidRequest},
-		{challenge.FailureProtocol, ErrorProtocol},
-		{challenge.FailureNetwork, ErrorNetwork},
-		{challenge.FailureVision, ErrorVision},
-		{challenge.FailureInternal, ErrorInternal},
+		{solve.FailureInvalidRequest, ErrorInvalidRequest},
+		{solve.FailureProtocol, ErrorProtocol},
+		{solve.FailureNetwork, ErrorNetwork},
+		{solve.FailureVision, ErrorVision},
+		{solve.FailureInternal, ErrorInternal},
 	}
 	for _, test := range tests {
 		t.Run(string(test.failure), func(t *testing.T) {
-			client := newFakeClient(t, &fakeChallengeSolver{err: &challenge.Failure{
+			client := newFakeClient(t, &fakeExecutor{err: &solve.Failure{
 				Kind: test.failure, Stage: "fixture", Message: "稳定消息", Cause: errors.New("hidden cause"),
 			}})
 			defer client.Close()
@@ -161,8 +157,8 @@ func TestClientMapsStableFailureKinds(t *testing.T) {
 }
 
 func TestCloseWaitsForActiveSolveAndRejectsNewWork(t *testing.T) {
-	engine := &fakeChallengeSolver{
-		outcome: challenge.SolveOutcome{TimingsMS: map[string]int{"total": 1}},
+	engine := &fakeExecutor{
+		outcome: solve.Outcome{TimingsMS: map[string]int{"total": 1}},
 		entered: make(chan struct{}), release: make(chan struct{}),
 	}
 	client := newFakeClient(t, engine)
@@ -224,25 +220,27 @@ func TestNewClientValidationAndArtifactPurge(t *testing.T) {
 	if _, err := NewClient(invalid); err == nil {
 		t.Fatal("device reserve without prewarm accepted")
 	}
-	options := DefaultClientOptions()
-	options.DevicePrewarmCapacity = 0
-	options.ArtifactDir = filepath.Join(t.TempDir(), "artifacts")
-	client, err := NewClient(options)
+	resources := &fakeResources{removed: 1}
+	application, err := service.New(service.Options{Executor: &fakeExecutor{}, Resources: resources})
 	if err != nil {
 		t.Fatal(err)
 	}
-	identifier, err := client.artifacts.SaveFailure(nil, nil, artifact.Metrics{Reason: "fixture", Stage: "test"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(options.ArtifactDir, identifier+"-metrics.json")
-	old := time.Now().Add(-8 * 24 * time.Hour)
-	if err := os.Chtimes(path, old, old); err != nil {
-		t.Fatal(err)
-	}
+	client := &Client{service: application}
 	removed, err := client.PurgeArtifacts()
 	if err != nil || removed != 1 {
 		t.Fatalf("removed=%d err=%v", removed, err)
 	}
 	client.Close()
 }
+
+type fakeResources struct {
+	removed    int
+	runtimeErr error
+	purgeErr   error
+}
+
+func (resources *fakeResources) CheckRuntime() error { return resources.runtimeErr }
+func (resources *fakeResources) PurgeArtifacts() (int, error) {
+	return resources.removed, resources.purgeErr
+}
+func (*fakeResources) Close() {}

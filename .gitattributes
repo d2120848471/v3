@@ -1,2 +1,2 @@
-ali-slider-go/packaging/windows/*.bat text eol=crlf
-ali-slider-go/packaging/windows/*.txt text eol=crlf
+ali-slider-go/build/packaging/windows/*.bat text eol=crlf
+ali-slider-go/build/packaging/windows/*.txt text eol=crlf
