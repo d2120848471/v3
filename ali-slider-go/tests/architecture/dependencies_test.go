@@ -101,7 +101,7 @@ func dependencyLayer(path string) string {
 	case "internal":
 		return parts[1]
 	case "pkg":
-		if parts[1] == "slider" {
+		if parts[1] == "slider" || parts[1] == "baxia" {
 			return "sdk"
 		}
 	case "cmd":

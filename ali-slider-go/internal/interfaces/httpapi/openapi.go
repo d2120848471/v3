@@ -8,6 +8,7 @@ func openAPIDocument() map[string]any {
 			"version": "1.0.0",
 		},
 		"paths": map[string]any{
+			BaxiaPath: map[string]any{"post": baxiaOperation()},
 			TestPagePath: map[string]any{
 				"get": map[string]any{
 					"operationId": "getTestPage",

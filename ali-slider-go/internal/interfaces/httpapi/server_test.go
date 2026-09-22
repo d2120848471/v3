@@ -412,7 +412,7 @@ func TestEmbeddedAPITestPage(t *testing.T) {
 
 	body := first.Body.String()
 	for _, required := range []string{
-		`id="api-test-console"`, `fetch("/api/slider"`, `fetch("/health"`,
+		`id="api-test-console"`, `"/api/slider"`, `"/api/bxua"`, `fetch(endpoint,`, `fetch("/health"`,
 		`"SceneId"`, `"prefix"`, `"AaduaneId"`, `"proxy"`, `AbortController`, `TextEncoder`,
 		`response.status === 200`, `!Array.isArray(lastResponse)`, `lastResponse.VerifyCode === "T001"`,
 		`lastResponse.VerifyResult === true`, `lastResponse.securityToken.length > 0`,
@@ -425,7 +425,7 @@ func TestEmbeddedAPITestPage(t *testing.T) {
 		t.Fatalf("page nonce substitution is incomplete")
 	}
 	if count := strings.Count(body, "fetch("); count != 2 {
-		t.Fatalf("page fetch calls = %d, want only health and manual solve", count)
+		t.Fatalf("page fetch calls = %d, want only health and manual API submission", count)
 	}
 	for _, forbidden := range []string{
 		`<script src=`, `rel="stylesheet"`, "innerHTML", "outerHTML", "insertAdjacentHTML",
@@ -577,7 +577,7 @@ func TestOnlyFrozenRoutesAreExposed(t *testing.T) {
 		t.Fatal(err)
 	}
 	paths := document["paths"].(map[string]any)
-	if len(paths) != 4 {
+	if len(paths) != 5 {
 		t.Fatalf("OpenAPI paths = %#v", paths)
 	}
 	page := paths[TestPagePath].(map[string]any)

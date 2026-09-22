@@ -16,7 +16,7 @@
 
 | 文档 | 内容 |
 |---|---|
-| [HTTP API](reference/http-api.md) | 路由、字段、结果、错误、OpenAPI 与旧 GET 兼容 |
+| [HTTP API](reference/http-api.md) | 验证码与 Baxia bx-ua 的路由、代理、curl 示例、结果、错误及 OpenAPI |
 | [配置](reference/configuration.md) | flags、环境变量、默认值与资源预算 |
 | [Go SDK](reference/go-sdk.md) | 公共源码导航、错误和生命周期边界 |
 

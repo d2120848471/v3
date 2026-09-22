@@ -531,8 +531,10 @@ jobs:
               throw "Packaged API test page returned status $($pageResponse.StatusCode) and Content-Type '$pageContentType'"
             }
             if (-not $pageResponse.Content.Contains('id="api-test-console"') -or
-                -not $pageResponse.Content.Contains('fetch("/api/slider"')) {
-              throw "Packaged API test page is missing its stable marker or same-origin solve path"
+                -not $pageResponse.Content.Contains('"/api/slider"') -or
+                -not $pageResponse.Content.Contains('"/api/bxua"') -or
+                -not $pageResponse.Content.Contains('fetch(endpoint,')) {
+              throw "Packaged API test page is missing its stable marker or same-origin API paths"
             }
             if ($pageCSP -notmatch "connect-src 'self'" -or
                 $pageCSP -match "unsafe-inline" -or
@@ -565,6 +567,30 @@ jobs:
               if (-not $solveResponses.ContainsKey("403") -or $solveResponses.ContainsKey("429")) {
                 throw "Packaged OpenAPI $method solve responses do not match the 403/no-429 contract"
               }
+            }
+
+            $baxiaPath = $openapiDocument["paths"]["/api/bxua"]
+            if ($null -eq $baxiaPath -or
+                -not $baxiaPath.ContainsKey("post") -or
+                $baxiaPath["post"]["operationId"] -ne "generateBXUA") {
+              throw "Packaged OpenAPI is missing the Baxia POST operation"
+            }
+            # 缺少必填 URL 时必须在下载 SDK 前拒绝，打包检查不访问上游。
+            $baxiaInvalid = Invoke-WebRequest `
+              -Method Post `
+              -Uri "http://127.0.0.1:18080/api/bxua" `
+              -ContentType "application/json" `
+              -Body "{}" `
+              -SkipHttpErrorCheck `
+              -TimeoutSec 2
+            $baxiaInvalidBody = $baxiaInvalid.Content |
+              ConvertFrom-Json -AsHashtable
+            $baxiaInvalidTraceHeader = [string]$baxiaInvalid.Headers["X-Trace-ID"]
+            if ($baxiaInvalid.StatusCode -ne 400 -or
+                [string]$baxiaInvalidBody["errorType"] -ne "ApiRequestError" -or
+                [string]::IsNullOrWhiteSpace($baxiaInvalidTraceHeader) -or
+                $baxiaInvalidTraceHeader -ne [string]$baxiaInvalidBody["traceId"]) {
+              throw "Baxia POST routing and validation smoke failed"
             }
 
             $legacyInvalid = Invoke-WebRequest `

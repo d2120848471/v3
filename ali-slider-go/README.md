@@ -7,7 +7,7 @@
 ## 启动与 HTTP 接入
 
 - [启动指南](docs/guides/getting-started.md)：Linux/macOS 源码、Windows 便携包和 Docker。
-- [HTTP API](docs/reference/http-api.md)：推荐 `POST /api/slider`，保留已废弃的旧 GET query；完整字段、错误和 OpenAPI 合同。
+- [HTTP API](docs/reference/http-api.md)：验证码调用 `POST /api/slider`，Baxia 调用 `POST /api/bxua`；包含代理、完整字段、错误和 OpenAPI 合同。
 - [配置参考](docs/reference/configuration.md)：命令行参数、环境变量、默认值与资源边界。
 
 启动成功后打开 `http://127.0.0.1:8000/` 使用内嵌测试页，或访问 `/health` 检查进程就绪。启动和 health 不访问真实上游；手工提交 Solve 后才创建挑战。HTTP `200` 仍需读取 `ok`、`VerifyCode` 和 `VerifyResult` 判断业务结果。
@@ -60,6 +60,33 @@ func run(ctx context.Context) error {
 每轮独占 Device/V8、token、挑战、轨迹和 Verify 状态，结束时关闭会话。`Close` 拒绝新工作并等待活动调用返回，不主动取消 Solve；取消由调用方 context 或总超时负责。`Prime` 保留为兼容空操作。HTTP 宿主在启动时和每小时清理失败样本；SDK 宿主负责定期调用 `PurgeArtifacts`。
 
 方法与类型以 [公共包源码](pkg/slider) 和 `go doc ./pkg/slider` 为准；源码导航、错误合同和兼容边界见 [SDK 参考](docs/reference/go-sdk.md)。
+
+## Baxia / Fireye 的 bx-ua
+
+对外 HTTP 调用使用 `POST /api/bxua`，JSON 传 `pageUrl`、`requestUrl` 和可选 `proxy`（兼容 `Proxy`）。代理格式与 `/api/slider` 一致；服务使用现有 `--v8-library` 配置，无需另起进程。打开首页选择“Baxia bx-ua”即可手工调用；完整 curl 示例、返回字段及错误见 [Baxia HTTP 文档](docs/reference/http-api.md#baxiapost-apibxua)，机器可读合同位于 `/openapi.json`。
+
+`pkg/baxia` 和独立命令 `cmd/bxua` 默认由 Go 获取当前 Fireye SDK，再在同进程 V8 中生成 `bx-ua`，与 V3 的 `Solve` 分开。运行时不需要浏览器或 Node。Go 下载器只访问允许的公开脚本地址；SDK 发现、采样和生成本身都在禁网 V8 中执行，不发送登录、遥测或验证码请求。
+
+调用链是 `baxiaCommon.getUA(url) → postFYModule.getFYToken(url) → options.reqUrl = url → __fyModule.getFYToken(options)`。新会话先取得[当前 AWSC](https://g.alicdn.com/??/AWSC/AWSC/awsc.js)，在页面 URL 和设备画像对应的环境中执行原 loader，捕获它实际选择的 Fireye 地址，再下载该脚本。当前站点的配置包含稳定 `1.231.69` 和灰度 `1.234.37`；不能简单挑最高版本，也不把某个数字写死为生产校验规则。
+
+每份源码在初始化时恢复 `RuntimeProfile`：实际协议版本、token 前缀、输出外层编码字母表和 SDK SHA-256。字母表从真实 getter 的编码调用中取证并绑定完整输出，Go 再按恢复的字母表严格解码和重编码核对样本。`234` 的字母表位于运行时字符串池，不能靠固定变量名或源码偏移提取。核心算法由本次下载的原 SDK 执行，内部实现随脚本一起更新；这些 profile 字段不代表已将 SDK 内部加密算法重写成 Go。
+
+每次创建新会话都会向 CDN 重新确认 AWSC 和选中的 SDK。复用 `baxia.Client` 时可以通过 ETag/Last-Modified 条件请求复用未变化的源码；同 URL 内容发生变化也会重新采样，不按协议版本号复用旧 profile，下载失败不会静默使用旧版。已建立的 Session 固定自己的源码与 profile，连续 `Token` 调用保留原会话状态；新版本只作用于后续新会话。
+
+```bash
+go run ./cmd/bxua \
+  -v8-library /opt/ali-slider/libali_slider_v8_runtime.so \
+  -page-url 'https://www.galaxyticketing.com/en/#/login/account?loginBefore=%252FuserCenter%252FaccountList' \
+  -request-url 'https://rest-sig.imaitix.com/api/user/userLogin?_bx-v=2.5.37'
+```
+
+V8 动态库必须与执行命令的操作系统和 CPU 一致；macOS 使用 `.dylib`，Windows 使用 `.dll`。输出 JSON 包含完整 `bx-ua`、版本、实际下载地址及摘要、恢复的 `profile` 和同一画像对应的 `uaHeaders`。`-proxy` 只影响公开脚本下载，`-timeout` 控制整次操作。省略 `-profile` 时沿用项目的移动 Chromium 画像；用 `-profile profile.json` 可以传入 `baxia.Profile` 的 JSON。画像必须与宿主实际发送的 User-Agent 等字段一致。
+
+Go 宿主先创建 `client, err := baxia.NewClient(baxia.ClientOptions{})`，再调用 `client.NewSession(ctx, baxia.Config{V8LibraryPath: libraryPath, PageURL: pageURL, Profile: profile})`。Session 使用完毕调用 `Close()`；Client 的 `Close()` 取消正在构造的会话并释放下载连接，已交付的 Session 仍单独关闭。单次调用也可以用 `baxia.NewSession`。`baxia.GenerateProfile()` 创建默认画像，`Session.Profile()` 返回经校验的编码合同。
+
+需要离线复现时，显式传 `Config.SDKSource` 或命令的 `-sdk /path/to/fireye.js`，就会跳过网络发现与下载，但仍执行相同的 profile 恢复和校验。原始 SDK 不纳入源码仓库。新脚本如果更改了导出接口、必需环境或编码路径，会明确返回 `ErrUnsupportedSDK` 或运行时错误，不靠删除版本限制或回退旧字母表伪装兼容。自动更新不保证任意未来算法变化均无需适配；本地 profile 检查也不等同于服务端认可。
+
+生成结果不等于服务端风控放行。浏览器的 Cookie、交互历史和环境会影响结果，同一 URL 的 token 也不固定；这个入口只生成 `bx-ua`，不包含独立的 `bx_et`、`bx-umidtoken` 或图片验证结果。当前目标原始登录请求虽返回 HTTP 200，响应带有 `Bxpunish: 1`，随后进入图片验证。
 
 ## 开发与维护
 

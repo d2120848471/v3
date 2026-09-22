@@ -19,8 +19,19 @@ func (h *Handler) decodeRequest(w http.ResponseWriter, r *http.Request) (solve.R
 	if r.Method == http.MethodGet {
 		return h.decodeQueryRequest(r)
 	}
+	payload, err := decodeJSONFields(w, r)
+	if err != nil {
+		return solve.Request{}, err
+	}
+	return h.requestFromFields(func(primary, alias string, maxRunes int) (string, error) {
+		return optionalAliasedText(payload, primary, alias, maxRunes)
+	})
+}
+
+// decodeJSONFields 保留既有 JSON 兼容语义，并对所有执行入口使用同一 body 上限。
+func decodeJSONFields(w http.ResponseWriter, r *http.Request) (map[string]json.RawMessage, error) {
 	if r.ContentLength > MaxRequestBytes {
-		return solve.Request{}, fmt.Errorf("请求体必须位于 0..%d 字节", MaxRequestBytes)
+		return nil, fmt.Errorf("请求体必须位于 0..%d 字节", MaxRequestBytes)
 	}
 	limited := http.MaxBytesReader(w, r.Body, MaxRequestBytes)
 	defer limited.Close()
@@ -33,20 +44,17 @@ func (h *Handler) decodeRequest(w http.ResponseWriter, r *http.Request) (solve.R
 	} else if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			return solve.Request{}, fmt.Errorf("请求体必须位于 0..%d 字节", MaxRequestBytes)
+			return nil, fmt.Errorf("请求体必须位于 0..%d 字节", MaxRequestBytes)
 		}
-		return solve.Request{}, errors.New("请求体不是合法 JSON")
+		return nil, errors.New("请求体不是合法 JSON")
 	}
 	if payload == nil {
-		return solve.Request{}, errors.New("请求体必须是 JSON object")
+		return nil, errors.New("请求体必须是 JSON object")
 	}
 	if err := ensureJSONEOF(decoder); err != nil {
-		return solve.Request{}, err
+		return nil, err
 	}
-
-	return h.requestFromFields(func(primary, alias string, maxRunes int) (string, error) {
-		return optionalAliasedText(payload, primary, alias, maxRunes)
-	})
+	return payload, nil
 }
 
 func (h *Handler) decodeQueryRequest(r *http.Request) (solve.Request, error) {

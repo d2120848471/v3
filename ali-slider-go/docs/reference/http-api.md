@@ -8,11 +8,12 @@
 |---|---|---|---|
 | `GET` | `/` | 返回内嵌 API 测试页 | 否；页面只自动检查 health，必须手工提交 |
 | `POST` | `/api/slider` | 执行一轮挑战 | 通过浏览器跨源与 HTTP 输入校验后调用一次 |
+| `POST` | `/api/bxua` | 生成一次 Baxia / Fireye `bx-ua` | 否；下载当前脚本后本地生成，不发送目标业务请求 |
 | `GET` | `/api/slider?...` | 兼容旧 Python query；已废弃 | 通过浏览器跨源与 HTTP 输入校验后调用一次 |
 | `GET` | `/health` | 进程级就绪检查 | 否 |
 | `GET` | `/openapi.json` | 返回 OpenAPI 3.0.3 JSON | 否 |
 
-只有 `/`、`/api/slider`、`/health` 和 `/openapi.json` 四个路径；Solve 路径同时接受 GET 和 POST。其他方法或路径返回 `404`。
+只有 `/`、`/api/slider`、`/api/bxua`、`/health` 和 `/openapi.json` 五个路径；Solve 路径同时接受 GET 和 POST，`/api/bxua` 只接受 POST。其他方法或路径返回 `404`。
 若极低概率的系统密码学随机源失败，`GET /` 返回 `500 text/plain` 且不调用 Solver；OpenAPI 同时声明该失败边界。
 
 ## 合同与兼容策略
@@ -24,6 +25,7 @@ OpenAPI 从 `internal/interfaces/httpapi/openapi.go` 定义，在 Handler 构造
 | 操作 | operationId |
 |---|---|
 | `POST /api/slider` | `solveSlider` |
+| `POST /api/bxua` | `generateBXUA` |
 | `GET /api/slider` | `solveSliderLegacy` |
 | `GET /health` | `getHealth` |
 | `GET /openapi.json` | `getOpenAPI` |
@@ -39,14 +41,14 @@ Go SDK 的接入方式见 [README](../../README.md#go-sdk-接入) 和 `go doc ./
 http://127.0.0.1:8000/
 ```
 
-页面内置于 Go EXE，不加载 CDN、字体、框架或第三方脚本，也不需要 Node.js。它固定调用当前 origin 的 `/health` 和 `/api/slider`，不能修改目标 URL，因此换端口后无需配置页面。
+页面内置于 Go EXE，不加载 CDN、字体、框架或第三方脚本，也不需要 Node.js。它固定调用当前 origin 的 `/health`、`/api/slider` 和 `/api/bxua`，因此换端口后无需配置页面。选择“验证码求解”或“Baxia bx-ua”切换操作；后者的页面 URL 和请求 URL 是计算输入，不改变页面调用的本地 API 地址。
 测试页需要支持 `fetch`、`AbortController` 和 `TextEncoder` 的现代 Edge、Chrome 或 Firefox；没有现代浏览器时仍可直接调用 API。
 
 - 页面打开时只执行无副作用的 health 检查，不自动创建挑战。
-- 只有点击“发送一次求解”才会提交一个合法 POST JSON；执行期间按钮禁用，防止双击。页面不生成旧 GET query，也不自动重试、批量请求或并发压测。
-- 空字段不进入 JSON，实际默认 Scene ID/prefix 由服务启动配置决定。
+- 只有手工提交才会发送一次 POST JSON；执行期间按钮和类型选择禁用，防止重复提交或切换。页面不生成旧 GET query，也不自动重试、批量请求或并发压测。
+- 空的可选字段不进入 JSON，验证码模式的默认 Scene ID/prefix 由服务启动配置决定；Baxia 模式必须填写 `pageUrl` 和 `requestUrl`，共用代理输入。
 - 页面等待上限可设为 `1..305` 秒，并支持手工取消。取消会传播到请求 context，但若 Verify 已发出，上游结果可能未知；不要手工重试结果未知的一轮。
-- RPC key、代理、`securityToken` 和 `certifyId` 默认遮罩。请求和响应只保留在当前页面内存，不写 Cookie、URL、localStorage、sessionStorage 或遥测；刷新或“清空”即移除。
+- RPC key、代理、`securityToken`、`certifyId` 和 `bx-ua` 默认遮罩，可勾选“显示敏感字段”查看。请求和响应只保留在当前页面内存，不写 Cookie、URL、localStorage、sessionStorage 或遥测；刷新或“清空”即移除。
 - 页面用 `textContent` 显示响应；CSP 只允许同源连接，并禁止外部资源、frame、form action、worker 和不带随机 nonce 的脚本/样式。
 
 测试页是本机调试入口，不是鉴权边界。Handler 会根据浏览器 `Origin` / `Sec-Fetch-Site` 拒绝明确的跨源 GET/POST Solve，但这不是账号、权限或完整 CSRF 身份机制；不要把监听地址改成 `0.0.0.0` 后直接暴露到公网。无浏览器来源头的 curl/程序客户端仍允许；POST 还保持空 body 和无 Content-Type 兼容性。
@@ -88,7 +90,7 @@ http://127.0.0.1:7890
 socks5h://proxy.example.test:1080
 ```
 
-代理由调用方控制且会影响本轮全部网络出口。不要把未经信任的代理参数开放给公网调用方。
+代理由调用方控制：验证码模式影响本轮全部网络出口，Baxia 模式只影响 AWSC 与 Fireye 公开脚本下载。不要把未经信任的代理参数开放给公网调用方。
 
 ### curl 示例
 
@@ -173,7 +175,71 @@ GET 是真实有副作用的 Solve，不是健康检查。即使响应头禁止�
 
 业务成功条件为 `VerifyCode == "T001" && VerifyResult && securityToken != ""`。三种验证码类型共用同一结果格式；历史成功率和耗时不属于接口保证，测量范围见 [性能说明](../design/performance.md)。
 
-## 处理结果与错误
+## Baxia：POST /api/bxua
+
+服务使用与验证码接口相同的监听地址、`--v8-library`、`--timeout` 和代理格式，无需单独启动 `cmd/bxua`。每次请求生成一份公共移动 Chromium 设备画像，下载当前 AWSC 和它选中的 Fireye，在本地 V8 中生成一次 token，然后关闭会话。启动、打开测试页和读取 health 都不会下载这些脚本。
+
+### 请求字段
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `pageUrl` | string | 是 | SDK 所在页面的完整 HTTP(S) URL，可以包含 `#/...` 路由 |
+| `requestUrl` | string | 是 | 实际业务请求的完整 HTTP(S) URL，保留其 query；本接口不会发送该请求 |
+| `proxy` | string / null | 否 | 同验证码接口；空或 `null` 时直连，无 scheme 时补 `http://` |
+| `Proxy` | string / null | 否 | `proxy` 的兼容别名；两者同时出现时 `proxy` 优先，包括空值 |
+
+URL 去除首尾空白后不能为空，每个最多 8,192 个 UTF-8 字节，必须有主机且不能带用户名/密码。字段名区分大小写，JSON body 最多 65,536 字节，未知字段忽略，URL query 不参与参数合并。空 body、`null`、数组、缺少 URL 或多个 JSON 对象均返回 `400`。不接收客户端指定的 JS 源码、文件路径或 V8 路径；不提供 GET query 入口。
+
+以下示例需要先启动本地服务，提交后只下载公开脚本并本地计算。代理应改为实际可用地址；直连时删除 `proxy` 字段或传空字符串：
+
+```bash
+curl --fail-with-body \
+  --request POST \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "pageUrl":"https://www.galaxyticketing.com/en/#/login/account?loginBefore=%252FuserCenter%252FaccountList",
+    "requestUrl":"https://rest-sig.imaitix.com/api/user/userLogin?_bx-v=2.5.37",
+    "proxy":"http://127.0.0.1:7890"
+  }' \
+  http://127.0.0.1:8000/api/bxua
+```
+
+### 成功结果
+
+成功返回 HTTP `200`，字段如下。`ok=true` 表示本地生成成功，不表示登录成功或站点风控接受。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `ok` | boolean | 生成成功时为 `true` |
+| `bx-ua` | string | 完整 token；业务请求头使用同名 `bx-ua` |
+| `uaHeaders` | object | 同一设备画像的 `User-Agent`、`Accept-Language`、`Sec-CH-UA`、`Sec-CH-UA-Mobile`、`Sec-CH-UA-Platform` |
+| `version` | integer | 当前 SDK 实测协议版本，不固定为某一版本 |
+| `sdkURL` | string | AWSC 实际选中的 Fireye 下载地址 |
+| `sdkSha256` / `awscSha256` | string | 本次两份脚本的 SHA-256，用于定位版本变化 |
+| `profile` | object | SDK 编码信息：`version`、`prefix`、含 padding 的 65 字符 `alphabet`、`sdkHash`；不是设备画像，也不代表内部密钥 |
+| `proxied` | boolean | 本次脚本下载是否配置了代理 |
+| `elapsedMs` | integer | 本次服务端处理耗时，单位毫秒 |
+| `traceId` | string | 与 `X-Trace-ID` 响应头一致 |
+
+调用方后续发送业务请求时，应同时使用返回的 `bx-ua` 和整组 `uaHeaders`。每次 HTTP 调用都是独立会话，不能假设不同调用属于同一台设备；需要自行指定画像或连续保持 SDK 会话时使用 [Go Baxia 接口](../../README.md#baxia--fireye-的-bx-ua)。该接口不生成 `bx_et`、`bx-umidtoken` 或验证码通过凭据。
+
+### 错误与超时
+
+错误复用 `{ "ok": false, "errorType": "...", "error": "...", "traceId": "..." }` 格式：
+
+| HTTP 状态 | `errorType` | 说明 |
+|---|---|---|
+| `400` | `ApiRequestError` / `InvalidRequest` | 必填 URL、JSON、代理等请求参数无效 |
+| `403` | `ApiOriginError` | 明确的跨源浏览器请求 |
+| `500` | `BaxiaSourceError` | AWSC 或 Fireye 下载失败 |
+| `500` | `BaxiaUnsupportedSDKError` | 当前 SDK 接口或编码路径无法适配 |
+| `500` | `BaxiaRuntimeError` | V8 初始化、执行或 token 校验失败 |
+| `500` | `BaxiaCanceled` | 请求取消或执行超时 |
+| `500` | `InternalError` | 内部错误；不回显底层错误或 panic 内容 |
+
+总执行受服务 `--timeout` 和客户端连接 context 限制；脚本下载与会话创建阶段另有最多 2 分钟上限，单次初始化最多 30 秒，均不延长外层 deadline。下载或适配失败不会返回旧 token，也不会静默回退到旧 SDK。具体错误消息已脱敏，排查时携带 `traceId`。
+
+## 验证码接口：处理结果与错误
 
 | HTTP 状态 | `errorType` | 语义 | Solver 调用 |
 |---|---|---|---|
@@ -195,7 +261,7 @@ Handler 不因本机在途请求数返回 `429` 或 `Retry-After`。每个通过
 | 所有响应 | `Cache-Control: no-store` | 防止包含挑战结果的响应被缓存 |
 | `GET /` | `Content-Security-Policy`、`X-Frame-Options`、`Cross-Origin-Resource-Policy`、`Permissions-Policy` | 页面只运行随机 nonce 的内联资源，只连接同源 API，禁止被 frame 嵌入 |
 | `GET /` | `Content-Type: text/html; charset=utf-8` | 内嵌测试页 |
-| `/api/slider` 的 `200/400/403/500` | `X-Trace-ID` | 与响应体 `traceId` 一致 |
+| `/api/slider` 和 `/api/bxua` 的 `200/400/403/500` | `X-Trace-ID` | 与响应体 `traceId` 一致 |
 | JSON 响应 | `Content-Type: application/json; charset=utf-8` | UTF-8 JSON |
 | HTML 与 JSON | `X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer` | 禁止 MIME 猜测且不发送 referrer |
 
@@ -221,7 +287,7 @@ curl --fail --output openapi.json http://127.0.0.1:8000/openapi.json
 
 ## 实现与回归入口
 
-HTTP 的输入、输出与 OpenAPI 由 [interfaces/httpapi](../../internal/interfaces/httpapi) 维护。`Handler` 消费应用层请求/结果合同，不依赖公共 SDK；兼容映射位于 [pkg/slider](../../pkg/slider)。HTTP 与 SDK 最终调用同一个应用 service，见 [架构](../design/architecture.md)。
+HTTP 的输入、输出与 OpenAPI 由 [interfaces/httpapi](../../internal/interfaces/httpapi) 维护。`Handler` 消费应用层请求/结果合同，不依赖公共 SDK；验证码兼容映射位于 [pkg/slider](../../pkg/slider)。Baxia HTTP 由应用层编排，复用 [pkg/baxia](../../pkg/baxia) 对应的底层下载与会话实现。
 
 ```bash
 go test -count=1 ./internal/interfaces/httpapi ./tests/architecture

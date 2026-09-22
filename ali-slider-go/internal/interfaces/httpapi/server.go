@@ -21,6 +21,7 @@ import (
 const (
 	TestPagePath = "/"
 	SolvePath    = "/api/slider"
+	BaxiaPath    = "/api/bxua"
 	HealthPath   = "/health"
 	OpenAPIPath  = "/openapi.json"
 	// MaxRequestBytes 是 POST body 与 legacy GET raw query 的共享上限。
@@ -32,6 +33,7 @@ var browserOriginProtection = http.NewCrossOriginProtection()
 // Options 配置 HTTP 层。Solver 是唯一必填项；其余零值使用项目默认值。
 type Options struct {
 	Solver         service.Executor
+	Baxia          service.BaxiaExecutor
 	DefaultSceneID string
 	DefaultPrefix  string
 	Timeout        time.Duration
@@ -41,6 +43,7 @@ type Options struct {
 // Handler 实现滑块 HTTP API。合法请求不做本地并发准入限制，直接进入 Solver。
 type Handler struct {
 	solver         service.Executor
+	baxia          service.BaxiaExecutor
 	defaultSceneID string
 	defaultPrefix  string
 	timeout        time.Duration
@@ -83,6 +86,7 @@ func New(options Options) (*Handler, error) {
 
 	return &Handler{
 		solver:         options.Solver,
+		baxia:          options.Baxia,
 		defaultSceneID: options.DefaultSceneID,
 		defaultPrefix:  options.DefaultPrefix,
 		timeout:        options.Timeout,
@@ -91,7 +95,7 @@ func New(options Options) (*Handler, error) {
 	}, nil
 }
 
-// ServeHTTP 仅暴露冻结合同中的四个路径；Solve 同时兼容旧 GET query 和当前 POST JSON。
+// ServeHTTP 仅暴露约定路径；Solve 兼容旧 GET query，Baxia 只接受 POST JSON。
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	switch {
@@ -100,6 +104,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.logResult("", status, started)
 	case (r.Method == http.MethodGet || r.Method == http.MethodPost) && r.URL.Path == SolvePath:
 		h.handleSolve(w, r, started)
+	case r.Method == http.MethodPost && r.URL.Path == BaxiaPath:
+		h.handleBaxia(w, r, started)
 	case r.Method == http.MethodGet && r.URL.Path == HealthPath:
 		h.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": "ready"}, nil)
 		h.logResult("", http.StatusOK, started)

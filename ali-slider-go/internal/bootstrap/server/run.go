@@ -64,8 +64,12 @@ func serve(rootContext context.Context, listener net.Listener, cfg config.Config
 	} else {
 		logger.Printf("event=artifact_purge status=ok removed=%d", removed)
 	}
+	baxia, err := parentbootstrap.NewBaxiaExecutor(cfg.V8RuntimeLibrary, cfg.Timeout)
+	if err != nil {
+		return fmt.Errorf("创建 Baxia 生成器: %w", err)
+	}
 	handler, err := httpapi.New(httpapi.Options{
-		Solver: client, DefaultSceneID: cfg.SceneID, DefaultPrefix: cfg.Prefix,
+		Solver: client, Baxia: baxia, DefaultSceneID: cfg.SceneID, DefaultPrefix: cfg.Prefix,
 		Timeout: cfg.Timeout, Logger: logger,
 	})
 	if err != nil {

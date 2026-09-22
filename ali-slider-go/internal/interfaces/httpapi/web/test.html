@@ -39,10 +39,13 @@
 
     a { color: var(--blue); }
 
-    button, input { font: inherit; }
+    button, input, select { font: inherit; }
+
+    [hidden] { display: none !important; }
 
     button:focus-visible,
     input:focus-visible,
+    select:focus-visible,
     pre:focus-visible,
     a:focus-visible {
       outline: 3px solid rgba(100, 168, 255, 0.75);
@@ -184,6 +187,19 @@
 
     .field.full { grid-column: 1 / -1; }
 
+    .mode-fields {
+      min-width: 0;
+      margin: 18px 0;
+      padding: 0;
+      border: 0;
+    }
+
+    .mode-fields legend {
+      margin-bottom: 12px;
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+
     label {
       display: block;
       margin-bottom: 7px;
@@ -194,7 +210,9 @@
 
     input[type="text"],
     input[type="password"],
-    input[type="number"] {
+    input[type="number"],
+    input[type="url"],
+    select {
       width: 100%;
       min-height: 44px;
       border: 1px solid rgba(148, 174, 204, 0.27);
@@ -386,7 +404,7 @@
       <div>
         <p class="eyebrow">Ali Slider Go</p>
         <h1>API 测试台</h1>
-        <p class="lead">手工发送一次真实滑块求解请求，查看 HTTP 状态、端到端耗时、追踪 ID 和完整阶段结果。</p>
+        <p class="lead">选择验证码求解或 Baxia bx-ua，手工发送一次请求，查看 HTTP 状态、耗时、追踪 ID 和完整响应。</p>
       </div>
       <div class="health" role="status" aria-live="polite">
         <span class="health-dot" id="health-dot" aria-hidden="true"></span>
@@ -403,11 +421,19 @@
       <section class="card" aria-labelledby="request-title">
         <div class="card-header">
           <h2 id="request-title">请求参数</h2>
-          <p>字段全部可留空；服务会使用当前启动配置的默认 Scene ID 和 prefix。</p>
+          <p id="request-hint">求解参数可留空；服务会使用当前启动配置的默认 Scene ID 和 prefix。</p>
         </div>
         <div class="card-body">
           <form id="solve-form" autocomplete="off">
-            <div class="fields">
+            <div class="field">
+              <label for="api-mode">请求类型</label>
+              <select id="api-mode">
+                <option value="slider">验证码求解</option>
+                <option value="bxua">Baxia bx-ua</option>
+              </select>
+            </div>
+            <fieldset class="fields mode-fields" id="slider-fields">
+              <legend>验证码求解参数</legend>
               <div class="field">
                 <label for="scene-id">SceneId</label>
                 <input id="scene-id" type="text" aria-describedby="scene-id-hint" placeholder="留空使用服务默认值" spellcheck="false">
@@ -418,12 +444,27 @@
                 <input id="prefix" type="text" maxlength="32" pattern="[A-Za-z0-9]{1,32}" aria-describedby="prefix-hint" placeholder="留空使用服务默认值" spellcheck="false">
                 <span class="hint" id="prefix-hint">非空时只能包含 ASCII 字母和数字</span>
               </div>
-              <div class="field">
+              <div class="field full">
                 <label for="rpc-key">AaduaneId</label>
                 <input id="rpc-key" type="password" aria-describedby="rpc-key-hint" placeholder="可选 RPC key id" autocomplete="off" spellcheck="false">
                 <span class="hint" id="rpc-key-hint">最多 128 个 Unicode 字符；敏感输入，不会写入浏览器存储</span>
               </div>
-              <div class="field">
+            </fieldset>
+            <fieldset class="fields mode-fields" id="bxua-fields" hidden disabled>
+              <legend>bx-ua 生成参数</legend>
+              <div class="field full">
+                <label for="page-url">pageUrl · 页面 URL（必填）</label>
+                <input id="page-url" type="url" required aria-describedby="page-url-hint" placeholder="https://example.com/login" spellcheck="false">
+                <span class="hint" id="page-url-hint">触发 Baxia 的完整页面地址，使用 HTTP 或 HTTPS。</span>
+              </div>
+              <div class="field full">
+                <label for="request-url">requestUrl · 请求 URL（必填）</label>
+                <input id="request-url" type="url" required aria-describedby="request-url-hint" placeholder="https://example.com/api/login" spellcheck="false">
+                <span class="hint" id="request-url-hint">需要携带 bx-ua 的完整请求地址；本页面不会调用此业务接口。</span>
+              </div>
+            </fieldset>
+            <div class="fields">
+              <div class="field full">
                 <label for="proxy">proxy</label>
                 <input id="proxy" type="password" aria-describedby="proxy-hint" placeholder="可选，例如 http://127.0.0.1:7890" autocomplete="off" spellcheck="false">
                 <span class="hint" id="proxy-hint">支持 HTTP(S)、SOCKS4、SOCKS5、SOCKS5H</span>
@@ -435,7 +476,7 @@
               </div>
             </div>
 
-            <div class="notice">
+            <div class="notice" id="request-notice">
               点击发送会访问真实 Device、Captcha、图片 CDN 和 Verify 上游。取消发生在 Verify 发出后时，结果可能未知；本页面绝不自动重试。
             </div>
 
@@ -452,7 +493,7 @@
       <section class="card" aria-labelledby="result-title">
         <div class="card-header">
           <h2 id="result-title">运行结果</h2>
-          <p>HTTP 200 仍需同时检查 ok、VerifyCode 和 VerifyResult。</p>
+          <p id="result-hint">HTTP 200 仍需同时检查 ok、VerifyCode 和 VerifyResult。</p>
         </div>
         <div class="card-body">
           <div class="result-banner" id="result-status" role="status" aria-live="polite">
@@ -466,7 +507,7 @@
             <div class="metric"><span>HTTP</span><strong id="http-status">—</strong></div>
             <div class="metric"><span>页面墙钟</span><strong id="wall-time">—</strong></div>
             <div class="metric"><span>Trace ID</span><strong id="trace-id">—</strong></div>
-            <div class="metric"><span>业务状态</span><strong id="business-status">—</strong></div>
+            <div class="metric"><span id="business-status-label">业务状态</span><strong id="business-status">—</strong></div>
           </div>
 
           <div class="section-title">
@@ -497,6 +538,9 @@
 
     (() => {
       const form = document.getElementById("solve-form");
+      const modeSelect = document.getElementById("api-mode");
+      const sliderFields = document.getElementById("slider-fields");
+      const bxuaFields = document.getElementById("bxua-fields");
       const submitButton = document.getElementById("submit");
       const cancelButton = document.getElementById("cancel");
       const clearButton = document.getElementById("clear");
@@ -519,13 +563,31 @@
       let lastRequest = {};
       let lastResponse = null;
 
-      document.getElementById("endpoint").textContent = `${location.origin}/api/slider`;
+      function updateMode() {
+        const bxua = modeSelect.value === "bxua";
+        sliderFields.hidden = bxua;
+        sliderFields.disabled = bxua;
+        bxuaFields.hidden = !bxua;
+        bxuaFields.disabled = !bxua;
+        document.getElementById("endpoint").textContent = `${location.origin}${bxua ? "/api/bxua" : "/api/slider"}`;
+        document.getElementById("request-hint").textContent = bxua
+          ? "pageUrl 和 requestUrl 必填，proxy 可选。只提交当前类型的参数。"
+          : "求解参数可留空；服务会使用当前启动配置的默认 Scene ID 和 prefix。";
+        document.getElementById("request-notice").textContent = bxua
+          ? "点击发送会向本服务申请生成一次 bx-ua。requestUrl 用于生成 token，页面不会自动调用该业务接口，也不会自动重试。"
+          : "点击发送会访问真实 Device、Captcha、图片 CDN 和 Verify 上游。取消发生在 Verify 发出后时，结果可能未知；本页面绝不自动重试。";
+        document.getElementById("result-hint").textContent = bxua
+          ? "HTTP 200 仍需检查 ok 和 bx-ua。生成成功不代表站点登录或业务请求已获放行。"
+          : "HTTP 200 仍需同时检查 ok、VerifyCode 和 VerifyResult。";
+        document.getElementById("business-status-label").textContent = bxua ? "生成状态" : "业务状态";
+        submitButton.textContent = bxua ? "生成一次 bx-ua" : "发送一次求解";
+      }
 
       function maskedClone(value) {
         if (value === null || typeof value !== "object") return value;
         const clone = JSON.parse(JSON.stringify(value));
         if (revealSensitive.checked) return clone;
-        const sensitive = new Set(["securitytoken", "certifyid", "aaduaneid", "proxy"]);
+        const sensitive = new Set(["securitytoken", "certifyid", "aaduaneid", "proxy", "bx-ua"]);
         const walk = (node) => {
           if (Array.isArray(node)) {
             node.forEach(walk);
@@ -554,24 +616,41 @@
       }
 
       function setBusy(busy) {
+        modeSelect.disabled = busy;
         submitButton.disabled = busy;
         cancelButton.disabled = !busy;
         clearButton.disabled = busy;
       }
 
-      function collectRequest() {
+      function collectRequest(mode) {
         const request = {};
-        const fields = [
+        const fields = mode === "bxua" ? [
+          ["page-url", "pageUrl"],
+          ["request-url", "requestUrl"]
+        ] : [
           ["scene-id", "SceneId"],
           ["prefix", "prefix"],
-          ["rpc-key", "AaduaneId"],
-          ["proxy", "proxy"]
+          ["rpc-key", "AaduaneId"]
         ];
+        fields.push(["proxy", "proxy"]);
         fields.forEach(([id, name]) => {
           const value = document.getElementById(id).value.trim();
           if (value !== "") request[name] = value;
         });
         return request;
+      }
+
+      function resetResult() {
+        revealSensitive.checked = false;
+        lastRequest = {};
+        lastResponse = null;
+        resultLabel.textContent = "尚未发送";
+        resultDetail.textContent = "填写参数后手工发送一次请求。";
+        httpStatus.textContent = "—";
+        wallTime.textContent = "—";
+        traceID.textContent = "—";
+        businessStatus.textContent = "—";
+        renderStoredData();
       }
 
       function setHealth(state, text) {
@@ -610,7 +689,9 @@
         event.preventDefault();
         if (!form.reportValidity() || activeController !== null) return;
 
-        const request = collectRequest();
+        const mode = modeSelect.value;
+        const endpoint = mode === "bxua" ? "/api/bxua" : "/api/slider";
+        const request = collectRequest(mode);
         const body = JSON.stringify(request);
         if (new TextEncoder().encode(body).length > 65536) {
           resultLabel.textContent = "请求未发送";
@@ -644,7 +725,7 @@
         const started = performance.now();
 
         try {
-          const response = await fetch("/api/slider", {
+          const response = await fetch(endpoint, {
             method: "POST",
             headers: {
               "Accept": "application/json",
@@ -668,20 +749,25 @@
             (lastResponse && typeof lastResponse === "object" ? lastResponse.traceId : "") || "—";
           const completed = lastResponse !== null && typeof lastResponse === "object" && !Array.isArray(lastResponse);
           const successfulHTTP = response.status === 200;
-          const verified = successfulHTTP && completed && lastResponse.ok === true &&
-            lastResponse.VerifyCode === "T001" && lastResponse.VerifyResult === true &&
-            typeof lastResponse.securityToken === "string" && lastResponse.securityToken.length > 0;
+          const succeeded = successfulHTTP && completed && lastResponse.ok === true && (mode === "bxua"
+            ? typeof lastResponse["bx-ua"] === "string" && lastResponse["bx-ua"].trim().length > 0
+            : lastResponse.VerifyCode === "T001" && lastResponse.VerifyResult === true &&
+              typeof lastResponse.securityToken === "string" && lastResponse.securityToken.length > 0);
           const businessFailed = successfulHTTP && completed && lastResponse.ok === false;
 
           httpStatus.textContent = `${response.status} ${response.statusText}`.trim();
           traceID.textContent = trace;
-          if (verified) {
-            resultLabel.textContent = "验证成功";
-            resultDetail.textContent = "HTTP 与业务结果均成功。";
+          if (succeeded) {
+            resultLabel.textContent = mode === "bxua" ? "bx-ua 已生成" : "验证成功";
+            resultDetail.textContent = mode === "bxua"
+              ? "生成成功不代表站点登录或业务请求已获放行。"
+              : "HTTP 与业务结果均成功。";
             businessStatus.textContent = "ok=true";
           } else if (businessFailed) {
-            resultLabel.textContent = "请求完成，验证未通过";
-            resultDetail.textContent = "HTTP 200 不代表业务成功，请检查 VerifyCode 和 VerifyResult。";
+            resultLabel.textContent = mode === "bxua" ? "请求完成，生成未成功" : "请求完成，验证未通过";
+            resultDetail.textContent = mode === "bxua"
+              ? "未生成可用的 bx-ua，请检查响应中的错误信息。"
+              : "HTTP 200 不代表业务成功，请检查 VerifyCode 和 VerifyResult。";
             businessStatus.textContent = "ok=false";
           } else if (!response.ok) {
             resultLabel.textContent = "API 返回错误";
@@ -729,17 +815,18 @@
       });
 
       clearButton.addEventListener("click", () => {
+        if (activeController !== null) return;
+        const mode = modeSelect.value;
         form.reset();
-        revealSensitive.checked = false;
-        lastRequest = {};
-        lastResponse = null;
-        resultLabel.textContent = "尚未发送";
-        resultDetail.textContent = "填写参数后手工发送一次请求。";
-        httpStatus.textContent = "—";
-        wallTime.textContent = "—";
-        traceID.textContent = "—";
-        businessStatus.textContent = "—";
-        renderStoredData();
+        modeSelect.value = mode;
+        updateMode();
+        resetResult();
+      });
+
+      modeSelect.addEventListener("change", () => {
+        if (activeController !== null) return;
+        updateMode();
+        resetResult();
       });
 
       revealSensitive.addEventListener("change", renderStoredData);
@@ -748,6 +835,7 @@
         if (activeController !== null) activeController.abort();
       });
 
+      updateMode();
       renderStoredData();
       checkHealth();
     })();

@@ -41,7 +41,7 @@ go test -count=1 ./tests/architecture
 | `internal/infrastructure/{httpclient,aliyun,artifact}` | Fake RoundTripper、上游 schema、代理/路由、双图下载、唯一 Verify、失败样本 |
 | `internal/infrastructure/engine` | Device bridge、脚本/profile 缓存、V8/纯 Go 差分与 fallback；可选 Node oracle |
 | `internal/platform/v8runtime` | 真库开启时的 C ABI、host callback、取消、heap/时间边界和 Isolate 生命周期 |
-| `internal/interfaces/httpapi` | 四路径、输入/别名/分源、旧 GET、状态、脱敏、OpenAPI、内嵌页与跨源边界 |
+| `internal/interfaces/httpapi` | 五路径、输入/别名/分源、旧 GET、Baxia、状态、脱敏、OpenAPI、内嵌页与跨源边界 |
 | `internal/bootstrap`、`internal/bootstrap/server`、`cmd/server`、`pkg/slider` | 配置映射、生产组装、HTTP header 预算、进程入口与公共兼容 |
 | `tests/architecture` | 生产导入方向与公共 API 黄金快照 |
 
