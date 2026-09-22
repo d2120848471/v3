@@ -123,8 +123,12 @@ func TestBaxiaRequestOwnsProfileProxyAndResources(t *testing.T) {
 					"User-Agent": fmt.Sprintf("request-UA-%d", index), "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8",
 					"Sec-CH-UA": `"Chromium";v="150"`, "Sec-CH-UA-Mobile": "?1", "Sec-CH-UA-Platform": `"Android"`,
 				}
-				if !reflect.DeepEqual(outcome.UAHeaders, wantHeaders) || outcome.Result != result || !outcome.Proxied || outcome.Elapsed <= 0 {
-					t.Fatal("result, headers, proxy flag or elapsed time does not match the request")
+				if !reflect.DeepEqual(outcome.UAHeaders, wantHeaders) || outcome.Result != result || !outcome.Proxied {
+					t.Fatal("result, headers or proxy flag does not match the request")
+				}
+				// 快速 Mock 可在 Windows 的同一时钟刻度内完成；耗时合同允许为零。
+				if outcome.Elapsed < 0 {
+					t.Fatalf("elapsed time must be nonnegative: %s", outcome.Elapsed)
 				}
 			}
 			if profiles != 2 || clients != 2 || !reflect.DeepEqual(events, []string{"session", "client", "session", "client"}) {
