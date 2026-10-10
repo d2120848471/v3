@@ -3,430 +3,224 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
-  <title>Ali Slider Go · API 测试台</title>
+  <meta name="color-scheme" content="light">
+  <title>Ali Slider Go · 开发者文档</title>
   <style nonce="__ALI_SLIDER_CSP_NONCE__">
     :root {
-      color-scheme: dark;
-      --background: #07111f;
-      --surface: rgba(13, 28, 47, 0.88);
-      --surface-strong: #10233b;
-      --line: rgba(148, 174, 204, 0.19);
-      --text: #f2f7fc;
-      --muted: #9fb2c8;
-      --accent: #39d6b4;
-      --accent-strong: #13b995;
-      --blue: #64a8ff;
-      --warning: #ffc66d;
-      --danger: #ff7e87;
-      --success: #53dfa2;
-      --shadow: 0 24px 70px rgba(0, 0, 0, 0.28);
+      color-scheme: light;
+      --accent: #6556d9;
+      --accent-hover: #5445c6;
+      --text: #27324b;
+      --muted: #68758b;
+      --line: #e8ebf2;
+      --surface: #f7f8fc;
+      font: 14px/1.7 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: var(--text);
+      background: #fff;
     }
-
     * { box-sizing: border-box; }
-
-    body {
-      min-height: 100vh;
-      margin: 0;
-      background:
-        radial-gradient(circle at 12% 8%, rgba(44, 130, 202, 0.18), transparent 34rem),
-        radial-gradient(circle at 88% 12%, rgba(20, 185, 149, 0.12), transparent 30rem),
-        var(--background);
-      color: var(--text);
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      line-height: 1.5;
-    }
-
-    a { color: var(--blue); }
-
-    button, input, select { font: inherit; }
-
+    body { margin: 0; }
+    body:has(dialog[open]) { overflow: hidden; }
     [hidden] { display: none !important; }
-
-    button:focus-visible,
-    input:focus-visible,
-    select:focus-visible,
-    pre:focus-visible,
-    a:focus-visible {
-      outline: 3px solid rgba(100, 168, 255, 0.75);
-      outline-offset: 3px;
-    }
-
-    .shell {
-      width: min(1180px, calc(100% - 32px));
-      margin: 0 auto;
-      padding: 44px 0 32px;
-    }
-
-    .hero {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 24px;
-      margin-bottom: 24px;
-    }
-
-    .eyebrow {
-      margin: 0 0 8px;
-      color: var(--accent);
-      font-size: 0.76rem;
-      font-weight: 800;
-      letter-spacing: 0.16em;
-      text-transform: uppercase;
-    }
-
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    button, input, select { font: inherit; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
     h1, h2, h3, p { margin-top: 0; }
-
-    h1 {
-      margin-bottom: 10px;
-      font-size: clamp(2rem, 5vw, 3.5rem);
-      line-height: 1.03;
-      letter-spacing: -0.045em;
-    }
-
-    .lead {
-      max-width: 720px;
-      margin-bottom: 0;
-      color: var(--muted);
-      font-size: 1rem;
-    }
-
-    .health {
-      display: inline-flex;
-      flex: 0 0 auto;
-      align-items: center;
-      gap: 9px;
-      min-width: 150px;
-      padding: 10px 14px;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      background: rgba(7, 17, 31, 0.72);
-      color: var(--muted);
-      font-size: 0.88rem;
-    }
-
-    .health-dot {
-      width: 9px;
-      height: 9px;
-      border-radius: 50%;
-      background: var(--warning);
-      box-shadow: 0 0 0 4px rgba(255, 198, 109, 0.12);
-    }
-
-    .health-dot.good {
-      background: var(--success);
-      box-shadow: 0 0 0 4px rgba(83, 223, 162, 0.12);
-    }
-
-    .health-dot.bad {
-      background: var(--danger);
-      box-shadow: 0 0 0 4px rgba(255, 126, 135, 0.12);
-    }
-
-    .endpoint-bar {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      margin-bottom: 20px;
-      padding: 12px 14px;
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      background: rgba(7, 17, 31, 0.64);
-      color: var(--muted);
-      font-size: 0.9rem;
-      overflow-wrap: anywhere;
-    }
-
-    .method {
-      padding: 3px 8px;
-      border-radius: 7px;
-      background: rgba(57, 214, 180, 0.13);
-      color: var(--accent);
-      font-weight: 800;
-      letter-spacing: 0.05em;
-    }
-
-    .grid {
-      display: grid;
-      grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.08fr);
-      gap: 20px;
-    }
-
-    .card {
-      min-width: 0;
-      border: 1px solid var(--line);
-      border-radius: 18px;
-      background: var(--surface);
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(14px);
-    }
-
-    .card-header {
-      padding: 21px 22px 15px;
-      border-bottom: 1px solid var(--line);
-    }
-
-    .card-header h2 {
-      margin-bottom: 5px;
-      font-size: 1.08rem;
-    }
-
-    .card-header p {
-      margin-bottom: 0;
-      color: var(--muted);
-      font-size: 0.86rem;
-    }
-
-    .card-body { padding: 22px; }
-
-    .fields {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 16px;
-    }
-
-    .field.full { grid-column: 1 / -1; }
-
-    .mode-fields {
-      min-width: 0;
-      margin: 18px 0;
-      padding: 0;
-      border: 0;
-    }
-
-    .mode-fields legend {
-      margin-bottom: 12px;
-      color: var(--muted);
-      font-size: 0.82rem;
-    }
-
-    label {
-      display: block;
-      margin-bottom: 7px;
-      color: #dbe8f5;
-      font-size: 0.87rem;
-      font-weight: 700;
-    }
-
-    input[type="text"],
-    input[type="password"],
-    input[type="number"],
-    input[type="url"],
-    select {
-      width: 100%;
-      min-height: 44px;
-      border: 1px solid rgba(148, 174, 204, 0.27);
-      border-radius: 10px;
-      background: rgba(5, 14, 26, 0.72);
-      color: var(--text);
-      padding: 10px 12px;
-    }
-
-    input::placeholder { color: #6f849b; }
-
-    input:invalid { border-color: var(--danger); }
-
-    .hint {
-      display: block;
-      margin-top: 6px;
-      color: var(--muted);
-      font-size: 0.76rem;
-    }
-
-    .notice {
-      margin: 18px 0;
-      padding: 12px 13px;
-      border: 1px solid rgba(255, 198, 109, 0.26);
-      border-radius: 11px;
-      background: rgba(255, 198, 109, 0.07);
-      color: #f4d9a9;
-      font-size: 0.82rem;
-    }
-
-    .actions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-    }
-
-    button {
-      min-height: 42px;
-      border: 1px solid transparent;
-      border-radius: 10px;
-      padding: 9px 15px;
-      cursor: pointer;
-      font-weight: 750;
-    }
-
-    button:disabled {
-      cursor: not-allowed;
-      opacity: 0.5;
-    }
-
-    .primary {
-      background: linear-gradient(135deg, var(--accent), var(--accent-strong));
-      color: #04130f;
-    }
-
-    .secondary {
-      border-color: var(--line);
-      background: rgba(148, 174, 204, 0.08);
-      color: var(--text);
-    }
-
-    .danger {
-      border-color: rgba(255, 126, 135, 0.3);
-      background: rgba(255, 126, 135, 0.09);
-      color: #ffb2b8;
-    }
-
-    .result-banner {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 14px;
-      margin-bottom: 16px;
-      padding: 13px 14px;
-      border: 1px solid var(--line);
-      border-radius: 11px;
-      background: rgba(5, 14, 26, 0.58);
-    }
-
-    .result-banner strong { display: block; }
-
-    .result-banner span {
-      color: var(--muted);
-      font-size: 0.8rem;
-    }
-
-    .metrics {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 9px;
-      margin-bottom: 17px;
-    }
-
-    .metric {
-      min-width: 0;
-      padding: 10px;
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      background: rgba(5, 14, 26, 0.5);
-    }
-
-    .metric span {
-      display: block;
-      margin-bottom: 3px;
-      color: var(--muted);
-      font-size: 0.72rem;
-    }
-
-    .metric strong {
-      display: block;
-      overflow: hidden;
-      color: #e7f1fb;
-      font-size: 0.82rem;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    .section-title {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      margin: 17px 0 8px;
-    }
-
-    .section-title h3 {
-      margin: 0;
-      font-size: 0.87rem;
-    }
-
-    .reveal {
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      color: var(--muted);
-      font-size: 0.78rem;
-      font-weight: 500;
-    }
-
-    .reveal input { accent-color: var(--accent); }
-
-    pre {
-      min-height: 104px;
-      max-height: 310px;
-      margin: 0;
-      overflow: auto;
-      border: 1px solid var(--line);
-      border-radius: 11px;
-      background: #050d18;
-      color: #d9e9f8;
-      padding: 14px;
-      font: 0.79rem/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      tab-size: 2;
-      white-space: pre-wrap;
-      overflow-wrap: anywhere;
-    }
-
-    .footer {
-      display: flex;
-      justify-content: space-between;
-      gap: 16px;
-      margin-top: 20px;
-      color: var(--muted);
-      font-size: 0.78rem;
-    }
-
+    h1 { margin-bottom: 14px; font-size: 34px; line-height: 1.4; letter-spacing: -.8px; font-weight: 650; }
+    h2 { font-size: 19px; font-weight: 600; }
+    h3 { font-size: 14px; font-weight: 600; }
+    code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+    button { min-height: 36px; padding: 7px 13px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--text); cursor: pointer; font-size: 12px; font-weight: 550; }
+    button:hover { background: var(--surface); }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .primary { color: #fff; background: var(--accent); border-color: var(--accent); }
+    .primary:hover { background: var(--accent-hover); }
+    .danger { color: #b34848; }
+    .skip-link { position: fixed; top: -60px; left: 16px; z-index: 50; padding: 8px 14px; background: var(--accent); color: #fff; border-radius: 6px; }
+    .skip-link:focus { top: 8px; }
+    .topbar { position: sticky; top: 0; z-index: 10; height: 64px; display: flex; align-items: center; gap: 24px; padding: 0 28px; border-bottom: 1px solid var(--line); background: #fff; }
+    .brand { display: flex; align-items: center; gap: 11px; min-width: 194px; color: var(--text); font-size: 18px; font-weight: 650; white-space: nowrap; }
+    .brand:hover { text-decoration: none; }
+    .brand small { color: var(--muted); font-size: 13px; font-weight: 500; }
+    .brand-mark { display: grid; place-items: center; width: 31px; height: 31px; border-radius: 9px; color: #fff; background: var(--accent); font-size: 20px; }
+    .topbar-label { padding-left: 23px; border-left: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+    .topbar-actions { display: flex; align-items: center; gap: 22px; margin-left: auto; font-size: 12px; }
+    .topbar-actions a { color: var(--muted); }
+    .health { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .health-dot { width: 7px; height: 7px; border-radius: 50%; background: #cc9a37; }
+    .health-dot.good { background: #2b9b75; }
+    .health-dot.bad { background: #d35b5b; }
+    .workspace { display: grid; grid-template-columns: 250px minmax(0, 1fr); min-height: calc(100vh - 64px); }
+    .navigation { position: sticky; top: 64px; align-self: start; height: calc(100vh - 64px); overflow-y: auto; padding: 25px 17px; border-right: 1px solid var(--line); background: #fcfcfe; }
+    .search-label { display: block; margin: 0 0 8px 2px; color: var(--muted); font-size: 11px; }
+    input[type="search"] { font-size: 12px; }
+    #navigation-details > summary { display: none; }
+    #navigation-details:not([open]) > summary { display: block; margin-top: 12px; }
+    .nav-group h2 { margin: 25px 11px 8px; color: #707b90; font-size: 11px; font-weight: 550; letter-spacing: .25px; }
+    .nav-link { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 37px; margin: 3px 0; padding: 7px 12px; border-radius: 6px; color: #606c82; font-size: 13px; }
+    .nav-link:hover { background: #f2f3f8; text-decoration: none; }
+    .nav-link[aria-current="page"] { background: #efecfc; color: #5b4cc9; font-weight: 600; box-shadow: inset 2px 0 var(--accent); }
+    .nav-link[aria-disabled="true"] { opacity: .5; cursor: not-allowed; }
+    .nav-method { padding: 1px 4px; border-radius: 3px; background: #fff3e7; color: #a95f1b; font: 9px/1.6 "SFMono-Regular", Consolas, monospace; }
+    .nav-note { margin: 30px 11px 0; padding-top: 19px; border-top: 1px solid var(--line); color: #738095; font-size: 11px; line-height: 1.9; }
+    .nav-note button { margin-top: 10px; }
+    #search-empty { margin: 18px 11px; color: var(--muted); font-size: 12px; }
+    .reference-column { width: 100%; max-width: 1190px; min-width: 0; margin: 0 auto; padding: 40px 64px 60px; }
+    .breadcrumb { margin-bottom: 25px; color: #728097; font-size: 12px; }
+    .scene-kicker { margin-bottom: 9px; color: var(--accent); font-size: 11px; font-weight: 600; letter-spacing: .7px; }
+    .scene-description { max-width: 780px; color: var(--muted); line-height: 1.9; }
+    .endpoint-bar { display: flex; align-items: center; gap: 12px; margin: 24px 0 20px; padding: 13px 16px; border: 1px solid #e4e6f1; border-radius: 8px; background: #fafaff; }
+    .method { padding: 3px 8px; border-radius: 5px; background: #e6f6ee; color: #187957; font-size: 11px; font-weight: 650; }
+    .endpoint-bar code { min-width: 0; overflow-wrap: anywhere; font-size: 13px; }
+    .endpoint-bar button { flex: none; margin-left: auto; }
+    .boundary { padding: 12px 15px; border-left: 2px solid #d7c188; border-radius: 0 5px 5px 0; background: #fbfaf5; color: #796844; font-size: 12px; }
+    .doc-section { margin-top: 32px; }
+    .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
+    .section-heading h2, .section-heading h3 { margin: 0; }
+    .section-heading span, .muted { color: var(--muted); font-size: 12px; }
+    .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+    table { width: 100%; border-spacing: 0; font-size: 12px; text-align: left; }
+    th { padding: 10px 16px; background: var(--surface); color: var(--muted); font-weight: 550; white-space: nowrap; }
+    td { padding: 13px 16px; border-top: 1px solid var(--line); color: #5b6880; vertical-align: top; }
+    td:first-child { color: #414c68; font-family: "SFMono-Regular", Consolas, monospace; white-space: nowrap; }
+    td:nth-child(2), #parameter-rows td:nth-child(3) { white-space: nowrap; }
+    .example-actions { display: flex; align-items: center; gap: 8px; }
+    .example-actions select { width: auto; min-height: 34px; font-size: 12px; }
+    pre { margin: 0; padding: 18px; max-height: 340px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: #f8f9fc; color: #45506c; font-size: 12px; line-height: 1.85; white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 2; }
+    #example-copy-status { min-height: 20px; margin: 5px 0 0; color: var(--muted); font-size: 11px; }
+    .response-note { margin-bottom: 16px; color: var(--muted); font-size: 13px; }
+    .footer { display: flex; justify-content: space-between; gap: 20px; margin-top: 36px; padding-top: 20px; border-top: 1px solid var(--line); color: #8891a3; font-size: 11px; }
     .footer p { margin: 0; }
-
-    @media (max-width: 860px) {
-      .hero { display: block; }
-      .health { margin-top: 18px; }
-      .grid { grid-template-columns: 1fr; }
-      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    }
-
-    @media (max-width: 560px) {
-      .shell { width: min(100% - 20px, 1180px); padding-top: 26px; }
-      .fields { grid-template-columns: 1fr; }
-      .field.full { grid-column: auto; }
-      .card-header, .card-body { padding-left: 16px; padding-right: 16px; }
+    dialog { position: fixed; inset: 0 0 0 auto; width: min(620px, 100%); height: 100%; max-width: 100%; max-height: 100%; margin: 0; padding: 0; border: 0; border-left: 1px solid var(--line); background: #fff; color: var(--text); box-shadow: -16px 0 60px #1821361a; }
+    dialog::backdrop { background: #20284055; }
+    .drawer-header { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; justify-content: space-between; padding: 20px 26px; border-bottom: 1px solid var(--line); background: #fff; }
+    .drawer-header h2 { margin: 2px 0 0; font-size: 19px; }
+    .drawer-header span { color: var(--accent); font-size: 10px; letter-spacing: 1px; }
+    .icon-button { width: 34px; padding: 2px; font-size: 23px; line-height: 1; }
+    .drawer-body { padding: 24px 26px 30px; }
+    .drawer-intro { color: var(--muted); font-size: 12px; }
+    .drawer-endpoint { margin-bottom: 20px; font-size: 12px; overflow-wrap: anywhere; }
+    label { display: block; margin-bottom: 6px; color: #47536b; font-size: 12px; font-weight: 550; }
+    input[type="text"], input[type="password"], input[type="number"], input[type="url"], input[type="search"], select { width: 100%; min-height: 40px; padding: 8px 11px; border: 1px solid #dfe3ed; border-radius: 6px; color: var(--text); background: #fff; }
+    input::placeholder { color: #9ba3b4; }
+    .fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .field.full { grid-column: 1 / -1; }
+    .mode-fields { min-width: 0; margin: 20px 0; padding: 0; border: 0; }
+    .mode-fields legend { margin-bottom: 12px; color: var(--muted); font-size: 11px; }
+    .hint { display: block; margin-top: 5px; color: #8992a4; font-size: 11px; line-height: 1.65; }
+    .advanced { padding: 12px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+    summary { cursor: pointer; color: #5e6980; font-size: 12px; }
+    summary span { margin-left: 8px; color: #9aa1af; font-size: 11px; }
+    .advanced .fields { margin-top: 15px; }
+    .notice { margin: 18px 0; padding: 11px 13px; border: 1px solid #eee9dc; border-radius: 6px; color: #88734d; background: #fdfbf6; font-size: 11px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .result-section { margin-top: 28px; padding-top: 24px; border-top: 1px solid var(--line); }
+    .result-banner { margin: 16px 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+    .result-banner strong { display: block; font-size: 13px; }
+    .result-banner span { color: var(--muted); font-size: 12px; }
+    .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin: 16px 0; }
+    .metric { min-width: 0; }
+    .metric span { display: block; color: #8992a4; font-size: 10px; }
+    .metric strong { display: block; color: #5e6980; font-size: 11px; overflow-wrap: anywhere; font-weight: 550; }
+    .section-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 18px 0 9px; }
+    .section-title h3 { margin: 0; font-size: 12px; }
+    .reveal { display: inline-flex; align-items: center; gap: 5px; margin: 0; color: var(--muted); font-size: 11px; font-weight: 400; }
+    .reveal input { accent-color: var(--accent); }
+    #request-output { max-height: 180px; }
+    #response-output { min-height: 105px; }
+    .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+    @media (min-width: 1600px) { .reference-column { margin-left: 40px; } }
+    @media (max-width: 1100px) { .reference-column { padding: 32px; } .workspace { grid-template-columns: 220px minmax(0, 1fr); } .topbar-label { display: none; } }
+    @media (max-width: 720px) {
+      .topbar { padding: 0 16px; gap: 12px; }
+      .brand { min-width: 0; font-size: 16px; }
+      .topbar-actions { gap: 12px; }
+      .health { font-size: 11px; }
+      .workspace { display: block; }
+      .navigation { position: static; height: auto; max-height: none; padding: 16px; border-right: 0; border-bottom: 1px solid var(--line); }
+      #navigation-details > summary { display: block; padding-top: 12px; }
+      #navigation { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
+      .nav-group h2 { margin-top: 16px; }
+      .nav-note { display: none; }
+      .reference-column { padding: 26px 20px 40px; }
+      h1 { font-size: 28px; }
+      .breadcrumb { margin-bottom: 18px; }
+      th, td { padding: 10px; }
+      .endpoint-bar { flex-wrap: wrap; padding: 12px; }
+      .endpoint-bar code { flex: 1; font-size: 11px; }
       .footer { display: block; }
-      .footer p + p { margin-top: 7px; }
+    }
+    @media (max-width: 420px) {
+      .brand small { display: none; }
+      .topbar-actions { font-size: 11px; }
+      .section-heading { flex-wrap: wrap; gap: 10px; }
+      .drawer-body, .drawer-header { padding-left: 18px; padding-right: 18px; }
+      .fields { grid-template-columns: 1fr; }
+      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
   </style>
 </head>
 <body>
-  <div class="shell">
-    <header class="hero">
-      <div>
-        <p class="eyebrow">Ali Slider Go</p>
-        <h1>API 测试台</h1>
-        <p class="lead">选择验证码求解、Baxia bx-ua 或 WAF / ESA 验证，手工发送一次请求，查看 HTTP 状态、耗时、追踪 ID 和完整响应。</p>
-      </div>
-      <div class="health" role="status" aria-live="polite">
-        <span class="health-dot" id="health-dot" aria-hidden="true"></span>
-        <span id="health-text">正在检查服务</span>
-      </div>
-    </header>
-
-    <div class="endpoint-bar" aria-label="当前 API 地址">
-      <span class="method">POST</span>
-      <span id="endpoint">/api/slider</span>
+  <a class="skip-link" href="#main-content">跳到文档正文</a>
+  <header class="topbar">
+    <a class="brand" href="#auto"><span class="brand-mark">A</span><span>Ali Slider <small>Go API</small></span></a>
+    <span class="topbar-label">开发者文档</span>
+    <div class="topbar-actions">
+      <div class="health" role="status" aria-live="polite"><span class="health-dot" id="health-dot" aria-hidden="true"></span><span id="health-text">正在检查服务</span></div>
+      <a href="/openapi.json" download>API 规范 ↗</a>
     </div>
-
-    <main class="grid" id="api-test-console">
-      <section class="card" aria-labelledby="request-title">
-        <div class="card-header">
-          <h2 id="request-title">请求参数</h2>
-          <p id="request-hint">求解参数可留空；服务会使用当前启动配置的默认 Scene ID 和 prefix。</p>
-        </div>
-        <div class="card-body">
+  </header>
+  <div class="workspace" id="api-test-console">
+    <aside class="navigation">
+      <label class="search-label" for="search">搜索文档</label>
+      <input id="search" type="search" placeholder="查找类型或接口" autocomplete="off">
+      <details id="navigation-details" open>
+        <summary>浏览接口类型</summary>
+        <nav id="navigation" aria-label="接口类型">
+          <div class="nav-group" id="group-start"><h2>开始使用</h2><a class="nav-link" id="nav-auto" href="#auto" aria-current="page"><span>自动选择</span><span class="nav-method">POST</span></a></div>
+          <div class="nav-group" id="group-captcha"><h2>V3 验证码</h2><a class="nav-link" id="nav-puzzle" href="#puzzle"><span>图片拼图</span><span class="nav-method">POST</span></a><a class="nav-link" id="nav-traceless" href="#traceless"><span>无痕验证</span><span class="nav-method">POST</span></a><a class="nav-link" id="nav-sliding" href="#sliding"><span>拖动滑块</span><span class="nav-method">POST</span></a></div>
+          <div class="nav-group" id="group-waf"><h2>WAF / ESA</h2><a class="nav-link" id="nav-waf" href="#waf"><span>页面验证</span><span class="nav-method">POST</span></a></div>
+          <div class="nav-group" id="group-bxua"><h2>Baxia / Fireye</h2><a class="nav-link" id="nav-bxua" href="#bxua"><span>bx-ua 生成</span><span class="nav-method">POST</span></a></div>
+        </nav>
+      </details>
+      <p id="search-empty" role="status" hidden>没有匹配的接口类型</p>
+      <div class="nav-note">Ali Slider Go 验证服务<br>选择类型，查看文档并在线测试。<br><button id="check-health" type="button">检查服务状态</button></div>
+    </aside>
+    <main class="reference-column" id="main-content" tabindex="-1">
+      <p class="breadcrumb" id="breadcrumb">开始使用 / 自动选择</p>
+      <section aria-labelledby="scene-title">
+        <p class="scene-kicker" id="scene-kicker">CAPTCHA · V3</p>
+        <h1 id="scene-title">自动选择</h1>
+        <p class="scene-description" id="scene-description">根据场景配置与上游返回的验证码类型，自动完成一轮验证。</p>
+        <div class="endpoint-bar" aria-label="当前 API 地址"><span class="method">POST</span><code id="endpoint">/api/slider</code><button class="primary" id="open-debug" type="button">在线调试 ↗</button></div>
+        <p class="boundary" id="scene-note">支持 PUZZLE、TRACELESS 与 SLIDING；实际类型由上游决定。</p>
+      </section>
+      <section class="doc-section" aria-labelledby="params-title">
+        <div class="section-heading"><h2 id="params-title">请求参数</h2><span>application/json</span></div>
+        <div class="table-wrap"><table><thead><tr><th scope="col">参数</th><th scope="col">类型</th><th scope="col">必填</th><th scope="col">说明</th></tr></thead><tbody id="parameter-rows"></tbody></table></div>
+      </section>
+      <section class="doc-section" aria-labelledby="example-title">
+        <div class="section-heading"><h2 id="example-title">调用示例</h2><div class="example-actions"><label class="visually-hidden" for="example-language">示例语言</label><select id="example-language"><option value="curl">cURL</option><option value="python">Python</option><option value="go">Go</option><option value="javascript">JavaScript</option></select><button id="copy-example" type="button">复制代码</button></div></div>
+        <pre tabindex="0" aria-label="调用示例"><code id="example-code"></code></pre>
+        <p id="example-copy-status" role="status"></p>
+      </section>
+      <section class="doc-section" aria-labelledby="response-title">
+        <div class="section-heading"><h2 id="response-title">响应说明</h2><span>HTTP 200</span></div>
+        <p class="response-note" id="response-note"></p>
+        <div class="table-wrap"><table><thead><tr><th scope="col">字段</th><th scope="col">类型</th><th scope="col">说明</th></tr></thead><tbody id="response-rows"></tbody></table></div>
+      </section>
+      <footer class="footer"><p>完整字段与错误定义见 <a href="/openapi.json">OpenAPI 3.0.3</a>。</p><p>Ali Slider Go · 开发者文档与在线调试</p></footer>
+    </main>
+  </div>
+  <dialog id="debug-dialog" aria-labelledby="debug-title">
+    <header class="drawer-header"><div><span>API REQUEST</span><h2 id="debug-title">在线调试 · 自动选择</h2></div><button class="icon-button" id="close-debug" type="button" aria-label="关闭在线调试">×</button></header>
+    <div class="drawer-body">
+      <p class="drawer-intro" id="request-hint">参数留空时使用服务默认配置。</p>
+      <p class="drawer-endpoint"><span class="method">POST</span> <code id="debug-endpoint">/api/slider</code></p>
           <form id="solve-form" autocomplete="off">
             <div class="field">
-              <label for="api-mode">请求类型</label>
+              <label for="api-mode">接口类型</label>
               <select id="api-mode">
                 <option value="slider">验证码求解</option>
                 <option value="bxua">Baxia bx-ua</option>
@@ -448,7 +242,7 @@
               <div class="field full">
                 <label for="rpc-key">AaduaneId</label>
                 <input id="rpc-key" type="password" aria-describedby="rpc-key-hint" placeholder="可选 RPC key id" autocomplete="off" spellcheck="false">
-                <span class="hint" id="rpc-key-hint">最多 128 个 Unicode 字符；敏感输入，不会写入浏览器存储</span>
+                <span class="hint" id="rpc-key-hint">可选，最多 128 个 Unicode 字符</span>
               </div>
             </fieldset>
             <fieldset class="fields mode-fields" id="bxua-fields" hidden disabled>
@@ -472,6 +266,7 @@
                 <span class="hint" id="waf-page-url-hint">使用公网域名 HTTPS 地址和默认或 443 端口，保留 query；不含用户名、密码或 # 路由。最多 8,192 个 UTF-8 字节。</span>
               </div>
             </fieldset>
+            <details class="advanced"><summary>代理与超时 <span>可选设置</span></summary>
             <div class="fields">
               <div class="field full">
                 <label for="proxy">proxy</label>
@@ -481,30 +276,24 @@
               <div class="field full">
                 <label for="client-timeout">页面等待上限（秒）</label>
                 <input id="client-timeout" type="number" min="1" max="305" value="30" inputmode="numeric" aria-describedby="client-timeout-hint">
-                <span class="hint" id="client-timeout-hint">页面超时只取消当前浏览器请求，不会自动重试；服务端仍执行自己的 timeout。</span>
+                <span class="hint" id="client-timeout-hint">超时后取消等待；服务端按自身超时设置执行。</span>
               </div>
             </div>
+            </details>
 
             <div class="notice" id="request-notice">
               点击发送会访问真实 Device、Captcha、图片 CDN 和 Verify 上游。取消发生在 Verify 发出后时，结果可能未知；本页面绝不自动重试。
             </div>
 
             <div class="actions">
-              <button class="primary" id="submit" type="submit">发送一次求解</button>
+              <button class="primary" id="submit" type="submit">发送请求</button>
               <button class="danger" id="cancel" type="button" disabled>取消请求</button>
-              <button class="secondary" id="clear" type="button">清空</button>
-              <button class="secondary" id="check-health" type="button">检查健康状态</button>
+              <button class="secondary" id="clear" type="button">重置参数</button>
             </div>
           </form>
-        </div>
-      </section>
-
-      <section class="card" aria-labelledby="result-title">
-        <div class="card-header">
-          <h2 id="result-title">运行结果</h2>
-          <p id="result-hint">HTTP 200 仍需同时检查 ok、VerifyCode 和 VerifyResult。</p>
-        </div>
-        <div class="card-body">
+      <section class="result-section" aria-labelledby="result-title">
+        <h2 id="result-title">运行结果</h2>
+        <p class="drawer-intro" id="result-hint">HTTP 200 仍需同时检查 ok、VerifyCode 和 VerifyResult。</p>
           <div class="result-banner" id="result-status" role="status" aria-live="polite">
             <div>
               <strong id="result-label">尚未发送</strong>
@@ -514,7 +303,7 @@
 
           <div class="metrics" aria-label="请求摘要">
             <div class="metric"><span>HTTP</span><strong id="http-status">—</strong></div>
-            <div class="metric"><span>页面墙钟</span><strong id="wall-time">—</strong></div>
+            <div class="metric"><span>请求耗时</span><strong id="wall-time">—</strong></div>
             <div class="metric"><span>Trace ID</span><strong id="trace-id">—</strong></div>
             <div class="metric"><span id="business-status-label">业务状态</span><strong id="business-status">—</strong></div>
           </div>
@@ -532,16 +321,11 @@
             <h3>API 响应</h3>
           </div>
           <pre id="response-output" tabindex="0" aria-label="API 响应">尚未发送请求。</pre>
-        </div>
+
       </section>
-    </main>
-
-    <footer class="footer">
-      <p>页面不保存历史、Cookie 或遥测；刷新即清除内存中的请求与响应。</p>
-      <p><a href="/openapi.json">OpenAPI 3.0.3</a> · <a href="/health">Health</a></p>
-    </footer>
-  </div>
-
+      <p class="hint">请求与响应仅保留在当前页面，刷新后清除。</p>
+    </div>
+  </dialog>
   <script nonce="__ALI_SLIDER_CSP_NONCE__">
     "use strict";
 
@@ -573,6 +357,133 @@
       let lastRequest = {};
       let lastResponse = null;
 
+      const dialog = document.getElementById("debug-dialog");
+      const languageSelect = document.getElementById("example-language");
+      const scenes = {
+        auto: {mode: "slider", group: "开始使用", title: "自动选择", code: "CAPTCHA · V3", description: "根据场景配置与上游返回的验证码类型，自动完成一轮验证。支持图片拼图、无痕验证和拖动滑块，使用统一的请求与响应格式。", note: "参数留空时使用服务启动配置的默认 SceneId 和 prefix。要测试指定场景，请在在线调试中填写对应参数。"},
+        puzzle: {mode: "slider", group: "V3 验证码", title: "图片拼图", code: "PUZZLE", description: "处理阿里 V3 图片拼图验证码，完成图片识别、轨迹生成与本轮验证。通过 SceneId 和 prefix 指定要测试的场景。", note: "请填写图片拼图场景对应的 SceneId 和 prefix。此分类不会强制上游返回 PUZZLE，实际验证码类型由场景配置与上游决定。"},
+        traceless: {mode: "slider", group: "V3 验证码", title: "无痕验证", code: "TRACELESS", description: "处理阿里 V3 无痕验证码。与图片拼图共用同一接口，返回统一的验证结果与令牌。", note: "请填写无痕验证场景对应的 SceneId 和 prefix。此分类不会强制上游返回 TRACELESS，实际验证码类型由场景配置与上游决定。"},
+        sliding: {mode: "slider", group: "V3 验证码", title: "拖动滑块", code: "SLIDING", description: "处理阿里 V3 拖动滑块验证码，完成本轮滑动验证。该类型与 WAF / ESA 页面验证使用不同的接入参数。", note: "请填写拖动滑块场景对应的 SceneId 和 prefix。此分类不会强制上游返回 SLIDING，实际验证码类型由场景配置与上游决定。"},
+        waf: {mode: "waf", group: "WAF / ESA", title: "页面验证", code: "WAF · ESA", description: "传入触发 WAF / ESA 验证的页面地址，服务读取页面并提取本轮挑战，完成验证后返回 u_atoken 和 u_asig。", note: "在线调试使用自动读取页面的接入方式。验证成功后，原页面访问与登录业务仍由调用方处理；完整接口字段见 API 规范。"},
+        bxua: {mode: "bxua", group: "Baxia / Fireye", title: "bx-ua 生成", code: "BAXIA · FIREYE", description: "根据页面地址和目标请求地址生成一次 bx-ua，并返回与本次设备画像匹配的 uaHeaders，供业务调用方接入。", note: "pageUrl 是 SDK 所在页面，requestUrl 是需要携带 bx-ua 的业务请求地址。生成 bx-ua 不会自动发送该业务请求，也不代表业务已获放行。"}
+      };
+      const endpoints = {slider: "/api/slider", waf: "/api/waf", bxua: "/api/bxua"};
+      const proxyParameter = ["proxy", "string", "否", "可选代理，留空直连。支持 HTTP(S)、SOCKS4、SOCKS5、SOCKS5H。"];
+      const parameters = {
+        slider: [
+          ["SceneId", "string", "否", "场景 ID，最多 64 个 Unicode 字符。留空使用服务默认配置。"],
+          ["prefix", "string", "否", "实例前缀，1–32 个 ASCII 字母或数字。留空使用服务默认配置。"],
+          ["AaduaneId", "string", "否", "可选 RPC key id，最多 128 个 Unicode 字符。"],
+          proxyParameter
+        ],
+        waf: [
+          ["pageUrl", "string", "是", "完整 WAF 页面地址，保留 query。仅支持公网域名 HTTPS 和默认 / 443 端口，不含账号、密码或 # 路由，最多 8,192 个 UTF-8 字节。"],
+          proxyParameter
+        ],
+        bxua: [
+          ["pageUrl", "string", "是", "触发 Baxia 的完整 HTTP(S) 页面地址，可保留 # 路由。最多 8,192 个 UTF-8 字节，不含账号或密码。"],
+          ["requestUrl", "string", "是", "需要携带 bx-ua 的完整 HTTP(S) 请求地址，保留 query。最多 8,192 个 UTF-8 字节，不含账号或密码。"],
+          proxyParameter
+        ]
+      };
+      const responseFields = {
+        slider: [
+          ["ok", "boolean", "本轮业务是否成功。"],
+          ["VerifyCode", "string", "上游验证结果码，成功为 T001。"],
+          ["VerifyResult", "boolean", "上游验证结果，成功为 true。"],
+          ["securityToken", "string", "验证成功后的令牌，成功时非空。"],
+          ["certifyId / sceneId", "string", "本轮挑战标识与实际场景 ID。"]
+        ],
+        waf: [
+          ["ok", "boolean", "本轮 WAF 验证是否成功。"],
+          ["u_atoken / u_asig", "string", "本轮验证签名，成功时两项均非空。"],
+          ["verifyCode", "string", "上游验证结果码，注意字段为小写开头。"],
+          ["sceneId / captchaType", "string", "页面场景与本轮验证码类型。"],
+          ["uaHeaders", "object", "本轮设备画像对应的请求头。"]
+        ],
+        bxua: [
+          ["ok", "boolean", "本次生成是否成功。"],
+          ["bx-ua", "string", "生成的 token，成功时非空。"],
+          ["uaHeaders", "object", "与本次设备画像一致的请求头。"],
+          ["version / profile", "number / object", "实际协议版本及对应 profile。"],
+          ["sdkURL / sdkSha256", "string", "本轮 SDK 的来源与内容摘要。"]
+        ]
+      };
+      let currentScene = "auto";
+
+      function renderRows(id, rows) {
+        const target = document.getElementById(id);
+        target.replaceChildren();
+        for (const row of rows) {
+          const tr = document.createElement("tr");
+          for (const value of row) {
+            const td = document.createElement("td");
+            td.textContent = value;
+            tr.append(td);
+          }
+          target.append(tr);
+        }
+      }
+
+      function exampleRequest() {
+        if (modeSelect.value === "waf") return {pageUrl: "https://example.com/protected-page"};
+        if (modeSelect.value === "bxua") return {pageUrl: "https://example.com/login", requestUrl: "https://example.com/api/login"};
+        return currentScene === "auto" ? {} : {SceneId: "YOUR_SCENE_ID", prefix: "YOURPREFIX"};
+      }
+
+      function renderExample() {
+        const url = `${location.origin}${endpoints[modeSelect.value]}`;
+        const request = exampleRequest();
+        const json = JSON.stringify(request, null, 2);
+        const quote = (value) => "'" + value.replace(/'/g, "'\\''") + "'";
+        let code;
+        switch (languageSelect.value) {
+          case "python":
+            code = `import json\nfrom urllib.request import Request, urlopen\n\nbody = ${json}\nrequest = Request(\n    ${JSON.stringify(url)},\n    data=json.dumps(body).encode("utf-8"),\n    headers={"Content-Type": "application/json"},\n    method="POST",\n)\nwith urlopen(request, timeout=30) as response:\n    print(response.status)\n    print(response.read().decode("utf-8"))`;
+            break;
+          case "go":
+            code = `package main\n\nimport (\n    "fmt"\n    "io"\n    "net/http"\n    "strings"\n    "time"\n)\n\nfunc main() {\n    body := strings.NewReader(${JSON.stringify(JSON.stringify(request))})\n    client := &http.Client{Timeout: 30 * time.Second}\n    response, err := client.Post(${JSON.stringify(url)}, "application/json", body)\n    if err != nil { panic(err) }\n    defer response.Body.Close()\n    data, err := io.ReadAll(response.Body)\n    if err != nil { panic(err) }\n    fmt.Println(response.Status)\n    fmt.Println(string(data))\n}`;
+            break;
+          case "javascript":
+            code = `const response = await fetch(${JSON.stringify(url)}, {\n  method: "POST",\n  headers: {"Content-Type": "application/json"},\n  body: JSON.stringify(${json.replace(/\n/g, "\n  ")}),\n  signal: AbortSignal.timeout(30_000),\n});\nconsole.log(response.status);\nconsole.log(await response.json());`;
+            break;
+          default:
+            code = `curl --fail-with-body --max-time 30 \\\n  --request POST ${quote(url)} \\\n  --header 'Content-Type: application/json' \\\n  --data ${quote(json)}`;
+        }
+        document.getElementById("example-code").textContent = code;
+        document.getElementById("example-copy-status").textContent = "示例参数请替换为实际场景；点击在线调试可填写并发送请求。";
+      }
+
+      function renderDocumentation() {
+        const scene = scenes[currentScene];
+        document.getElementById("breadcrumb").textContent = `${scene.group} / ${scene.title}`;
+        document.getElementById("scene-kicker").textContent = scene.code;
+        document.getElementById("scene-title").textContent = scene.title;
+        document.getElementById("scene-description").textContent = scene.description;
+        document.getElementById("scene-note").textContent = scene.note;
+        document.getElementById("debug-title").textContent = `在线调试 · ${scene.title}`;
+        document.getElementById("debug-endpoint").textContent = `${location.origin}${endpoints[scene.mode]}`;
+        document.getElementById("response-note").textContent = document.getElementById("result-hint").textContent;
+        for (const key of Object.keys(scenes)) {
+          document.getElementById(`nav-${key}`).setAttribute("aria-current", key === currentScene ? "page" : "false");
+        }
+        renderRows("parameter-rows", parameters[scene.mode]);
+        renderRows("response-rows", [...responseFields[scene.mode],
+          ["elapsedMs", "integer", "服务端报告的耗时，单位为毫秒。"],
+          ["traceId", "string", "请求追踪 ID，可用于排查错误。"]
+        ]);
+        renderExample();
+      }
+
+      // 分类只选择文档和接口，不向 V3 请求添加服务端不支持的类型字段。
+      function selectScene(key) {
+        if (!Object.hasOwn(scenes, key) || activeController !== null) return;
+        currentScene = key;
+        modeSelect.value = scenes[key].mode;
+        updateMode();
+        resetResult();
+      }
+
       function updateMode() {
         const bxua = modeSelect.value === "bxua";
         const waf = modeSelect.value === "waf";
@@ -599,7 +510,11 @@
           ? "HTTP 200 仍需检查 ok 和 bx-ua。生成成功不代表站点登录或业务请求已获放行。"
           : "HTTP 200 仍需同时检查 ok、VerifyCode 和 VerifyResult。";
         document.getElementById("business-status-label").textContent = waf ? "验证状态" : bxua ? "生成状态" : "业务状态";
-        submitButton.textContent = waf ? "发送一次 WAF 验证" : bxua ? "生成一次 bx-ua" : "发送一次求解";
+        submitButton.textContent = waf ? "发送 WAF 验证" : bxua ? "生成 bx-ua" : "发送请求";
+        if (!bxua && !waf && currentScene !== "auto") {
+          document.getElementById("request-hint").textContent = scenes[currentScene].note;
+        }
+        renderDocumentation();
       }
 
       function maskedClone(value) {
@@ -639,6 +554,9 @@
         submitButton.disabled = busy;
         cancelButton.disabled = !busy;
         clearButton.disabled = busy;
+        for (const key of Object.keys(scenes)) {
+          document.getElementById(`nav-${key}`).setAttribute("aria-disabled", String(busy));
+        }
       }
 
       function collectRequest(mode) {
@@ -856,8 +774,50 @@
 
       modeSelect.addEventListener("change", () => {
         if (activeController !== null) return;
-        updateMode();
-        resetResult();
+        const key = modeSelect.value === "slider" ? "auto" : modeSelect.value;
+        selectScene(key);
+        history.replaceState(null, "", `#${key}`);
+      });
+
+      for (const key of Object.keys(scenes)) {
+        document.getElementById(`nav-${key}`).addEventListener("click", (event) => {
+          event.preventDefault();
+          if (activeController !== null) return;
+          selectScene(key);
+          if (location.hash !== `#${key}`) location.hash = key;
+        });
+      }
+      window.addEventListener("hashchange", () => {
+        const key = location.hash.slice(1);
+        if (activeController !== null) {
+          history.replaceState(null, "", `#${currentScene}`);
+          return;
+        }
+        if (Object.hasOwn(scenes, key) && key !== currentScene) selectScene(key);
+      });
+      document.getElementById("search").addEventListener("input", () => {
+        const query = document.getElementById("search").value.trim().toLowerCase();
+        const matches = Object.entries(scenes).filter(([key, scene]) =>
+          `${key} ${scene.title} ${scene.group} ${scene.code} ${endpoints[scene.mode]}`.toLowerCase().includes(query)
+        ).map(([key]) => key);
+        for (const key of Object.keys(scenes)) document.getElementById(`nav-${key}`).hidden = !matches.includes(key);
+        for (const [group, keys] of Object.entries({start: ["auto"], captcha: ["puzzle", "traceless", "sliding"], waf: ["waf"], bxua: ["bxua"]})) {
+          document.getElementById(`group-${group}`).hidden = !keys.some((key) => matches.includes(key));
+        }
+        document.getElementById("search-empty").hidden = matches.length !== 0;
+        document.getElementById("navigation-details").open = true;
+      });
+      document.getElementById("open-debug").addEventListener("click", () => dialog.showModal());
+      document.getElementById("close-debug").addEventListener("click", () => dialog.close());
+      languageSelect.addEventListener("change", renderExample);
+      document.getElementById("copy-example").addEventListener("click", async () => {
+        const status = document.getElementById("example-copy-status");
+        try {
+          await navigator.clipboard.writeText(document.getElementById("example-code").textContent);
+          status.textContent = "代码已复制。";
+        } catch (_error) {
+          status.textContent = "浏览器未允许复制，请选中上方代码手动复制。";
+        }
       });
 
       revealSensitive.addEventListener("change", renderStoredData);
@@ -866,8 +826,8 @@
         if (activeController !== null) activeController.abort();
       });
 
-      updateMode();
-      renderStoredData();
+      const initialScene = location.hash.slice(1);
+      selectScene(Object.hasOwn(scenes, initialScene) ? initialScene : "auto");
       checkHealth();
     })();
   </script>

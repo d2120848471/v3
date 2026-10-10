@@ -424,9 +424,7 @@ func TestEmbeddedAPITestPage(t *testing.T) {
 	if strings.Count(body, `nonce="`+nonce+`"`) != 2 || strings.Contains(body, testPageNoncePlaceholder) {
 		t.Fatalf("page nonce substitution is incomplete")
 	}
-	if count := strings.Count(body, "fetch("); count != 2 {
-		t.Fatalf("page fetch calls = %d, want only health and manual API submission", count)
-	}
+	// 调用示例也包含 fetch 文本；真实网络目的地与触发时机由页面行为测试执行脚本核对。
 	for _, forbidden := range []string{
 		`<script src=`, `rel="stylesheet"`, "innerHTML", "outerHTML", "insertAdjacentHTML",
 		"localStorage", "sessionStorage", "indexedDB", "caches.", "document.cookie", "navigator.sendBeacon", "serviceWorker",

@@ -43,14 +43,14 @@ Go SDK 的接入方式见 [README](../../README.md#go-sdk-接入) 和 `go doc ./
 http://127.0.0.1:8000/
 ```
 
-页面内置于 Go EXE，不加载 CDN、字体、框架或第三方脚本，也不需要 Node.js。它固定调用当前 origin 的 `/health`、`/api/slider`、`/api/bxua` 和 `/api/waf`，因此换端口后无需配置页面。选择“验证码求解”、“Baxia bx-ua”或“WAF / ESA 验证”切换操作；各模式的页面 URL 都不会改变测试页调用的本地 API 地址。
+页面内置于 Go EXE，不加载 CDN、字体、框架或第三方脚本，也不需要 Node.js。它固定调用当前 origin 的 `/health`、`/api/slider`、`/api/bxua` 和 `/api/waf`，因此换端口后无需配置页面。左侧按“自动选择”、V3 验证码（图片拼图、无痕验证、拖动滑块）、WAF / ESA 和 Baxia / Fireye 分类，支持搜索和类型深链接。正文展示对应参数、响应说明与 cURL、Python、Go、JavaScript 调用示例；点击“在线调试”打开右侧测试面板。V3 分类共用 `/api/slider`，实际类型由场景配置和上游决定，不会发送额外的类型参数。各模式的页面 URL 都不会改变测试页调用的本地 API 地址。
 测试页需要支持 `fetch`、`AbortController` 和 `TextEncoder` 的现代 Edge、Chrome 或 Firefox；没有现代浏览器时仍可直接调用 API。
 
 - 页面打开时只执行无副作用的 health 检查，不自动创建挑战。
 - 只有手工提交才会发送一次 POST JSON；执行期间按钮和类型选择禁用，防止重复提交或切换。页面不生成旧 GET query，也不自动重试、批量请求或并发压测。
-- 空的可选字段不进入 JSON，验证码模式的默认 Scene ID/prefix 由服务启动配置决定；Baxia 模式必须填写 `pageUrl` 和 `requestUrl`。WAF/ESA 模式的 `pageUrl` 必填，填写挑战参数时须同时提供 Scene ID、`userId`、`userUserId`、`traceid`、`token` 和 `region`；三者共用代理输入。
+- 空的可选字段不进入 JSON，验证码模式的默认 Scene ID/prefix 由服务启动配置决定；Baxia 模式必须填写 `pageUrl` 和 `requestUrl`。WAF/ESA 模式的 `pageUrl` 必填，由服务自动读取页面获取挑战；三者共用“代理与超时”中的可选设置。
 - 页面等待上限可设为 `1..305` 秒，并支持手工取消。取消会传播到请求 context，但若 Verify 已发出，上游结果可能未知；不要手工重试结果未知的一轮。
-- RPC key、代理、`securityToken`、`certifyId`、`bx-ua`、WAF 挑战 `token`、`u_atoken` 和 `u_asig` 默认遮罩，可勾选“显示敏感字段”查看。请求和响应只保留在当前页面内存，不写 Cookie、URL、localStorage、sessionStorage 或遥测；刷新或“清空”即移除。
+- RPC key、代理、`securityToken`、`certifyId`、`bx-ua`、WAF 挑战 `token`、`u_atoken` 和 `u_asig` 默认遮罩，可勾选“显示敏感字段”查看。请求和响应只保留在当前页面内存，不写 Cookie、URL、localStorage、sessionStorage 或遥测；刷新或“重置参数”即移除。
 - 页面用 `textContent` 显示响应；CSP 只允许同源连接，并禁止外部资源、frame、form action、worker 和不带随机 nonce 的脚本/样式。
 
 测试页是本机调试入口，不是鉴权边界。Handler 会根据浏览器 `Origin` / `Sec-Fetch-Site` 拒绝明确的跨源 GET/POST Solve，但这不是账号、权限或完整 CSRF 身份机制；不要把监听地址改成 `0.0.0.0` 后直接暴露到公网。无浏览器来源头的 curl/程序客户端仍允许；POST 还保持空 body 和无 Content-Type 兼容性。
