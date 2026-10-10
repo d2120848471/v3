@@ -412,7 +412,7 @@ func TestEmbeddedAPITestPage(t *testing.T) {
 
 	body := first.Body.String()
 	for _, required := range []string{
-		`id="api-test-console"`, `"/api/slider"`, `"/api/bxua"`, `fetch(endpoint,`, `fetch("/health"`,
+		`id="api-test-console"`, `"/api/slider"`, `"/api/bxua"`, `"/api/waf"`, `fetch(endpoint,`, `fetch("/health"`,
 		`"SceneId"`, `"prefix"`, `"AaduaneId"`, `"proxy"`, `AbortController`, `TextEncoder`,
 		`response.status === 200`, `!Array.isArray(lastResponse)`, `lastResponse.VerifyCode === "T001"`,
 		`lastResponse.VerifyResult === true`, `lastResponse.securityToken.length > 0`,
@@ -577,7 +577,7 @@ func TestOnlyFrozenRoutesAreExposed(t *testing.T) {
 		t.Fatal(err)
 	}
 	paths := document["paths"].(map[string]any)
-	if len(paths) != 5 {
+	if len(paths) != 6 {
 		t.Fatalf("OpenAPI paths = %#v", paths)
 	}
 	page := paths[TestPagePath].(map[string]any)

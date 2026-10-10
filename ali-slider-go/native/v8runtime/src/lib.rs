@@ -446,6 +446,25 @@ impl Engine {
                     .set(scope, create_name.into(), create_function.into())
                     .unwrap()
             );
+            let native_name = v8::String::new(scope, "__aliV8CreateNativeFunction").unwrap();
+            let global = context.global(scope);
+            let native_function = v8::Function::builder(native_create_native_function)
+                .data(global.into())
+                .length(4)
+                .constructor_behavior(v8::ConstructorBehavior::Throw)
+                .build(scope)
+                .unwrap();
+            native_function.set_name(native_name);
+            assert!(
+                global
+                    .define_own_property(
+                        scope,
+                        native_name.into(),
+                        native_function.into(),
+                        v8::PropertyAttribute::DONT_ENUM,
+                    )
+                    .unwrap()
+            );
             let run_name = v8::String::new(scope, "__aliV8RunInContext").unwrap();
             let run_function = v8::Function::new(scope, native_vm_run_in_context).unwrap();
             assert!(
@@ -719,6 +738,85 @@ fn native_vm_create_context(
     return_value.set(global.into());
 }
 
+fn native_create_native_function(
+    scope: &mut v8::PinScope,
+    arguments: v8::FunctionCallbackArguments,
+    mut return_value: v8::ReturnValue,
+) {
+    let Ok(target) = v8::Local::<v8::Object>::try_from(arguments.get(0)) else {
+        throw_js_type_error(scope, "V8 native function target must be a child global");
+        return;
+    };
+    let Some(context) = target.get_creation_context(scope) else {
+        throw_js_type_error(scope, "V8 native function target has no creation context");
+        return;
+    };
+    // helper 的 data 保留 root global；只接受同一 Isolate 的真实 child global。
+    if !target.strict_equals(context.global(scope).into()) || target.strict_equals(arguments.data())
+    {
+        throw_js_type_error(scope, "V8 native function target must be a child global");
+        return;
+    }
+    let Ok(name) = v8::Local::<v8::String>::try_from(arguments.get(1)) else {
+        throw_js_type_error(scope, "V8 native function name must be a string");
+        return;
+    };
+    let length = arguments.get(2);
+    if !length.is_number() {
+        throw_js_type_error(
+            scope,
+            "V8 native function length must be a nonnegative integer",
+        );
+        return;
+    }
+    // V8 模板内部以 i16 保存 length，超出范围会截断。
+    let Some(length) = length.number_value(scope).filter(|length| {
+        length.is_finite() && *length >= 0.0 && *length <= i16::MAX as f64 && length.fract() == 0.0
+    }) else {
+        throw_js_type_error(
+            scope,
+            "V8 native function length must be an integer from 0 to 32767",
+        );
+        return;
+    };
+    let Ok(callback) = v8::Local::<v8::Function>::try_from(arguments.get(3)) else {
+        throw_js_type_error(scope, "V8 native function callback must be a function");
+        return;
+    };
+
+    let scope = &mut v8::ContextScope::new(scope, context);
+    // callback 直接存入 V8 data，随包装函数参与 GC，不保存 Rust 裸指针。
+    let Some(function) = v8::Function::builder(native_function_dispatch)
+        .data(callback.into())
+        .length(length as i32)
+        .constructor_behavior(v8::ConstructorBehavior::Throw)
+        .build(scope)
+    else {
+        return;
+    };
+    function.set_name(name);
+    return_value.set(function.into());
+}
+
+fn native_function_dispatch(
+    scope: &mut v8::PinScope,
+    arguments: v8::FunctionCallbackArguments,
+    mut return_value: v8::ReturnValue,
+) {
+    let Ok(callback) = v8::Local::<v8::Function>::try_from(arguments.data()) else {
+        throw_js_type_error(scope, "V8 native function callback is unavailable");
+        return;
+    };
+    let args: Vec<_> = (0..arguments.length())
+        .map(|index| arguments.get(index))
+        .collect();
+    // V8 已将 receiver 转为对象；对象、参数与返回值均保持原引用。
+    // call 返回 None 时保留 pending exception，由调用方接收原异常。
+    if let Some(value) = callback.call(scope, arguments.this().into(), &args) {
+        return_value.set(value);
+    }
+}
+
 fn native_vm_run_in_context(
     scope: &mut v8::PinScope,
     arguments: v8::FunctionCallbackArguments,
@@ -838,6 +936,12 @@ fn native_vm_run_in_context(
 fn throw_js_error(scope: &mut v8::PinScope, message: &str) {
     let message = v8::String::new(scope, message).unwrap();
     let exception = v8::Exception::error(scope, message);
+    scope.throw_exception(exception);
+}
+
+fn throw_js_type_error(scope: &mut v8::PinScope, message: &str) {
+    let message = v8::String::new(scope, message).unwrap();
+    let exception = v8::Exception::type_error(scope, message);
     scope.throw_exception(exception);
 }
 
@@ -1325,6 +1429,188 @@ mod tests {
         );
         // SAFETY: runtime was created above and is destroyed exactly once.
         unsafe { ali_slider_v8_runtime_destroy(runtime) };
+    }
+
+    fn eval_native_function_test(engine: &mut Engine, source: &str) -> String {
+        let result = engine.eval(source, "native-function-test.js");
+        let text = String::from_utf8(result.data).unwrap();
+        assert_eq!(result.status, 0, "{text}");
+        text
+    }
+
+    #[test]
+    fn creates_native_functions_in_child_realm() {
+        let mut engine = Engine::new(Arc::new(HostBridge::new()));
+        let result = eval_native_function_test(
+            &mut engine,
+            r#"(() => {
+              const child = __aliV8CreateContext();
+              const rootToString = Function.prototype.toString;
+              const childToString = __aliV8RunInContext('Function.prototype.toString', child);
+              child.method = __aliV8CreateNativeFunction(child, 'toDataURL', 1, () => 'data:');
+              child.getter = __aliV8CreateNativeFunction(child, 'get userAgent', 0, () => 'ua');
+              const check = __aliV8RunInContext(`({
+                methodSource: Function.prototype.toString.call(method),
+                getterSource: Function.prototype.toString.call(getter),
+                methodName: method.name,
+                getterName: getter.name,
+                methodLength: method.length,
+                getterLength: getter.length,
+                prototype: Object.getPrototypeOf(method) === Function.prototype,
+                constructor: getter.constructor === Function,
+                instance: method instanceof Function,
+                noPrototype: !Object.hasOwn(method, 'prototype') && !Object.hasOwn(getter, 'prototype'),
+                noChildHelper: typeof __aliV8CreateNativeFunction === 'undefined',
+                noConstruct: [method, getter].every(fn => {
+                  try { Reflect.construct(fn, []); return false; }
+                  catch (error) { return error instanceof TypeError; }
+                }),
+              })`, child);
+              check.rootSource = rootToString.call(child.method);
+              check.rootInstance = child.method instanceof Function;
+              check.toStringIntact = rootToString === Function.prototype.toString &&
+                childToString === __aliV8RunInContext('Function.prototype.toString', child);
+              check.privateHelper = !Object.keys(globalThis).includes('__aliV8CreateNativeFunction');
+              return check;
+            })()"#,
+        );
+        assert_eq!(
+            result,
+            r#"{"methodSource":"function toDataURL() { [native code] }","getterSource":"function get userAgent() { [native code] }","methodName":"toDataURL","getterName":"get userAgent","methodLength":1,"getterLength":0,"prototype":true,"constructor":true,"instance":true,"noPrototype":true,"noChildHelper":true,"noConstruct":true,"rootSource":"function toDataURL() { [native code] }","rootInstance":false,"toStringIntact":true,"privateHelper":true}"#,
+        );
+    }
+
+    #[test]
+    fn forwards_native_function_objects_arguments_returns_and_exceptions() {
+        let mut engine = Engine::new(Arc::new(HostBridge::new()));
+        let result = eval_native_function_test(
+            &mut engine,
+            r#"(() => {
+              const child = __aliV8CreateContext();
+              const receiver = {};
+              const values = [{}, undefined, Symbol('argument'), 42n, null, 1, 'last'];
+              const returned = {};
+              let actualThis, actualArgs;
+              const callback = function () {
+                'use strict';
+                actualThis = this;
+                actualArgs = Array.from(arguments);
+                return returned;
+              };
+              const fn = __aliV8CreateNativeFunction(child, 'method', 1, callback);
+              const resultIdentity = fn.apply(receiver, values) === returned;
+              const thisIdentity = actualThis === receiver;
+              const argumentIdentity = actualArgs.length === values.length &&
+                values.every((value, index) => actualArgs[index] === value);
+              const noArgs = fn.call(receiver) === returned && actualArgs.length === 0;
+              const promise = Promise.resolve(returned);
+              const asyncFn = __aliV8CreateNativeFunction(child, 'asyncMethod', 0, () => promise);
+              const promiseIdentity = asyncFn.call(receiver) === promise;
+              const childCallback = __aliV8RunInContext('(value) => value', child);
+              const childFn = __aliV8CreateNativeFunction(child, 'childMethod', 1, childCallback);
+              const childReturnIdentity = childFn(values[0]) === values[0];
+              const thrown = [new TypeError('original exception'), {}, undefined, 'thrown string'];
+              const exceptionIdentity = thrown.every(value => {
+                const throwing = __aliV8CreateNativeFunction(child, 'throwing', 0, () => { throw value; });
+                try { throwing.call(receiver); return false; }
+                catch (error) { return error === value; }
+              });
+              return { resultIdentity, thisIdentity, argumentIdentity, noArgs,
+                promiseIdentity, childReturnIdentity, exceptionIdentity };
+            })()"#,
+        );
+        assert_eq!(
+            result,
+            r#"{"resultIdentity":true,"thisIdentity":true,"argumentIdentity":true,"noArgs":true,"promiseIdentity":true,"childReturnIdentity":true,"exceptionIdentity":true}"#,
+        );
+
+        let failed = engine.eval(
+            "__aliV8CreateNativeFunction(__aliV8CreateContext(), 'fail', 0, () => { throw new Error('native-callback-boom'); })()",
+            "native-function-throw.js",
+        );
+        assert_eq!(failed.status, 1);
+        assert!(
+            String::from_utf8(failed.data)
+                .unwrap()
+                .contains("native-callback-boom")
+        );
+        assert_eq!(eval_native_function_test(&mut engine, "21 * 2"), "42");
+    }
+
+    #[test]
+    fn rejects_invalid_native_function_inputs_without_coercion() {
+        let mut engine = Engine::new(Arc::new(HostBridge::new()));
+        let result = eval_native_function_test(
+            &mut engine,
+            r#"(() => {
+              const child = __aliV8CreateContext();
+              const callback = () => 42;
+              let coerced = 0;
+              const coercible = { toString() { ++coerced; return 'name'; }, valueOf() { ++coerced; return 0; } };
+              const rejects = args => {
+                try { __aliV8CreateNativeFunction(...args); return false; }
+                catch (error) { return error instanceof TypeError; }
+              };
+              const targets = [undefined, null, 1, {}, globalThis, Object.create(child),
+                new Proxy(child, {}), __aliV8RunInContext('({})', child)];
+              const names = [undefined, null, 1, {}, Symbol('name'), coercible];
+              const lengths = [undefined, null, '0', -1, 0.5, NaN, Infinity, -Infinity,
+                32768, 2147483648, 1n, coercible];
+              const callbacks = [undefined, null, 1, {}, 'callback'];
+              const valid = __aliV8CreateNativeFunction(child, '', 32767, callback);
+              const zero = __aliV8CreateNativeFunction(child, 'zero', -0, callback);
+              return {
+                missing: rejects([]),
+                targets: targets.every(value => rejects([value, 'method', 0, callback])),
+                names: names.every(value => rejects([child, value, 0, callback])),
+                lengths: lengths.every(value => rejects([child, 'method', value, callback])),
+                callbacks: callbacks.every(value => rejects([child, 'method', 0, value])),
+                noCoercion: coerced === 0,
+                boundary: valid.name === '' && valid.length === 32767 && valid() === 42,
+                zero: zero.length === 0 && zero() === 42,
+              };
+            })()"#,
+        );
+        assert_eq!(
+            result,
+            r#"{"missing":true,"targets":true,"names":true,"lengths":true,"callbacks":true,"noCoercion":true,"boundary":true,"zero":true}"#,
+        );
+    }
+
+    #[test]
+    fn keeps_native_callback_data_alive_through_gc_and_repeated_disposal() {
+        for _ in 0..4 {
+            let mut engine = Engine::new(Arc::new(HostBridge::new()));
+            assert_eq!(
+                eval_native_function_test(
+                    &mut engine,
+                    r#"globalThis.kept = Array.from({ length: 32 }, (_, index) => {
+                      const child = __aliV8CreateContext();
+                      const callback = (() => {
+                        const result = { index };
+                        return () => result;
+                      })();
+                      return __aliV8CreateNativeFunction(child, 'kept', 0, callback);
+                    });
+                    kept.length"#,
+                ),
+                "32",
+            );
+            // eval 的 HandleScope 已释放；callback 只能由包装函数 data 保活。
+            engine.isolate.low_memory_notification();
+            assert_eq!(
+                eval_native_function_test(
+                    &mut engine,
+                    "kept.every((fn, index) => fn().index === index && fn() === fn())",
+                ),
+                "true",
+            );
+            assert_eq!(
+                eval_native_function_test(&mut engine, "delete globalThis.kept"),
+                "true"
+            );
+            engine.isolate.low_memory_notification();
+        }
     }
 
     #[test]

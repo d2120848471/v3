@@ -68,8 +68,12 @@ func serve(rootContext context.Context, listener net.Listener, cfg config.Config
 	if err != nil {
 		return fmt.Errorf("创建 Baxia 生成器: %w", err)
 	}
+	waf, err := parentbootstrap.NewWAFExecutor(cfg.V8RuntimeLibrary, cfg.Timeout)
+	if err != nil {
+		return fmt.Errorf("创建 WAF 执行器: %w", err)
+	}
 	handler, err := httpapi.New(httpapi.Options{
-		Solver: client, Baxia: baxia, DefaultSceneID: cfg.SceneID, DefaultPrefix: cfg.Prefix,
+		Solver: client, Baxia: baxia, WAF: waf, DefaultSceneID: cfg.SceneID, DefaultPrefix: cfg.Prefix,
 		Timeout: cfg.Timeout, Logger: logger,
 	})
 	if err != nil {

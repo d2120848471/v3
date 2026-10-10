@@ -395,6 +395,10 @@ func runtimeProfileCacheFresh(cached cachedRuntimeProfile, now time.Time) bool {
 }
 
 func (resolver *KeyResolver) sdkSource(ctx context.Context, transport http.RoundTripper, profile device.Profile, _ time.Time) ([]byte, error) {
+	return resolver.sdkSourceWithReferer(ctx, transport, profile, keyBridgeReferer)
+}
+
+func (resolver *KeyResolver) sdkSourceWithReferer(ctx context.Context, transport http.RoundTripper, profile device.Profile, referer string) ([]byte, error) {
 	resolver.mu.Lock()
 	// 必须在获锁后取时间：否则晚获锁的 goroutine 可能拿着
 	// 比新 `fetchedAt` 更旧的 now，把刚写入的 SDK 缓存误判为未命中。
@@ -427,10 +431,10 @@ func (resolver *KeyResolver) sdkSource(ctx context.Context, transport http.Round
 	resolver.sdkLoad = pending
 	resolver.mu.Unlock()
 
-	source, loadErr := downloadPublicScript(ctx, transport, profile, keySDKURL, map[string]bool{
+	source, loadErr := downloadPublicScriptWithReferer(ctx, transport, profile, keySDKURL, map[string]bool{
 		"o.alicdn.com": true,
 		"g.alicdn.com": true,
-	}, keyScriptMaxBytes)
+	}, keyScriptMaxBytes, referer)
 	if loadErr == nil && (len(source) < 1_000 || !bytes.Contains(source, []byte("AliyunCaptcha"))) {
 		loadErr = fmt.Errorf("%w: SDK script structure mismatch", pe.ErrUnsupportedPE)
 	}
@@ -481,6 +485,10 @@ func normalizeStaticPath(value string) (string, error) {
 }
 
 func downloadPublicScript(ctx context.Context, transport http.RoundTripper, profile device.Profile, rawURL string, allowedHosts map[string]bool, limit int64) ([]byte, error) {
+	return downloadPublicScriptWithReferer(ctx, transport, profile, rawURL, allowedHosts, limit, keyBridgeReferer)
+}
+
+func downloadPublicScriptWithReferer(ctx context.Context, transport http.RoundTripper, profile device.Profile, rawURL string, allowedHosts map[string]bool, limit int64, referer string) ([]byte, error) {
 	if limit < 1 {
 		return nil, fmt.Errorf("%w: invalid byte limit", pe.ErrKeyRuntime)
 	}
@@ -500,7 +508,7 @@ func downloadPublicScript(ctx context.Context, transport http.RoundTripper, prof
 	if err := validatePublicScriptURL(request.URL, allowedHosts); err != nil {
 		return nil, fmt.Errorf("%w: invalid URL", pe.ErrKeyRuntime)
 	}
-	for name, value := range profile.BrowserHeaders(keyBridgeReferer, "", "script", "no-cors", false) {
+	for name, value := range profile.BrowserHeaders(referer, "", "script", "no-cors", false) {
 		request.Header.Set(name, value)
 	}
 	response, err := client.Do(request)

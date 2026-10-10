@@ -24,6 +24,22 @@ func TestEmbeddedAPITestPageBaxiaControls(t *testing.T) {
 	}
 }
 
+func TestEmbeddedAPITestPageWAFControls(t *testing.T) {
+	for _, pattern := range []string{
+		`<option\s+value="waf">WAF / ESA 验证</option>`,
+		`<fieldset[^>]+id="waf-fields"[^>]+hidden[^>]+disabled>`,
+		`<input[^>]+id="waf-page-url"[^>]+type="url"[^>]+required\b`,
+	} {
+		if !regexp.MustCompile(pattern).Match(testPageHTML) {
+			t.Errorf("page missing WAF control %q", pattern)
+		}
+	}
+	fields := regexp.MustCompile(`(?s)<fieldset[^>]+id="waf-fields"[^>]*>(.*?)</fieldset>`).FindSubmatch(testPageHTML)
+	if len(fields) != 2 || bytes.Count(fields[1], []byte("<input ")) != 1 {
+		t.Fatal("WAF form must only ask for pageUrl; proxy uses the shared input")
+	}
+}
+
 func TestEmbeddedAPITestPageModeBehavior(t *testing.T) {
 	nodePath, err := exec.LookPath("node")
 	if err != nil {
@@ -90,7 +106,7 @@ const context = {
   fetch(url, options) {
     calls.push({url, options});
     if (url === "/health") return Promise.resolve({ok: true, json: async () => ({ok: true, status: "ready"})});
-    assert.ok(["/api/slider", "/api/bxua"].includes(url), "unexpected network destination: " + url);
+    assert.ok(["/api/slider", "/api/bxua", "/api/waf"].includes(url), "unexpected network destination: " + url);
     assert.equal(pending, undefined, "overlapping API requests");
     return new Promise((resolve, reject) => {
       pending = {resolve, reject};
@@ -108,6 +124,8 @@ assert.equal(timers.size, 0);
 assert.equal(get("api-mode").value, "slider");
 assert.equal(get("bxua-fields").hidden, true);
 assert.equal(get("bxua-fields").disabled, true);
+assert.equal(get("waf-fields").hidden, true);
+assert.equal(get("waf-fields").disabled, true);
 
 const businessCalls = () => calls.filter((call) => call.url !== "/health");
 const reply = (body, status = 200) => {
@@ -213,7 +231,74 @@ reply({...sliderSuccess, VerifyResult: false});
 await running;
 assert.equal(get("result-label").textContent, "响应合同异常", "slider verification must still be checked");
 
+// WAF 只提交页面 URL 和代理，不带 V3 参数或 Baxia requestUrl。
+get("prefix").value = "invalid hidden prefix!";
+get("page-url").value = "invalid hidden URL";
+get("request-url").value = "";
+const beforeWAF = businessCalls().length;
+await selectMode("waf");
+assert.equal(businessCalls().length, beforeWAF, "selecting WAF must not access its page");
+assert.equal(get("slider-fields").disabled, true);
+assert.equal(get("bxua-fields").disabled, true);
+assert.equal(get("waf-fields").hidden, false);
+assert.equal(get("waf-fields").disabled, false);
+assert.equal(get("endpoint").textContent, "http://127.0.0.1:18080/api/waf");
+assert.match(get("result-hint").textContent, /u_atoken.*u_asig/);
+await submit();
+assert.equal(businessCalls().length, beforeWAF, "empty WAF pageUrl must block sending");
+get("waf-page-url").value = "not a URL";
+await submit();
+assert.equal(businessCalls().length, beforeWAF, "invalid WAF pageUrl must block sending");
+get("waf-page-url").value = "https://example.com/pc/index.html?orgId=fixture";
+running = submit();
+assert.equal(businessCalls().at(-1).url, "/api/waf");
+assert.deepEqual(JSON.parse(businessCalls().at(-1).options.body), {
+  pageUrl: "https://example.com/pc/index.html?orgId=fixture", proxy: "http://proxy-user:proxy-secret@127.0.0.1:7890"
+});
+assert.equal(get("api-mode").disabled, true);
+assert.equal(get("submit").disabled, true);
+await submit();
+assert.equal(businessCalls().length, beforeWAF + 1, "duplicate WAF submit must not send again");
+const wafSuccess = {
+  ok: true, sceneId: "fixture-scene", captchaType: "SLIDING", verifyCode: "T001",
+  u_atoken: "waf-secret-token", u_asig: "waf-secret-signature",
+  uaHeaders: {"User-Agent": "fixture-ua", "U_ASIG": "nested-waf-secret"}, proxied: true, elapsedMs: 15, traceId: "body-trace"
+};
+reply(wafSuccess);
+await running;
+assert.equal(get("result-label").textContent, "WAF 验证成功");
+assert.equal(get("business-status").textContent, "T001");
+assert.match(get("result-detail").textContent, /原页面和登录业务仍由调用方处理/);
+displayed = JSON.parse(get("response-output").textContent);
+assert.equal(displayed.u_atoken, "••••••");
+assert.equal(displayed.u_asig, "••••••");
+assert.equal(displayed.uaHeaders["U_ASIG"], "••••••");
+assert.ok(!get("response-output").textContent.includes("waf-secret"));
+get("reveal-sensitive").checked = true;
+await fire("reveal-sensitive", "change");
+assert.deepEqual(JSON.parse(get("response-output").textContent), wafSuccess);
+get("reveal-sensitive").checked = false;
+for (const [body, status, label] of [
+  [{ok: true, u_atoken: "token"}, 200, "响应合同异常"],
+  [{ok: true, u_atoken: "token", u_asig: " "}, 200, "响应合同异常"],
+  [wafSuccess, 201, "响应合同异常"],
+  [{ok: false, verifyCode: "F015"}, 200, "请求完成，验证未通过"],
+  [{ok: false, errorType: "WAFRuntimeError"}, 500, "API 返回错误"]
+]) {
+  running = submit();
+  reply(body, status);
+  await running;
+  assert.equal(get("result-label").textContent, label);
+  if (body.verifyCode === "F015") assert.equal(get("business-status").textContent, "F015");
+}
+await fire("clear", "click");
+assert.equal(get("api-mode").value, "waf", "clear keeps WAF mode");
+assert.equal(get("waf-fields").disabled, false);
+assert.equal(get("waf-page-url").value, "");
+assert.equal(get("response-output").textContent, "尚未发送请求。");
+
 await selectMode("bxua");
+assert.equal(get("waf-fields").disabled, true);
 get("page-url").value = "https://example.test/login";
 get("request-url").value = "https://example.test/api/login";
 get("proxy").value = "";

@@ -9,11 +9,12 @@
 | `GET` | `/` | 返回内嵌 API 测试页 | 否；页面只自动检查 health，必须手工提交 |
 | `POST` | `/api/slider` | 执行一轮挑战 | 通过浏览器跨源与 HTTP 输入校验后调用一次 |
 | `POST` | `/api/bxua` | 生成一次 Baxia / Fireye `bx-ua` | 否；下载当前脚本后本地生成，不发送目标业务请求 |
+| `POST` | `/api/waf` | 执行一轮 WAF/ESA 验证并返回签名 | 使用独立 WAF 执行器；推荐传完整挑战参数，兼容自动抓页，不自动回访页面或登录业务 |
 | `GET` | `/api/slider?...` | 兼容旧 Python query；已废弃 | 通过浏览器跨源与 HTTP 输入校验后调用一次 |
 | `GET` | `/health` | 进程级就绪检查 | 否 |
 | `GET` | `/openapi.json` | 返回 OpenAPI 3.0.3 JSON | 否 |
 
-只有 `/`、`/api/slider`、`/api/bxua`、`/health` 和 `/openapi.json` 五个路径；Solve 路径同时接受 GET 和 POST，`/api/bxua` 只接受 POST。其他方法或路径返回 `404`。
+只有 `/`、`/api/slider`、`/api/bxua`、`/api/waf`、`/health` 和 `/openapi.json` 六个路径；Solve 路径同时接受 GET 和 POST，`/api/bxua` 与 `/api/waf` 只接受 POST。其他方法或路径返回 `404`。
 若极低概率的系统密码学随机源失败，`GET /` 返回 `500 text/plain` 且不调用 Solver；OpenAPI 同时声明该失败边界。
 
 ## 合同与兼容策略
@@ -26,6 +27,7 @@ OpenAPI 从 `internal/interfaces/httpapi/openapi.go` 定义，在 Handler 构造
 |---|---|
 | `POST /api/slider` | `solveSlider` |
 | `POST /api/bxua` | `generateBXUA` |
+| `POST /api/waf` | `solveWAF` |
 | `GET /api/slider` | `solveSliderLegacy` |
 | `GET /health` | `getHealth` |
 | `GET /openapi.json` | `getOpenAPI` |
@@ -41,14 +43,14 @@ Go SDK 的接入方式见 [README](../../README.md#go-sdk-接入) 和 `go doc ./
 http://127.0.0.1:8000/
 ```
 
-页面内置于 Go EXE，不加载 CDN、字体、框架或第三方脚本，也不需要 Node.js。它固定调用当前 origin 的 `/health`、`/api/slider` 和 `/api/bxua`，因此换端口后无需配置页面。选择“验证码求解”或“Baxia bx-ua”切换操作；后者的页面 URL 和请求 URL 是计算输入，不改变页面调用的本地 API 地址。
+页面内置于 Go EXE，不加载 CDN、字体、框架或第三方脚本，也不需要 Node.js。它固定调用当前 origin 的 `/health`、`/api/slider`、`/api/bxua` 和 `/api/waf`，因此换端口后无需配置页面。选择“验证码求解”、“Baxia bx-ua”或“WAF / ESA 验证”切换操作；各模式的页面 URL 都不会改变测试页调用的本地 API 地址。
 测试页需要支持 `fetch`、`AbortController` 和 `TextEncoder` 的现代 Edge、Chrome 或 Firefox；没有现代浏览器时仍可直接调用 API。
 
 - 页面打开时只执行无副作用的 health 检查，不自动创建挑战。
 - 只有手工提交才会发送一次 POST JSON；执行期间按钮和类型选择禁用，防止重复提交或切换。页面不生成旧 GET query，也不自动重试、批量请求或并发压测。
-- 空的可选字段不进入 JSON，验证码模式的默认 Scene ID/prefix 由服务启动配置决定；Baxia 模式必须填写 `pageUrl` 和 `requestUrl`，共用代理输入。
+- 空的可选字段不进入 JSON，验证码模式的默认 Scene ID/prefix 由服务启动配置决定；Baxia 模式必须填写 `pageUrl` 和 `requestUrl`。WAF/ESA 模式的 `pageUrl` 必填，填写挑战参数时须同时提供 Scene ID、`userId`、`userUserId`、`traceid`、`token` 和 `region`；三者共用代理输入。
 - 页面等待上限可设为 `1..305` 秒，并支持手工取消。取消会传播到请求 context，但若 Verify 已发出，上游结果可能未知；不要手工重试结果未知的一轮。
-- RPC key、代理、`securityToken`、`certifyId` 和 `bx-ua` 默认遮罩，可勾选“显示敏感字段”查看。请求和响应只保留在当前页面内存，不写 Cookie、URL、localStorage、sessionStorage 或遥测；刷新或“清空”即移除。
+- RPC key、代理、`securityToken`、`certifyId`、`bx-ua`、WAF 挑战 `token`、`u_atoken` 和 `u_asig` 默认遮罩，可勾选“显示敏感字段”查看。请求和响应只保留在当前页面内存，不写 Cookie、URL、localStorage、sessionStorage 或遥测；刷新或“清空”即移除。
 - 页面用 `textContent` 显示响应；CSP 只允许同源连接，并禁止外部资源、frame、form action、worker 和不带随机 nonce 的脚本/样式。
 
 测试页是本机调试入口，不是鉴权边界。Handler 会根据浏览器 `Origin` / `Sec-Fetch-Site` 拒绝明确的跨源 GET/POST Solve，但这不是账号、权限或完整 CSRF 身份机制；不要把监听地址改成 `0.0.0.0` 后直接暴露到公网。无浏览器来源头的 curl/程序客户端仍允许；POST 还保持空 body 和无 Content-Type 兼容性。
@@ -90,7 +92,7 @@ http://127.0.0.1:7890
 socks5h://proxy.example.test:1080
 ```
 
-代理由调用方控制：验证码模式影响本轮全部网络出口，Baxia 模式只影响 AWSC 与 Fireye 公开脚本下载。不要把未经信任的代理参数开放给公网调用方。
+代理由调用方控制：验证码模式和 WAF/ESA 模式影响本轮全部网络出口，Baxia 模式只影响 AWSC 与 Fireye 公开脚本下载。不要把未经信任的代理参数开放给公网调用方。
 
 ### curl 示例
 
@@ -239,6 +241,83 @@ curl --fail-with-body \
 
 总执行受服务 `--timeout` 和客户端连接 context 限制；脚本下载与会话创建阶段另有最多 2 分钟上限，单次初始化最多 30 秒，均不延长外层 deadline。下载或适配失败不会返回旧 token，也不会静默回退到旧 SDK。具体错误消息已脱敏，排查时携带 `traceId`。
 
+## WAF / ESA：POST /api/waf
+
+`bmy.albatrip.cn` 已完成一次自动抓页模式的真实生产 HTTP 验收：调用方仅提交 `pageUrl` 和 `proxy`，返回 HTTP `200`、`ok=true`、`verifyCode=T001`，耗时 6,316 ms；携带返回签名与 `uaHeaders` 回访取得 HTTP `200`，命中“快速购票”标题，未再出现挑战。验收使用无 Node 的 PATH、`CGO_ENABLED=0` 和实际 V8 库。此前自动抓页模式的 4 次 Go + V8 Verify 也均返回 `T001`；这些结果仅覆盖此站点，尚未做跨站实测。WAF 使用新增原生浏览器绑定，部署时需按本版源码重建同平台 V8 wrapper。
+
+WAF/ESA 挑战使用独立入口，当前支持 `verifyType1.0` 的 `InitCaptchaV2 → SLIDING` 协议。调用方只提交 `pageUrl` 和可选代理，服务器读取保护页，从页面配置中自动提取本轮挑战，创建设备画像并验证一次。场景、用户、token、地区和语言由服务器提取，无需调用方填写；验证码接口的默认 Scene ID 和 `prefix` 不用于此入口。
+
+启动、打开测试页、切换类型和 health 检查都不会请求该页面，只有提交 `/api/waf` 后才开始读取并验证。
+
+本入口全程使用 Go 与同进程 V8，不启动 Node.js 或浏览器。地区当前支持 `cn` 与 `sgp`；设备初始化成功后按真实时间运行交互，每轮最多提交一次 Verify。服务使用本轮页面中的新鲜挑战，不复用上一轮值。本轮保护页读取、验证以及后续携带签名访问业务都须保持相同出口；需要代理时传入相同出口的 `proxy`。
+
+### 请求字段
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `pageUrl` | string | 是 | 保护页面的完整公网域名 HTTPS URL，保留业务 query；服务从此页面提取挑战 |
+| `proxy` | string / null | 否 | 与验证码接口相同，影响本轮页面、SDK 与验证的全部网络请求；空或 `null` 时直连 |
+| `Proxy` | string / null | 否 | `proxy` 的兼容别名；两者同时出现时 `proxy` 优先，包括空值 |
+
+URL 去除首尾空白后不能为空，最多 8,192 个 UTF-8 字节；必须使用默认 HTTPS 端口或显式 `443`，不能包含用户名/密码或 fragment（包括末尾空 `#`）。主机必须是有效 ASCII 域名，国际化域名使用 Punycode；拒绝 IP literal、localhost、单段主机及本地或保留域名后缀。输入校验本身不进行 DNS 查询或发请求。字段名区分大小写，JSON body 最多 65,536 字节，未知字段忽略，URL query 不参与参数合并；不提供 GET query 入口。
+
+读取保护页时校验并固定目标公网 IP，保持原域名 Host/SNI，不跟随重定向。本机 DNS 的全部答案若属于 TUN 常用的 `198.18.0.0/15` Fake-IP 段，会通过同一代理路由向固定 Google DoH 地址查询真实 A/AAAA，再执行公网校验。该查询只包含域名，不包含页面路径、query 或验证码字段；DoH 不可达时明确失败，不使用 Fake-IP 继续访问。
+
+将下面地址替换为当前出现上述 WAF/ESA 挑战的授权页面；该示例地址本身不保证包含挑战，未填写代理时直连：
+
+```bash
+curl --fail-with-body \
+  --request POST \
+  --header 'Content-Type: application/json' \
+  --data '{"pageUrl":"https://example.com/pc/index.html?orgId=your-org"}' \
+  http://127.0.0.1:8000/api/waf
+```
+
+自动抓页模式的真实 HTTP 验收使用生产执行器，只运行以下测试；需要当前授权页面和同平台实际 V8 库，示例 URL 需替换：
+
+```bash
+CGO_ENABLED=0 \
+ALI_SLIDER_V8_TEST_LIBRARY=/absolute/path/to/platform-v8-library \
+ALI_SLIDER_WAF_ONLINE_URL='https://your-authorized-page.example/' \
+go test -tags online -run '^TestOnlineWAFHTTP$' -count=1 -v ./internal/bootstrap
+```
+
+可选设置 `ALI_SLIDER_WAF_ONLINE_BODY_MARKER` 为预期业务页正文片段，测试才会额外携带签名和返回的 `uaHeaders` 回访一次并检查该片段；不设置时只验收验证结果。该测试由服务器获取本轮新挑战，不复用旧参数；直接调用生产执行器的自动抓页验收仍可使用 `-run '^TestOnlineWAF$'`。`F001` 等业务拒绝会使测试失败。
+
+### 验证结果
+
+正常完成一轮验证时返回 HTTP `200`；业务拒绝也返回 `200` 和 `ok=false`，通过 `verifyCode` 查看上游结果。调用方必须检查 `ok` 和非空 `u_atoken`、`u_asig` 才能确认取得验证签名。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `ok` | boolean | 本轮 WAF 验证是否通过 |
+| `sceneId` | string | 本轮实际 Scene ID，来自保护页面配置 |
+| `captchaType` | string | 本轮挑战类型，当前支持 `SLIDING` |
+| `verifyCode` | string | 上游验证结果码，业务拒绝时用于判断本轮结果 |
+| `u_atoken` / `u_asig` | string | 本轮 WAF 验证 token 与签名；敏感字段，业务拒绝时可能为空 |
+| `uaHeaders` | object | 同一设备画像的 `User-Agent`、`Accept-Language`、`Sec-CH-UA`、`Sec-CH-UA-Mobile`、`Sec-CH-UA-Platform` |
+| `proxied` | boolean | 本轮是否配置了代理 |
+| `elapsedMs` | integer | 本轮服务端处理耗时，单位毫秒 |
+| `traceId` | string | 与 `X-Trace-ID` 响应头一致 |
+
+成功输出是验证签名，不表示原页面、登录或其他业务已经成功。服务不自动回访原页面或提交登录业务；后续请求由调用方按站点流程处理，并保持与本轮 `uaHeaders`、代理出口一致。
+
+### 错误与超时
+
+技术失败使用 `{ "ok": false, "errorType": "...", "error": "...", "traceId": "..." }`，不会输出部分 token 或签名：
+
+| HTTP 状态 | `errorType` | 说明 |
+|---|---|---|
+| `400` | `ApiRequestError` / `InvalidRequest` | URL、JSON 或代理等请求参数无效 |
+| `403` | `ApiOriginError` | 明确的跨源浏览器请求 |
+| `500` | `WAFSourceError` | 保护页面或 SDK 获取失败 |
+| `500` | `WAFUnsupportedError` | 页面或挑战类型不受支持 |
+| `500` | `WAFRuntimeError` | 本轮运行或验证执行失败 |
+| `500` | `WAFCanceled` | 请求取消或执行超时 |
+| `500` | `InternalError` | 内部错误；不回显底层错误或 panic 内容 |
+
+总执行受服务 `--timeout` 和客户端连接 context 限制，不自动重试。验证请求发出后取消时，上游结果可能未知。具体错误消息已脱敏，排查时携带 `traceId`。
+
 ## 验证码接口：处理结果与错误
 
 | HTTP 状态 | `errorType` | 语义 | Solver 调用 |
@@ -261,7 +340,7 @@ Handler 不因本机在途请求数返回 `429` 或 `Retry-After`。每个通过
 | 所有响应 | `Cache-Control: no-store` | 防止包含挑战结果的响应被缓存 |
 | `GET /` | `Content-Security-Policy`、`X-Frame-Options`、`Cross-Origin-Resource-Policy`、`Permissions-Policy` | 页面只运行随机 nonce 的内联资源，只连接同源 API，禁止被 frame 嵌入 |
 | `GET /` | `Content-Type: text/html; charset=utf-8` | 内嵌测试页 |
-| `/api/slider` 和 `/api/bxua` 的 `200/400/403/500` | `X-Trace-ID` | 与响应体 `traceId` 一致 |
+| `/api/slider`、`/api/bxua` 和 `/api/waf` 的 `200/400/403/500` | `X-Trace-ID` | 与响应体 `traceId` 一致 |
 | JSON 响应 | `Content-Type: application/json; charset=utf-8` | UTF-8 JSON |
 | HTML 与 JSON | `X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer` | 禁止 MIME 猜测且不发送 referrer |
 
@@ -287,10 +366,10 @@ curl --fail --output openapi.json http://127.0.0.1:8000/openapi.json
 
 ## 实现与回归入口
 
-HTTP 的输入、输出与 OpenAPI 由 [interfaces/httpapi](../../internal/interfaces/httpapi) 维护。`Handler` 消费应用层请求/结果合同，不依赖公共 SDK；验证码兼容映射位于 [pkg/slider](../../pkg/slider)。Baxia HTTP 由应用层编排，复用 [pkg/baxia](../../pkg/baxia) 对应的底层下载与会话实现。
+HTTP 的输入、输出与 OpenAPI 由 [interfaces/httpapi](../../internal/interfaces/httpapi) 维护。`Handler` 消费应用层请求/结果合同，不依赖公共 SDK；验证码兼容映射位于 [pkg/slider](../../pkg/slider)。Baxia HTTP 由应用层编排，复用 [pkg/baxia](../../pkg/baxia) 对应的底层下载与会话实现。WAF/ESA 使用独立的应用层请求、结果与错误合同。
 
 ```bash
-go test -count=1 ./internal/interfaces/httpapi ./tests/architecture
+go test -count=1 ./internal/interfaces/httpapi ./internal/application/service ./tests/contracts ./tests/architecture
 ```
 
 该命令用本地替身核对字段、别名、状态、跨源边界和公共 SDK 合同，不访问上游。HTTP 协议改动需要同时更新生成式 OpenAPI、本页与相应合同测试。

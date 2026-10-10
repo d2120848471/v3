@@ -54,6 +54,14 @@ const {
 
 const sdkV8Adapter = `
 
+globalThis.__aliV8WAFSolve = async (input) => runWAFChallenge(input.sdkSource, {
+  pageURL: input.pageURL,
+  region: input.challenge.region,
+  timeoutMs: input.timeoutMs,
+  networkEnabled: true,
+  deviceProfile: input.deviceProfile,
+}, input);
+
 globalThis.__aliSdkModule = Object.freeze({
   browserRequestHeaders,
   callFeiLinGetter,

@@ -127,13 +127,14 @@ function browserRequestHeaders(
     destination = "empty",
     includeOrigin = true,
     mode = "cors",
+    referer = TARGET_REFERER,
   } = {},
 ) {
   return {
     Accept: "*/*",
     "Accept-Language": profile.acceptLanguage,
-    ...(includeOrigin ? { Origin: TARGET_ORIGIN } : {}),
-    Referer: TARGET_REFERER,
+    ...(includeOrigin ? { Origin: new URL(referer).origin } : {}),
+    Referer: referer,
     "Sec-CH-UA": profile.secChUa,
     "Sec-CH-UA-Mobile": profile.secChUaMobile,
     "Sec-CH-UA-Platform": profile.secChUaPlatform,
@@ -1136,7 +1137,22 @@ function makeBrowserContext(options, onRequest) {
   // 全部由它派生，任何一处另起炉灶都会让服务端看到两台设备。
   const deviceProfile = options.deviceProfile;
   const screenProfile = deviceProfile.screen;
-  const makeElement = makeElementFactory(deviceProfile);
+  const requestReferer = options.pageURL
+    ? `${new URL(options.pageURL).origin}/`
+    : TARGET_REFERER;
+  let contextReference = null;
+  const navigatorValues = new WeakMap();
+  const canvasDataURLs = new WeakMap();
+  const makeBaseElement = makeElementFactory(deviceProfile);
+  const makeElement = (tagName, realm = contextReference) => {
+    const element = makeBaseElement(tagName);
+    if (options.pageURL && realm && element.tagName === "CANVAS") {
+      canvasDataURLs.set(element, element.toDataURL);
+      delete element.toDataURL;
+      Object.setPrototypeOf(element, realm.HTMLCanvasElement.prototype);
+    }
+    return element;
+  };
   const head = makeElement("head");
   const body = makeElement("body");
   const documentElement = makeElement("html");
@@ -1145,7 +1161,6 @@ function makeBrowserContext(options, onRequest) {
   const HostDate = globalThis.Date;
   const hostPerformance = globalThis.performance;
   let logicalTimeOffsetMs = 0;
-  let contextReference = null;
   let timerSequence = 1;
   const timeoutHandles = new Map();
   const intervalHandles = new Map();
@@ -1373,7 +1388,7 @@ function makeBrowserContext(options, onRequest) {
     return parsed.href;
   }
 
-  async function fetchAllowedNetworkUrl(value, init) {
+  async function fetchAllowedNetworkUrl(value, init, singleAttempt = false) {
     let currentUrl = assertAllowedNetworkUrl(value);
     let method = String(init.method ?? "GET").toUpperCase();
     let body = init.body;
@@ -1386,6 +1401,10 @@ function makeBrowserContext(options, onRequest) {
       });
       if (![301, 302, 303, 307, 308].includes(response.status)) {
         return response;
+      }
+      if (singleAttempt) {
+        await response.body?.cancel();
+        throw new Error("WAF RPC 不允许重定向重放");
       }
       if (redirectCount >= 3) {
         await response.body?.cancel();
@@ -1429,6 +1448,7 @@ function makeBrowserContext(options, onRequest) {
                 destination: "script",
                 includeOrigin: false,
                 mode: "no-cors",
+                referer: requestReferer,
               },
             ),
           });
@@ -1483,6 +1503,7 @@ function makeBrowserContext(options, onRequest) {
                 destination: "style",
                 includeOrigin: false,
                 mode: "no-cors",
+                referer: requestReferer,
               },
             ),
           });
@@ -1522,7 +1543,9 @@ function makeBrowserContext(options, onRequest) {
     currentScript: null,
     createElement(tagName) {
       const element = makeElement(tagName);
-      const prototype = contextReference?.HTMLElement?.prototype;
+      const prototype = options.pageURL && element.tagName === "CANVAS"
+        ? contextReference?.HTMLCanvasElement?.prototype
+        : contextReference?.HTMLElement?.prototype;
       if (prototype) {
         Object.setPrototypeOf(element, prototype);
       }
@@ -1689,6 +1712,7 @@ function makeBrowserContext(options, onRequest) {
       const effectiveHeaders = browserRequestHeaders(
         deviceProfile,
         this.headers,
+        { referer: requestReferer },
       );
       const request = {
         method: this.method,
@@ -1725,6 +1749,20 @@ function makeBrowserContext(options, onRequest) {
 
       const form = parseForm(request.body);
       const sdkInit = contextReference?.__ALI_SDK_INIT__;
+      const waf = sdkInit?.protocol === "waf" ? sdkInit : null;
+      if (waf && /^(Init|Verify)Captcha/.test(form.Action ?? "")) {
+        const init = form.Action === "InitCaptchaV2";
+        const verify = form.Action === "VerifyCaptchaV2";
+        if (waf.closed || (!init && !verify) || form.SceneId !== waf.sceneId
+          || (init && waf.initRequested)
+          || (verify && (!waf.consumed || waf.verifyRequested || form.CertifyId !== waf.certifyId))) {
+          Promise.resolve().then(() => this.onerror?.(new Error("WAF 单轮请求合同不一致")));
+          return;
+        }
+        if (init) waf.initRequested = true;
+        if (verify) waf.verifyRequested = true;
+        waf.phase = init ? "calling_init" : "verify_request";
+      }
       if (form.Action === "InitCaptchaV3" && sdkInit) {
         Promise.resolve()
           .then(() => {
@@ -1791,13 +1829,44 @@ function makeBrowserContext(options, onRequest) {
             headers: effectiveHeaders,
             body: request.body,
             signal: timeoutController.signal,
-          });
+          }, waf !== null);
           const responseText = await response.text();
           if (timeoutId !== null) {
             clearTimeout(timeoutId);
           }
           if (this._aborted) {
             return;
+          }
+          if (waf && form.Action === "Log2" && response.status === 200) {
+            waf.deviceReady = true;
+          }
+          if (waf && (form.Action === "InitCaptchaV2" || form.Action === "VerifyCaptchaV2")) {
+            if (response.status !== 200) throw new Error("WAF RPC 状态无效");
+            const payload = JSON.parse(responseText);
+            if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+              throw new Error("WAF RPC 响应无效");
+            }
+            if (form.Action === "InitCaptchaV2") {
+              if (payload.Success !== true || payload.Code !== "Success"
+                || typeof payload.CertifyId !== "string" || !payload.CertifyId
+                || payload.CertifyId.length > 512 || payload.CaptchaType !== "SLIDING") {
+                waf.reject?.(new Error("WAF_INIT_UNSUPPORTED"));
+                return;
+              }
+              waf.certifyId = payload.CertifyId;
+              waf.consumed = true;
+              waf.phase = "init_response";
+            } else {
+              const result = payload.Result;
+              const code = result?.VerifyCode ?? payload.Code;
+              waf.verifyResult = {
+                certifyId: waf.certifyId,
+                verifyCode: typeof code === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(code)
+                  ? code : "Unknown",
+                verifyResult: payload.Success === true && result?.VerifyResult === true,
+              };
+              waf.phase = "verify_response";
+            }
           }
           if (form.Action === "VerifyCaptchaV3" && sdkInit) {
             sdkInit.verifyResult = parseTracelessVerifyResponse(
@@ -1818,6 +1887,9 @@ function makeBrowserContext(options, onRequest) {
           }
           if (this._aborted) {
             return;
+          }
+          if (waf && /^(Init|Verify)Captcha/.test(form.Action ?? "")) {
+            waf.reject?.(new Error("WAF_RPC_FAILED"));
           }
           if (error?.name === "AbortError") {
             this.ontimeout?.();
@@ -1875,6 +1947,14 @@ function makeBrowserContext(options, onRequest) {
       return this.href;
     },
   };
+  if (options.pageURL) {
+    const page = new URL(options.pageURL);
+    document.domain = page.hostname;
+    document.URL = page.href;
+    for (const field of ["protocol", "host", "hostname", "port", "origin", "pathname", "search", "hash", "href"]) {
+      location[field] = page[field];
+    }
+  }
   function makeNavigator() {
     const makeMimeType = (type) => ({
       type,
@@ -2006,14 +2086,17 @@ function makeBrowserContext(options, onRequest) {
       userAgent: {
         value: deviceProfile.userAgent,
         enumerable: true,
+        configurable: Boolean(options.pageURL),
       },
       platform: {
         value: deviceProfile.platform,
         enumerable: true,
+        configurable: Boolean(options.pageURL),
       },
       appVersion: {
         value: deviceProfile.appVersion,
         enumerable: true,
+        configurable: Boolean(options.pageURL),
       },
       userAgentData: {
         value: userAgentData,
@@ -2038,6 +2121,42 @@ function makeBrowserContext(options, onRequest) {
       angle: screenProfile.orientationAngle,
     },
   };
+
+  function installWAFBrowserBindings(realm, realmNavigator) {
+    // 浏览器的只读设备属性属于 Navigator.prototype，实例仅保存内部状态。
+    // 用 V8 原生绑定转调画像值，避免改写函数源码表示或采集结果。
+    const names = [
+      "webdriver", "plugins", "platform", "vendor", "userAgent", "appVersion",
+      "language", "languages", "hardwareConcurrency", "deviceMemory",
+      "cookieEnabled", "maxTouchPoints", "product", "appCodeName",
+    ];
+    const values = Object.fromEntries(names.map(name => [name, realmNavigator[name]]));
+    navigatorValues.set(realmNavigator, values);
+    Object.setPrototypeOf(realmNavigator, realm.Navigator.prototype);
+    for (const name of names) {
+      delete realmNavigator[name];
+      Object.defineProperty(realm.Navigator.prototype, name, {
+        configurable: true,
+        enumerable: true,
+        get: vm.createNativeFunction(realm, `get ${name}`, 0, function () {
+          const state = navigatorValues.get(this);
+          if (!state) throw new realm.TypeError("Illegal invocation");
+          return state[name];
+        }),
+      });
+    }
+    Object.setPrototypeOf(realm.HTMLCanvasElement.prototype, realm.HTMLElement.prototype);
+    Object.defineProperty(realm.HTMLCanvasElement.prototype, "toDataURL", {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: vm.createNativeFunction(realm, "toDataURL", 0, function (...args) {
+        const implementation = canvasDataURLs.get(this);
+        if (!implementation) throw new realm.TypeError("Illegal invocation");
+        return implementation.apply(this, args);
+      }),
+    });
+  }
 
   function makeIframeRealm(frameElement) {
     if (contextReference === null) {
@@ -2080,7 +2199,7 @@ function makeBrowserContext(options, onRequest) {
       currentScript: null,
       defaultView: null,
       createElement(tagName) {
-        return makeElement(tagName);
+        return makeElement(tagName, childContext);
       },
       createTextNode(text) {
         return { nodeType: 3, textContent: String(text) };
@@ -2166,6 +2285,10 @@ function makeBrowserContext(options, onRequest) {
       outerHeight: screenProfile.outerHeight,
       devicePixelRatio: screenProfile.devicePixelRatio,
     };
+    if (options.pageURL) {
+      // about:blank 子文档继承创建它的 HTTPS 页面的安全上下文。
+      childSandbox.isSecureContext = contextReference.isSecureContext;
+    }
     const childContext = vm.createContext(childSandbox);
     childContext.window = childContext;
     childContext.self = childContext;
@@ -2200,7 +2323,7 @@ function makeBrowserContext(options, onRequest) {
         "this.Screen=function Screen(){}",
         "this.Element=function Element(){}",
         "this.HTMLElement=function HTMLElement(){}",
-      ].join(";"),
+      ].concat(options.pageURL ? ["this.HTMLCanvasElement=function HTMLCanvasElement(){}"] : []).join(";"),
       childContext,
       { timeout: 1_000 },
     );
@@ -2224,6 +2347,7 @@ function makeBrowserContext(options, onRequest) {
     ]) {
       Object.setPrototypeOf(element, childContext.HTMLElement.prototype);
     }
+    if (options.pageURL) installWAFBrowserBindings(childContext, childNavigator);
     return {
       contentWindow: childContext,
       contentDocument: childDocument,
@@ -2389,6 +2513,7 @@ function makeBrowserContext(options, onRequest) {
     },
   };
   context.window = context;
+  if (options.pageURL) context.isSecureContext = location.protocol === "https:";
   context.self = context;
   context.globalThis = context;
   context.top = context;
@@ -2436,6 +2561,8 @@ function makeBrowserContext(options, onRequest) {
       return "";
     },
   });
+  // 动态 Function 必须属于页面 realm，否则其全局变量会落到没有 DOM 的宿主。
+  if (options.pageURL) delete context.Function;
   contextReference = vm.createContext(context);
   BROWSER_LOGICAL_CLOCKS.set(contextReference, logicalClock);
   Object.setPrototypeOf(
@@ -2445,6 +2572,7 @@ function makeBrowserContext(options, onRequest) {
   for (const element of [head, body, documentElement]) {
     Object.setPrototypeOf(element, contextReference.HTMLElement.prototype);
   }
+  if (options.pageURL) installWAFBrowserBindings(contextReference, navigator);
   return contextReference;
 }
 
@@ -3161,7 +3289,12 @@ async function replaySlidingTrack(context, slider, completion) {
     throw slidingBridgeError("SLIDING_TRACK_DISPATCH");
   }
   for (const sample of completion.track) {
-    logicalClock.advanceBy(sample.dt);
+    if (completion.waf) {
+      // WAF 的设备采集与滑块组件并行运行，必须让采集 timer 经历真实交互时间。
+      await wait(sample.dt);
+    } else {
+      logicalClock.advanceBy(sample.dt);
+    }
     elapsed += sample.dt;
     const clientX = completion.handleWidth / 2 + sample.x;
     const clientY = completion.handleWidth / 2 + sample.y;
@@ -3182,7 +3315,8 @@ async function replaySlidingTrack(context, slider, completion) {
       force: sample.force,
     };
     const ended = sample.type === "touchend";
-    const wireType = {
+    // WAF 使用移动画像，FeiLin 只监听触摸采集；不能把触摸轨迹改成鼠标事件。
+    const wireType = completion.waf ? sample.type : {
       touchstart: "mousedown",
       touchmove: "mousemove",
       touchend: "mouseup",
@@ -3191,7 +3325,8 @@ async function replaySlidingTrack(context, slider, completion) {
     const changed = makeTouchList([touch]);
     let event;
     try {
-      event = new context.MouseEvent(wireType, {
+      const EventConstructor = completion.waf ? context.TouchEvent : context.MouseEvent;
+      event = new EventConstructor(wireType, {
         bubbles: true,
         cancelable: true,
         composed: true,
@@ -3252,6 +3387,26 @@ async function replaySlidingTrack(context, slider, completion) {
   }
 }
 
+
+// WAF 在 InitV2 响应后才创建 FeiLin；不能预先启动 V3 Device 会话。
+async function runWAFChallenge(source, options, input) {
+  const context = makeBrowserContext(options, () => {});
+  delete context.AliyunCaptchaConfig;
+  vm.runInContext(source, context, {filename: "AliyunCaptcha.js", timeout: 10_000});
+  const result = await runSlidingCaptcha(context, {}, options, {
+    ...input,
+    waf: input.challenge,
+    sceneId: input.challenge.sceneId,
+    captchaType: "SLIDING",
+  });
+  return {
+    signature: result.captchaVerifyParam,
+    certifyId: result.verifyResult.certifyId,
+    captchaType: "SLIDING",
+    verifyCode: result.verifyResult.verifyCode,
+    verifyResult: result.verifyResult.verifyResult,
+  };
+}
 
 async function runSlidingCaptcha(
   context,
@@ -3320,12 +3475,14 @@ async function runSlidingCaptcha(
   let captchaInstance = null;
   let timeoutId = null;
   let dragStarted = false;
+  const waf = completion.waf;
   try {
-    runtimeConfig.DeviceToken = completion.deviceToken;
-    if (runtimeConfig.DeviceToken !== completion.deviceToken) {
+    if (!waf) runtimeConfig.DeviceToken = completion.deviceToken;
+    if (!waf && runtimeConfig.DeviceToken !== completion.deviceToken) {
       throw new Error("拖动验证码 DeviceToken 不可写");
     }
     context.__ALI_SDK_INIT__ = {
+      protocol: waf ? "waf" : "v3",
       sceneId: completion.sceneId,
       certifyId: completion.certifyId,
       captchaType: "SLIDING",
@@ -3345,6 +3502,7 @@ async function runSlidingCaptcha(
         if (timeoutId !== null) clearTimeout(timeoutId);
         callback(value);
       };
+      if (waf) context.__ALI_SDK_INIT__.reject = error => finish(reject, error);
       timeoutId = setTimeout(
         () => {
           const phase = context.__ALI_SDK_INIT__?.phase;
@@ -3367,11 +3525,18 @@ async function runSlidingCaptcha(
       try {
         context.__ALI_SDK_INIT__.phase = "calling_init";
         context.initAliyunCaptcha({
-          prefix: options.prefix,
+          ...(waf ? {
+            verifyType: "1.0",
+            userId: waf.userId,
+            userUserId: waf.userUserId,
+            UserCertifyId: waf.traceid,
+            region: waf.region,
+            immediate: true,
+          } : {prefix: options.prefix}),
           SceneId: completion.sceneId,
           mode: "embed",
           element: `#${elementId}`,
-          language: "cn",
+          language: waf?.language || "cn",
           timeout: Math.min(options.timeoutMs, 5_000),
           rem: 1,
           slideStyle: {
@@ -3386,8 +3551,9 @@ async function runSlidingCaptcha(
               !context.__ALI_SDK_INIT__?.consumed
               || context.__ALI_SDK_INIT__?.captchaType !== "SLIDING"
               || context.__ALI_SDK_INIT__?.verifyResult === null
+              || (waf && context.__ALI_SDK_INIT__?.verifyResult?.verifyResult !== true)
               || typeof value !== "string"
-              || value.length <= 140
+              || value.length < (waf ? 1 : 141)
               || value.length > 16 * 1024
             ) {
               finish(reject, new Error("拖动验证码成功参数无效"));
@@ -3396,6 +3562,10 @@ async function runSlidingCaptcha(
             finish(resolve, value);
           },
           fail() {
+            if (waf && context.__ALI_SDK_INIT__?.verifyResult) {
+              finish(resolve, "");
+              return;
+            }
             finish(reject, slidingBridgeError("SLIDING_FAIL_CALLBACK"));
           },
           onError() {
@@ -3416,6 +3586,19 @@ async function runSlidingCaptcha(
                   const slider = slidingDOM?.slider;
                   if (!slider) {
                     throw slidingBridgeError("SLIDING_TIMEOUT_DOM");
+                  }
+                  if (waf) {
+                    // InitV2 会并行下载 FeiLin 与滑块组件；DOM 就绪不代表设备采集已就绪。
+                    const deadline = Date.now() + options.timeoutMs;
+                    while (!context.__ALI_SDK_INIT__?.deviceReady
+                      || typeof instance.config?.DeviceToken !== "string"
+                      || !instance.config.DeviceToken
+                      || !selectFeiLinGetterOwner(context)) {
+                      if (Date.now() >= deadline || context.__ALI_SDK_INIT__?.closed) {
+                        throw new Error("WAF_DEVICE_NOT_READY");
+                      }
+                      await wait(10);
+                    }
                   }
                   // getInstance 返回当前调用栈后，SDK 的同步 listener 已全部挂载；
                   // 清空 microtask 即可，不引入真实 timer/macrotask 等待。
@@ -3441,9 +3624,9 @@ async function runSlidingCaptcha(
     });
     const observedDeviceToken = context.__ALI_SDK_INIT__?.observedDeviceToken;
     if (
-      typeof observedDeviceToken !== "string"
+      !waf && (typeof observedDeviceToken !== "string"
       || observedDeviceToken.length < 1
-      || observedDeviceToken.length > 32 * 1024
+      || observedDeviceToken.length > 32 * 1024)
     ) {
       throw new Error("拖动验证码 DeviceToken 无效");
     }
@@ -3464,7 +3647,12 @@ async function runSlidingCaptcha(
     context.document.querySelector = originalQuerySelector;
     context.document.querySelectorAll = originalQuerySelectorAll;
     context.document.body.removeChild(element);
-    delete context.__ALI_SDK_INIT__;
+    if (waf) {
+      // SDK 的延迟回调可能继续尝试 refresh；保留单轮状态直到 Isolate 关闭。
+      context.__ALI_SDK_INIT__.closed = true;
+    } else {
+      delete context.__ALI_SDK_INIT__;
+    }
     if (hadDeviceToken) {
       runtimeConfig.DeviceToken = originalDeviceToken;
     } else {
@@ -4056,6 +4244,7 @@ export {
   readWorkerCompletionInput,
   runTracelessCaptcha,
   runSlidingCaptcha,
+  runWAFChallenge,
   safeDeviceBridgeFailureMessage,
   selectFeiLinGetterOwner,
 };

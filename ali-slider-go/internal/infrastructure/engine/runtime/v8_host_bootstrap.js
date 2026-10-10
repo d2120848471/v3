@@ -14,6 +14,7 @@
   }
   const nativeHostCall = globalThis.__aliNativeHostCall;
   const nativeCreateContext = globalThis.__aliV8CreateContext;
+  const nativeCreateFunction = globalThis.__aliV8CreateNativeFunction;
   const nativeRunInContext = globalThis.__aliV8RunInContext;
   const nativeQueueMicrotask = globalThis.__aliV8QueueMicrotask;
 
@@ -691,6 +692,13 @@
 
   const vmContexts = new WeakMap();
   const vm = {
+    createNativeFunction(context, name, length, callback) {
+      const target = vmContexts.get(context);
+      if (!target || typeof nativeCreateFunction !== "function") {
+        throw new Error("WAF browser bindings require an updated V8 runtime");
+      }
+      return nativeCreateFunction(target, name, length, callback);
+    },
     createContext(sandbox) {
       if (!sandbox || typeof sandbox !== "object") {
         throw new TypeError("vm.createContext sandbox must be an object");

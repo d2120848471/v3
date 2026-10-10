@@ -22,6 +22,7 @@ const (
 	TestPagePath = "/"
 	SolvePath    = "/api/slider"
 	BaxiaPath    = "/api/bxua"
+	WAFPath      = "/api/waf"
 	HealthPath   = "/health"
 	OpenAPIPath  = "/openapi.json"
 	// MaxRequestBytes 是 POST body 与 legacy GET raw query 的共享上限。
@@ -34,6 +35,7 @@ var browserOriginProtection = http.NewCrossOriginProtection()
 type Options struct {
 	Solver         service.Executor
 	Baxia          service.BaxiaExecutor
+	WAF            service.WAFExecutor
 	DefaultSceneID string
 	DefaultPrefix  string
 	Timeout        time.Duration
@@ -44,6 +46,7 @@ type Options struct {
 type Handler struct {
 	solver         service.Executor
 	baxia          service.BaxiaExecutor
+	waf            service.WAFExecutor
 	defaultSceneID string
 	defaultPrefix  string
 	timeout        time.Duration
@@ -87,6 +90,7 @@ func New(options Options) (*Handler, error) {
 	return &Handler{
 		solver:         options.Solver,
 		baxia:          options.Baxia,
+		waf:            options.WAF,
 		defaultSceneID: options.DefaultSceneID,
 		defaultPrefix:  options.DefaultPrefix,
 		timeout:        options.Timeout,
@@ -95,7 +99,7 @@ func New(options Options) (*Handler, error) {
 	}, nil
 }
 
-// ServeHTTP 仅暴露约定路径；Solve 兼容旧 GET query，Baxia 只接受 POST JSON。
+// ServeHTTP 仅暴露约定路径；Solve 兼容旧 GET query，Baxia 和 WAF 只接受 POST JSON。
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	switch {
@@ -106,6 +110,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleSolve(w, r, started)
 	case r.Method == http.MethodPost && r.URL.Path == BaxiaPath:
 		h.handleBaxia(w, r, started)
+	case r.Method == http.MethodPost && r.URL.Path == WAFPath:
+		h.handleWAF(w, r, started)
 	case r.Method == http.MethodGet && r.URL.Path == HealthPath:
 		h.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": "ready"}, nil)
 		h.logResult("", http.StatusOK, started)

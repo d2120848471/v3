@@ -404,7 +404,7 @@
       <div>
         <p class="eyebrow">Ali Slider Go</p>
         <h1>API 测试台</h1>
-        <p class="lead">选择验证码求解或 Baxia bx-ua，手工发送一次请求，查看 HTTP 状态、耗时、追踪 ID 和完整响应。</p>
+        <p class="lead">选择验证码求解、Baxia bx-ua 或 WAF / ESA 验证，手工发送一次请求，查看 HTTP 状态、耗时、追踪 ID 和完整响应。</p>
       </div>
       <div class="health" role="status" aria-live="polite">
         <span class="health-dot" id="health-dot" aria-hidden="true"></span>
@@ -430,6 +430,7 @@
               <select id="api-mode">
                 <option value="slider">验证码求解</option>
                 <option value="bxua">Baxia bx-ua</option>
+                <option value="waf">WAF / ESA 验证</option>
               </select>
             </div>
             <fieldset class="fields mode-fields" id="slider-fields">
@@ -461,6 +462,14 @@
                 <label for="request-url">requestUrl · 请求 URL（必填）</label>
                 <input id="request-url" type="url" required aria-describedby="request-url-hint" placeholder="https://example.com/api/login" spellcheck="false">
                 <span class="hint" id="request-url-hint">需要携带 bx-ua 的完整请求地址；本页面不会调用此业务接口。</span>
+              </div>
+            </fieldset>
+            <fieldset class="fields mode-fields" id="waf-fields" hidden disabled>
+              <legend>WAF / ESA 验证参数</legend>
+              <div class="field full">
+                <label for="waf-page-url">pageUrl · WAF 页面 URL（必填）</label>
+                <input id="waf-page-url" type="url" required aria-describedby="waf-page-url-hint" placeholder="https://example.com/pc/index.html?orgId=your-org" spellcheck="false">
+                <span class="hint" id="waf-page-url-hint">使用公网域名 HTTPS 地址和默认或 443 端口，保留 query；不含用户名、密码或 # 路由。最多 8,192 个 UTF-8 字节。</span>
               </div>
             </fieldset>
             <div class="fields">
@@ -541,6 +550,7 @@
       const modeSelect = document.getElementById("api-mode");
       const sliderFields = document.getElementById("slider-fields");
       const bxuaFields = document.getElementById("bxua-fields");
+      const wafFields = document.getElementById("waf-fields");
       const submitButton = document.getElementById("submit");
       const cancelButton = document.getElementById("cancel");
       const clearButton = document.getElementById("clear");
@@ -565,29 +575,38 @@
 
       function updateMode() {
         const bxua = modeSelect.value === "bxua";
-        sliderFields.hidden = bxua;
-        sliderFields.disabled = bxua;
+        const waf = modeSelect.value === "waf";
+        sliderFields.hidden = bxua || waf;
+        sliderFields.disabled = bxua || waf;
         bxuaFields.hidden = !bxua;
         bxuaFields.disabled = !bxua;
-        document.getElementById("endpoint").textContent = `${location.origin}${bxua ? "/api/bxua" : "/api/slider"}`;
-        document.getElementById("request-hint").textContent = bxua
+        wafFields.hidden = !waf;
+        wafFields.disabled = !waf;
+        document.getElementById("endpoint").textContent = `${location.origin}${waf ? "/api/waf" : bxua ? "/api/bxua" : "/api/slider"}`;
+        document.getElementById("request-hint").textContent = waf
+          ? "pageUrl 必填，proxy 可选。服务自动获取本轮 WAF 挑战参数。"
+          : bxua
           ? "pageUrl 和 requestUrl 必填，proxy 可选。只提交当前类型的参数。"
           : "求解参数可留空；服务会使用当前启动配置的默认 Scene ID 和 prefix。";
-        document.getElementById("request-notice").textContent = bxua
+        document.getElementById("request-notice").textContent = waf
+          ? "点击发送会读取目标页面并执行一轮 WAF / ESA 验证，返回签名。服务不会自动回访页面、提交登录业务或重试。"
+          : bxua
           ? "点击发送会向本服务申请生成一次 bx-ua。requestUrl 用于生成 token，页面不会自动调用该业务接口，也不会自动重试。"
           : "点击发送会访问真实 Device、Captcha、图片 CDN 和 Verify 上游。取消发生在 Verify 发出后时，结果可能未知；本页面绝不自动重试。";
-        document.getElementById("result-hint").textContent = bxua
+        document.getElementById("result-hint").textContent = waf
+          ? "HTTP 200 仍需检查 ok、u_atoken 和 u_asig。验证签名不表示原页面或登录业务已获放行。"
+          : bxua
           ? "HTTP 200 仍需检查 ok 和 bx-ua。生成成功不代表站点登录或业务请求已获放行。"
           : "HTTP 200 仍需同时检查 ok、VerifyCode 和 VerifyResult。";
-        document.getElementById("business-status-label").textContent = bxua ? "生成状态" : "业务状态";
-        submitButton.textContent = bxua ? "生成一次 bx-ua" : "发送一次求解";
+        document.getElementById("business-status-label").textContent = waf ? "验证状态" : bxua ? "生成状态" : "业务状态";
+        submitButton.textContent = waf ? "发送一次 WAF 验证" : bxua ? "生成一次 bx-ua" : "发送一次求解";
       }
 
       function maskedClone(value) {
         if (value === null || typeof value !== "object") return value;
         const clone = JSON.parse(JSON.stringify(value));
         if (revealSensitive.checked) return clone;
-        const sensitive = new Set(["securitytoken", "certifyid", "aaduaneid", "proxy", "bx-ua"]);
+        const sensitive = new Set(["securitytoken", "certifyid", "aaduaneid", "proxy", "bx-ua", "u_atoken", "u_asig"]);
         const walk = (node) => {
           if (Array.isArray(node)) {
             node.forEach(walk);
@@ -624,7 +643,9 @@
 
       function collectRequest(mode) {
         const request = {};
-        const fields = mode === "bxua" ? [
+        const fields = mode === "waf" ? [
+          ["waf-page-url", "pageUrl"]
+        ] : mode === "bxua" ? [
           ["page-url", "pageUrl"],
           ["request-url", "requestUrl"]
         ] : [
@@ -690,7 +711,7 @@
         if (!form.reportValidity() || activeController !== null) return;
 
         const mode = modeSelect.value;
-        const endpoint = mode === "bxua" ? "/api/bxua" : "/api/slider";
+        const endpoint = mode === "waf" ? "/api/waf" : mode === "bxua" ? "/api/bxua" : "/api/slider";
         const request = collectRequest(mode);
         const body = JSON.stringify(request);
         if (new TextEncoder().encode(body).length > 65536) {
@@ -751,6 +772,9 @@
           const successfulHTTP = response.status === 200;
           const succeeded = successfulHTTP && completed && lastResponse.ok === true && (mode === "bxua"
             ? typeof lastResponse["bx-ua"] === "string" && lastResponse["bx-ua"].trim().length > 0
+            : mode === "waf"
+            ? typeof lastResponse.u_atoken === "string" && lastResponse.u_atoken.trim().length > 0 &&
+              typeof lastResponse.u_asig === "string" && lastResponse.u_asig.trim().length > 0
             : lastResponse.VerifyCode === "T001" && lastResponse.VerifyResult === true &&
               typeof lastResponse.securityToken === "string" && lastResponse.securityToken.length > 0);
           const businessFailed = successfulHTTP && completed && lastResponse.ok === false;
@@ -758,14 +782,18 @@
           httpStatus.textContent = `${response.status} ${response.statusText}`.trim();
           traceID.textContent = trace;
           if (succeeded) {
-            resultLabel.textContent = mode === "bxua" ? "bx-ua 已生成" : "验证成功";
-            resultDetail.textContent = mode === "bxua"
+            resultLabel.textContent = mode === "waf" ? "WAF 验证成功" : mode === "bxua" ? "bx-ua 已生成" : "验证成功";
+            resultDetail.textContent = mode === "waf"
+              ? "已取得 WAF 验证签名；原页面和登录业务仍由调用方处理。"
+              : mode === "bxua"
               ? "生成成功不代表站点登录或业务请求已获放行。"
               : "HTTP 与业务结果均成功。";
             businessStatus.textContent = "ok=true";
           } else if (businessFailed) {
             resultLabel.textContent = mode === "bxua" ? "请求完成，生成未成功" : "请求完成，验证未通过";
-            resultDetail.textContent = mode === "bxua"
+            resultDetail.textContent = mode === "waf"
+              ? "上游未接受本轮 WAF 验证，请检查 verifyCode。"
+              : mode === "bxua"
               ? "未生成可用的 bx-ua，请检查响应中的错误信息。"
               : "HTTP 200 不代表业务成功，请检查 VerifyCode 和 VerifyResult。";
             businessStatus.textContent = "ok=false";
@@ -777,6 +805,9 @@
             resultLabel.textContent = "响应合同异常";
             resultDetail.textContent = "HTTP 状态或成功字段与 OpenAPI 合同不一致。";
             businessStatus.textContent = "unknown";
+          }
+          if (mode === "waf" && completed && typeof lastResponse.verifyCode === "string" && lastResponse.verifyCode !== "") {
+            businessStatus.textContent = lastResponse.verifyCode;
           }
           renderStoredData();
         } catch (error) {

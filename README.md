@@ -1,6 +1,6 @@
 # Ali Slider Go
 
-阿里 V3 验证码协议的 Go 实现，提供可复用的 Go SDK 和本机 HTTP 服务，按上游类型处理 `PUZZLE`、`TRACELESS` 与 `SLIDING`。主项目位于 [ali-slider-go](ali-slider-go/README.md)。仅用于自有系统或已获授权的研究、兼容性验证与测试。
+阿里 V3 验证码协议的 Go 实现，提供可复用的 Go SDK 和本机 HTTP 服务，按上游类型处理 `PUZZLE`、`TRACELESS` 与 `SLIDING`。HTTP 另提供 WAF/ESA `verifyType: 1.0` 拖动验证入口，只需传入页面 URL 和可选代理，由服务器读取页面并自动提取挑战。主项目位于 [ali-slider-go](ali-slider-go/README.md)。仅用于自有系统或已获授权的研究、兼容性验证与测试。
 
 生产运行需要 **Go 主程序和同平台 V8 动态库**。Go 通过 `purego` 调用 Rust wrapper，在同进程执行动态 Device SDK 与 PE；Go 构建使用 `CGO_ENABLED=0`。Windows 便携包和 Docker 镜像包含 wrapper，服务端无需 Python、Node.js 或浏览器。
 

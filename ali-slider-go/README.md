@@ -7,10 +7,36 @@
 ## 启动与 HTTP 接入
 
 - [启动指南](docs/guides/getting-started.md)：Linux/macOS 源码、Windows 便携包和 Docker。
-- [HTTP API](docs/reference/http-api.md)：验证码调用 `POST /api/slider`，Baxia 调用 `POST /api/bxua`；包含代理、完整字段、错误和 OpenAPI 合同。
+- [HTTP API](docs/reference/http-api.md)：V3 验证码调用 `POST /api/slider`，Baxia 调用 `POST /api/bxua`，WAF/ESA 页面验证调用 `POST /api/waf`；包含代理、完整字段、错误和 OpenAPI 合同。
 - [配置参考](docs/reference/configuration.md)：命令行参数、环境变量、默认值与资源边界。
 
-启动成功后打开 `http://127.0.0.1:8000/` 使用内嵌测试页，或访问 `/health` 检查进程就绪。启动和 health 不访问真实上游；手工提交 Solve 后才创建挑战。HTTP `200` 仍需读取 `ok`、`VerifyCode` 和 `VerifyResult` 判断业务结果。
+启动成功后打开 `http://127.0.0.1:8000/` 使用内嵌测试页，或访问 `/health` 检查进程就绪。启动和 health 不访问真实上游；手工提交后才执行对应操作。V3 接口的 HTTP `200` 仍需读取 `ok`、`VerifyCode` 和 `VerifyResult` 判断业务结果。
+
+WAF/ESA 使用独立的 `POST /api/waf`，JSON 只需必填 `pageUrl` 和可选 `proxy`（兼容 `Proxy`）。服务器读取保护页，自动提取本轮挑战并执行 `verifyType1.0` / `InitCaptchaV2 → SLIDING` 验证，无需调用方填写场景、用户、token、地区或语言。字段名区分大小写，未知字段忽略；`proxy` 与 `Proxy` 同时出现时，`proxy` 优先，包括空值。
+
+将以下地址替换为当前出现上述 WAF/ESA 挑战的授权页面后调用；需要代理时增加 `proxy`，本轮全部网络请求与后续业务请求须保持相同出口：
+
+```bash
+curl --fail-with-body --request POST \
+  --header 'Content-Type: application/json' \
+  --data '{"pageUrl":"https://example.com/pc/index.html?orgId=your-org"}' \
+  http://127.0.0.1:8000/api/waf
+```
+
+页面 URL 仅允许无凭据、无 fragment、使用默认或 443 端口的公网域名 HTTPS 地址。成功响应包含 `u_atoken`、`u_asig`、`verifyCode` 和匹配设备画像的 `uaHeaders`；后续携带签名请求须使用返回的 `uaHeaders`。签名成功不表示已进入原页面或完成登录，服务不自动回访页面或提交后续业务。完整字段、示例与错误见 [HTTP API](docs/reference/http-api.md#waf--esapost-apiwaf)。
+
+`bmy.albatrip.cn` 已完成一次自动抓页模式的真实生产 HTTP 验收：调用方仅提交 `pageUrl` 和 `proxy`，返回 HTTP `200`、`ok=true`、`verifyCode=T001`，耗时 6,316 ms；携带返回签名与 `uaHeaders` 回访取得 HTTP `200`，命中“快速购票”标题，未再出现挑战。验收使用无 Node 的 PATH、`CGO_ENABLED=0` 和实际 V8 库。此前自动抓页模式的 4 次 Go + V8 Verify 也均返回 `T001`；这些结果仅覆盖此站点，尚未做跨站实测。WAF 路径使用新增的 V8 原生浏览器绑定，需按本版源码重建同平台 V8 wrapper；旧库不包含该能力。离线合同测试与真实站点验收分别执行。
+
+自动抓页模式的真实 HTTP 验收只运行以下测试；`F001` 等拒绝会使测试失败，不把请求发出或 HTTP 200 当作通过：
+
+```bash
+CGO_ENABLED=0 \
+ALI_SLIDER_V8_TEST_LIBRARY=/absolute/path/to/platform-v8-library \
+ALI_SLIDER_WAF_ONLINE_URL='https://your-authorized-page.example/' \
+go test -tags online -run '^TestOnlineWAFHTTP$' -count=1 -v ./internal/bootstrap
+```
+
+可选设置 `ALI_SLIDER_WAF_ONLINE_BODY_MARKER` 为预期业务页正文片段，测试才会额外携带签名和返回的 `uaHeaders` 回访一次并检查该片段；不设置时只验收验证结果。直接调用生产执行器的自动抓页验收仍可使用 `-run '^TestOnlineWAF$'`。
 
 ## Go SDK 接入
 

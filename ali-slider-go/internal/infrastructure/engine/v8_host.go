@@ -328,6 +328,13 @@ func roundTripV8HostRequest(
 	if err != nil {
 		return v8HostHTTPResponse{}, errors.New("V8 HTTP request is invalid")
 	}
+	if input.Body != nil {
+		fields, _ := url.ParseQuery(*input.Body)
+		if fields.Get("Action") == "VerifyCaptchaV2" {
+			// WAF Verify 也只有一次机会，禁止 HTTP/2 通过 GetBody 透明重放。
+			request.GetBody = nil
+		}
+	}
 	headerBytes := 0
 	for name, value := range input.Headers {
 		headerBytes += len(name) + len(value)

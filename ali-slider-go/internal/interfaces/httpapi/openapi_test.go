@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/d2120848471/v3/ali-slider-go/internal/application/service"
 	"github.com/d2120848471/v3/ali-slider-go/internal/application/solve"
 )
 
@@ -30,6 +31,7 @@ func TestOpenAPIOperationIDsAndConcurrentReads(t *testing.T) {
 		{SolvePath, "get", "solveSliderLegacy"},
 		{SolvePath, "post", "solveSlider"},
 		{BaxiaPath, "post", "generateBXUA"},
+		{WAFPath, "post", "solveWAF"},
 		{HealthPath, "get", "getHealth"},
 		{OpenAPIPath, "get", "getOpenAPI"},
 	} {
@@ -113,6 +115,77 @@ func TestBaxiaOpenAPIContract(t *testing.T) {
 	for _, name := range []string{"User-Agent", "Accept-Language", "Sec-CH-UA", "Sec-CH-UA-Mobile", "Sec-CH-UA-Platform"} {
 		if headers[name] == nil {
 			t.Errorf("missing matching UA header %s", name)
+		}
+	}
+}
+
+func TestWAFOpenAPIContract(t *testing.T) {
+	handler := newWAFHandler(t, wafExecutorFunc(func(context.Context, service.WAFRequest) (service.WAFOutcome, error) {
+		t.Error("OpenAPI must not invoke WAF executor")
+		return service.WAFOutcome{}, nil
+	}), nil)
+	response := performRequest(handler, http.MethodGet, OpenAPIPath, "")
+	var document map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &document); err != nil {
+		t.Fatal(err)
+	}
+	methods := document["paths"].(map[string]any)[WAFPath].(map[string]any)
+	if len(methods) != 1 || methods["post"] == nil {
+		t.Fatalf("WAF must only document POST: %#v", methods)
+	}
+	operation := methods["post"].(map[string]any)
+	body := operation["requestBody"].(map[string]any)
+	if body["required"] != true {
+		t.Fatal("WAF body must be required")
+	}
+	request := body["content"].(map[string]any)["application/json"].(map[string]any)["schema"].(map[string]any)
+	if !reflect.DeepEqual(request["required"], []any{"pageUrl"}) {
+		t.Fatalf("required WAF request fields = %#v", request["required"])
+	}
+	fields := request["properties"].(map[string]any)
+	urlField := fields["pageUrl"].(map[string]any)
+	if len(fields) != 3 || urlField["type"] != "string" || urlField["format"] != "uri" || urlField["maxLength"] != float64(service.MaxWAFURLBytes) {
+		t.Fatalf("WAF request properties = %#v", fields)
+	}
+	if request["additionalProperties"] != true || request["oneOf"] != nil {
+		t.Fatalf("WAF must accept unknown fields without selecting a request mode: %#v", request)
+	}
+	if fields["type"] != nil || fields["Type"] != nil || fields["targetHost"] != nil || urlField["default"] != nil {
+		t.Fatal("WAF must not configure type or provide a default page host")
+	}
+	for _, name := range []string{"proxy", "Proxy"} {
+		field := fields[name].(map[string]any)
+		if field["type"] != "string" || field["nullable"] != true {
+			t.Errorf("WAF proxy schema %s = %#v", name, field)
+		}
+	}
+	responses := operation["responses"].(map[string]any)
+	if len(responses) != 4 {
+		t.Fatalf("WAF response count = %d, want 4", len(responses))
+	}
+	for _, status := range []string{"200", "400", "403", "500"} {
+		if responses[status] == nil {
+			t.Fatalf("missing WAF HTTP %s", status)
+		}
+	}
+	success := responses["200"].(map[string]any)["content"].(map[string]any)["application/json"].(map[string]any)["schema"].(map[string]any)
+	properties := success["properties"].(map[string]any)
+	wantFields := []any{"ok", "sceneId", "captchaType", "verifyCode", "u_atoken", "u_asig", "uaHeaders", "proxied", "elapsedMs", "traceId"}
+	if len(properties) != len(wantFields) || !reflect.DeepEqual(success["required"], wantFields) {
+		t.Fatalf("WAF required response fields = %#v", success["required"])
+	}
+	for _, name := range wantFields {
+		if properties[name.(string)] == nil {
+			t.Errorf("missing WAF response field %s", name)
+		}
+	}
+	if _, hasEnum := properties["ok"].(map[string]any)["enum"]; hasEnum {
+		t.Fatal("WAF HTTP 200 must also allow a business rejection")
+	}
+	headers := properties["uaHeaders"].(map[string]any)["properties"].(map[string]any)
+	for _, name := range []string{"User-Agent", "Accept-Language", "Sec-CH-UA", "Sec-CH-UA-Mobile", "Sec-CH-UA-Platform"} {
+		if headers[name] == nil {
+			t.Errorf("missing matching WAF UA header %s", name)
 		}
 	}
 }
